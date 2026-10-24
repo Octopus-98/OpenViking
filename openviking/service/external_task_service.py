@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol
 from uuid import uuid4
 
+from openviking.pyagfs import GitConcurrentCommitError
 from openviking.server.identity import RequestContext
 from openviking.service.task_domain import TaskPatch
 from openviking.service.task_tracker import TaskRecord, TaskStatus, get_task_tracker
@@ -528,12 +529,14 @@ class ExternalTaskService:
             if on_finish is not None:
 
                 async def finish():
-                    """Keep lock retries inside cancellation-protected provider finalization."""
+                    """Retry finalization conflicts inside cancellation-protected work."""
                     while True:
                         try:
                             return await on_finish(task, snapshot)
-                        except ResourceBusyError:
-                            await asyncio.sleep(self._providers[task.task_type].poll_interval_seconds)
+                        except (ResourceBusyError, GitConcurrentCommitError):
+                            await asyncio.sleep(
+                                self._providers[task.task_type].poll_interval_seconds
+                            )
 
                 snapshot = await run_to_completion(finish)
 
