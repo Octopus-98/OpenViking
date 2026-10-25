@@ -54,7 +54,7 @@ def next_slot(schedule: Dict[str, Any], now: datetime) -> datetime:
 
 
 def next_run_at(record: Dict[str, Any], now: Optional[datetime] = None) -> Optional[str]:
-    if not (record.get("auto_update") and record.get("initialized")):
+    if not record.get("auto_update"):
         return None
     return next_slot(record["update_schedule"], now or datetime.now(TZ)).isoformat()
 
@@ -66,7 +66,6 @@ def is_due(record: Dict[str, Any], slot: datetime) -> bool:
     enabled_at = record.get("auto_update_enabled_at")
     return (
         record.get("status") == "active"
-        and bool(record.get("initialized"))
         and bool(record.get("auto_update"))
         and enabled_at is not None
         and datetime.fromisoformat(enabled_at) < slot
@@ -224,11 +223,7 @@ class CompileScheduler:
                         previous_to,
                     )
                 )
-            if (
-                record.get("status") == "active"
-                and record.get("initialized")
-                and record.get("auto_update")
-            ):
+            if record.get("status") == "active" and record.get("auto_update"):
                 schedule = record["update_schedule"]
                 due = next_slot(schedule, datetime.now(TZ))
                 await self._expiry.report(
@@ -270,7 +265,10 @@ class CompileScheduler:
             try:
                 ctx, connection = await self._executor(record)
                 owner_ctx = task_ctx(account_id, ctx.user.user_id)
-                if not await self._fs.exists(record["to"], ctx=owner_ctx):
+                # Initial failures can leave the output directory uncreated.
+                if record.get("initialized") and not await self._fs.exists(
+                    record["to"], ctx=owner_ctx
+                ):
                     raise NotFoundError(record["to"], "compile target")
             except (FailedPreconditionError, NotFoundError) as exc:
                 record["auto_update"] = False
