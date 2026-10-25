@@ -18,11 +18,11 @@ Agent Runtime Server 负责执行 Agent 任务，当前支持 Compile。应用�
 | `to` | string | 是 | - | 目标 Resource 或 Memory 目录，或受支持的 Skill namespace |
 | `skill` | string | 是 | - | Skill 目录或其 `SKILL.md` URI |
 | `instruction` | string | 否 | Skill 驱动的默认值 | 本次 Compile 的补充指令 |
-| `args` | object | 否 | - | 执行端扩展参数；`model_name` 可传模型 Endpoint ID |
+| `args` | object | 否 | - | 执行端扩展参数和 Compile 调度控制字段；`model_name` 可传模型 Endpoint ID |
 
 `args` 整体可省略，模型 Endpoint ID 也不是顶层字段。需要指定模型时使用 `args.model_name`；不传时由执行端使用其默认模型配置。
 
-下面的模型选择示例要求执行端支持 `args.model_name`。使用内置 VikingBot 时，省略 `args` 和 CLI 的 `--args`，它不接受非空扩展参数。Python 示例使用 `SyncHTTPClient`；使用 `AsyncHTTPClient` 时需 `await compile()`。
+调度控制字段 `auto_update` 和 `update_schedule` 由 OpenViking 处理。Python 示例使用 `SyncHTTPClient`；使用 `AsyncHTTPClient` 时需 `await compile()`。
 
 **HTTP API**
 
@@ -44,7 +44,7 @@ curl -X POST http://localhost:1933/api/v1/compile \
   }'
 ```
 
-接口返回 `202 Accepted` 和 OV TaskRecord：
+未传调度控制字段时，接口立即将 Compile 任务入队，并返回 `202 Accepted` 和 OV TaskRecord：
 
 ```json
 {
@@ -59,6 +59,22 @@ curl -X POST http://localhost:1933/api/v1/compile \
 }
 ```
 
+当 `args` 显式包含 `auto_update` 或 `update_schedule` 时，请求只保存目标配置并注册或移除调度。接口返回 `200 OK`，结果包含已保存配置和 `next_run_at`，不包含 `task_id`；到下一计划时间才创建 Compile 任务并调用 Runtime。例如：
+
+```json
+{
+  "from": ["viking://resources/research"],
+  "to": "viking://resources/research-wiki",
+  "skill": "viking://user/default/skills/research-compiler",
+  "args": {
+    "auto_update": true,
+    "update_schedule": {"frequency": "daily", "hour": 0, "minute": 0}
+  }
+}
+```
+
+传入非空 `update_schedule` 时会开启自动更新，除非显式指定 `auto_update=false`。关闭后返回 `next_run_at: null`。不传这两个调度控制字段时仍立即编译，即使目标已有定时策略。计划按 `to` 更新，不会创建供 `GET /api/v1/compile/submissions/{key}` 查询的任务提交记录。
+
 **CLI**
 
 ```bash
@@ -70,7 +86,7 @@ ov compile \
   --args '{"model_name":"your-model-endpoint-id"}'
 ```
 
-`--args` 必须是 JSON object。命令提交后立即返回 Task ID。
+`--args` 必须是 JSON object。立即编译返回 Task ID；保存计划返回下次执行时间。
 
 **SDK**
 
@@ -128,7 +144,7 @@ task, err := client.Compile(
 
 `update_schedule` 必填 `frequency`（`daily` 或 `weekly`）。可选 `hour`（0–23）和 `minute`（0–59）默认均为 0。每周计划还接受 `weekday`（1 为周一，7 为周日，默认 1）。计划使用 `Asia/Shanghai` 时区。
 
-定时自动更新需要显式配置 `compile_api.scheduler_enabled=true`（默认 `false`），并提供有效的 `expiry.service_name` 和 `expiry.redis` 配置。`compile_api.scheduler_backend` 仅接受 `redis`（默认值），配置 `local` 无效。调度关闭时开启 `auto_update` 会返回 `COMPILE_SCHEDULER_DISABLED`。手动增量编译和版本管理不依赖 Redis。
+定时自动更新需要显式配置 `compile_api.scheduler_enabled=true`（默认 `false`），并提供有效的 `expiry.service_name` 和 `expiry.redis` 配置。`compile_api.scheduler_backend` 仅接受 `redis`（默认值），配置 `local` 无效。定时请求会同步校验：调度未启用或缺少配置时返回 HTTP 412（`COMPILE_SCHEDULER_DISABLED`），Redis 注册不可用时返回 HTTP 503。保存计划失败不会提交 Compile 任务。编译失败本身不会取消后续定时执行，包括首次编译失败。手动增量编译和版本管理不依赖 Redis。
 
 操作列表和产出列表接口均接受可选查询参数 `limit`（1–100，默认 20）和 `cursor`。翻页时原样传入返回的 `next_cursor`，其为 `null` 时表示最后一页。
 
@@ -259,7 +275,7 @@ Idempotency-Key: <OV task_id>
 }
 ```
 
-`task_type` 和 `payload` 均必填。当前只支持 `task_type="compile"`；`payload` 使用本页创建任务的字段及校验规则，`instruction`、`args` 可省略。内置 VikingBot 不支持非空 `args`。不支持的类型或无效的 payload 返回 `4xx`，不创建执行任务。
+`task_type` 和 `payload` 均必填。当前只支持 `task_type="compile"`；`payload` 使用本页创建任务的字段及校验规则，`instruction`、`args` 可省略。不支持的类型或无效的 payload 返回 `4xx`，不创建执行任务。
 
 OV 通过 `X-API-Key` 传递当前用户的 OV API Key；配置 `compile_api.gateway_token` 时还会发送 `X-Gateway-Token`。这些凭证不能出现在公开任务结果中。
 

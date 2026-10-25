@@ -18,11 +18,11 @@ Agent Runtime Server executes Agent tasks and currently supports Compile. Applic
 | `to` | string | Yes | - | Target Resource or Memory directory, or a supported Skill namespace |
 | `skill` | string | Yes | - | Skill directory or its `SKILL.md` URI |
 | `instruction` | string | No | Skill-driven default | Additional instructions for this Compile run |
-| `args` | object | No | - | Execution backend extensions; `model_name` accepts a model endpoint ID |
+| `args` | object | No | - | Execution backend extensions and Compile scheduling controls; `model_name` accepts a model endpoint ID |
 
 The entire `args` object is optional, and the model endpoint ID is not a top-level field. Use `args.model_name` to select a model; when omitted, the execution backend uses its default model configuration.
 
-The model-selection examples below require a backend that accepts `args.model_name`. When using bundled VikingBot, omit `args` and CLI `--args`; it rejects non-empty arguments. The Python example uses `SyncHTTPClient`; await `compile()` with `AsyncHTTPClient`.
+The scheduling controls `auto_update` and `update_schedule` are handled by OpenViking. The Python example uses `SyncHTTPClient`; await `compile()` with `AsyncHTTPClient`.
 
 **HTTP API**
 
@@ -44,7 +44,7 @@ curl -X POST http://localhost:1933/api/v1/compile \
   }'
 ```
 
-The endpoint returns `202 Accepted` with an OV task record:
+Without scheduling controls, the endpoint immediately queues a Compile task and returns `202 Accepted` with an OV task record:
 
 ```json
 {
@@ -59,6 +59,22 @@ The endpoint returns `202 Accepted` with an OV task record:
 }
 ```
 
+When `args` explicitly contains `auto_update` or `update_schedule`, the request only saves target settings and registers or removes the schedule. It returns `200 OK` with the saved configuration and `next_run_at`, without a `task_id`. No Compile task or Runtime call occurs until the next scheduled time. For example:
+
+```json
+{
+  "from": ["viking://resources/research"],
+  "to": "viking://resources/research-wiki",
+  "skill": "viking://user/default/skills/research-compiler",
+  "args": {
+    "auto_update": true,
+    "update_schedule": {"frequency": "daily", "hour": 0, "minute": 0}
+  }
+}
+```
+
+A non-null `update_schedule` enables automatic updates unless `auto_update=false` is explicit. Disabling updates returns `next_run_at: null`. A request without either scheduling control still compiles immediately, including targets that already have a saved schedule. Schedule saves update the target by `to`; they do not create a task submission for `GET /api/v1/compile/submissions/{key}`.
+
 **CLI**
 
 ```bash
@@ -70,7 +86,7 @@ ov compile \
   --args '{"model_name":"your-model-endpoint-id"}'
 ```
 
-`--args` must be a JSON object. The command returns a task ID immediately after submission.
+`--args` must be a JSON object. Immediate submissions return a task ID; schedule saves return the next run time.
 
 **SDKs**
 
@@ -128,7 +144,7 @@ The update body requires `to`, `from` (a non-empty source URI array), `skill`, a
 
 `update_schedule` requires `frequency` (`daily` or `weekly`). Optional `hour` (0–23) and `minute` (0–59) default to 0. Weekly schedules also accept `weekday` (1=Monday through 7=Sunday, default 1). Schedules use `Asia/Shanghai` time.
 
-Scheduled updates require `compile_api.scheduler_enabled=true` (default `false`) and valid `expiry.service_name` and `expiry.redis` configuration. `compile_api.scheduler_backend` only accepts `redis` (the default); `local` is invalid. Enabling `auto_update` while scheduling is disabled returns `COMPILE_SCHEDULER_DISABLED`. Manual incremental Compile and version management do not require Redis.
+Scheduled updates require `compile_api.scheduler_enabled=true` (default `false`) and valid `expiry.service_name` and `expiry.redis` configuration. `compile_api.scheduler_backend` only accepts `redis` (the default); `local` is invalid. A schedule request synchronously rejects disabled or missing scheduling configuration with HTTP 412 (`COMPILE_SCHEDULER_DISABLED`), and unavailable Redis registration with HTTP 503. A failed schedule save does not submit a Compile task. Compile failures, including the first run, do not cancel subsequent scheduled runs. Manual incremental Compile and version management do not require Redis.
 
 The history and output list endpoints accept optional query parameters `limit` (1–100, default 20) and `cursor`. Pass the returned `next_cursor` unchanged; `null` marks the last page.
 
@@ -259,7 +275,7 @@ Idempotency-Key: <OV task_id>
 }
 ```
 
-Both `task_type` and `payload` are required. Only `task_type="compile"` is supported. The `payload` uses the task creation fields and validation rules described on this page; `instruction` and `args` are optional. Bundled VikingBot does not support non-empty `args`. Unsupported types or invalid payloads return `4xx` without creating an execution task.
+Both `task_type` and `payload` are required. Only `task_type="compile"` is supported. The `payload` uses the task creation fields and validation rules described on this page; `instruction` and `args` are optional. Unsupported types or invalid payloads return `4xx` without creating an execution task.
 
 OV forwards the current user's OV API key in `X-API-Key`. It also sends `X-Gateway-Token` when `compile_api.gateway_token` is configured. These credentials must not appear in public task results.
 

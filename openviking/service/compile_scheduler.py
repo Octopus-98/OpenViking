@@ -20,7 +20,12 @@ from zoneinfo import ZoneInfo
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.compile_targets import CompileStore, task_ctx
-from openviking_cli.exceptions import ConflictError, FailedPreconditionError, NotFoundError
+from openviking_cli.exceptions import (
+    ConflictError,
+    FailedPreconditionError,
+    NotFoundError,
+    UnavailableError,
+)
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 
@@ -201,9 +206,14 @@ class CompileScheduler:
     ) -> None:
         """Mirror the URI's schedule and remove ``previous_to`` after a move.
 
-        Redis failures propagate only when ``raise_on_error`` is true.
+        Strict callers receive 412 when enabling without Redis and 503 on registration failure.
         """
         if self._expiry is None:
+            if raise_on_error and record.get("auto_update"):
+                raise FailedPreconditionError(
+                    "Scheduled Compile requires a configured Redis scheduler",
+                    details={"reason": "COMPILE_SCHEDULER_DISABLED"},
+                )
             return
         from openviking.scheduling.expiry import ExpiryMode, ExpiryRegistration, ItemIdentity
 
@@ -236,11 +246,13 @@ class CompileScheduler:
                 )
             else:
                 await self._expiry.unregister(identity)
-        except Exception:
+        except Exception as exc:
             # The compensation scan repairs a missing or stale registration.
             logger.warning("Compile reschedule failed for %s", record["to"], exc_info=True)
             if raise_on_error:
-                raise
+                raise UnavailableError(
+                    "compile scheduler", "Cannot register scheduled Compile; retry the request"
+                ) from exc
 
     # ---------- decision and submission ----------
 
