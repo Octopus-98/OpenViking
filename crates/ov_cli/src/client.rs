@@ -116,10 +116,16 @@ pub enum SnapshotShowResult {
     },
 }
 
+/// A Compile submission returns either an immediate task or saved target scheduling settings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompileAccepted {
-    pub task_id: String,
+    /// Present only when this request submits an immediate Compile task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub status: String,
+    /// The saved schedule's next ISO 8601 trigger time; null when scheduling is disabled.
+    #[serde(default)]
+    pub next_run_at: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
     #[serde(default)]
@@ -2892,7 +2898,26 @@ mod tests {
             )
             .await
             .expect("202 response body should deserialize");
-        assert_eq!(accepted.task_id, "cmp_1");
+        assert_eq!(accepted.task_id.as_deref(), Some("cmp_1"));
+    }
+
+    #[test]
+    fn compile_schedule_response_has_no_task_id() {
+        let accepted: super::CompileAccepted = serde_json::from_value(serde_json::json!({
+            "to": "viking://resources/wiki",
+            "status": "active",
+            "auto_update": true,
+            "next_run_at": "2026-10-26T00:00:00+08:00"
+        }))
+        .expect("saved Compile schedules should deserialize without a task");
+        assert!(accepted.task_id.is_none());
+        assert_eq!(
+            accepted.next_run_at.as_deref(),
+            Some("2026-10-26T00:00:00+08:00")
+        );
+        let output = serde_json::to_value(accepted).expect("schedule output should serialize");
+        assert!(output.get("task_id").is_none());
+        assert_eq!(output["next_run_at"], "2026-10-26T00:00:00+08:00");
     }
 
     #[tokio::test]

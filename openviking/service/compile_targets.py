@@ -970,7 +970,7 @@ class CompileLifecycle:
         control, runtime_args = split_control_args(payload.get("args"))
         task_payload = {key: value for key, value in payload.items() if key != "args"}
         if scheduled_record is None:
-            record = await self._save_submission(
+            record = await self.save_submission(
                 payload, control, runtime_args, instruction_set, ctx
             )
             runtime_args = {**record["execution_context"]["args"], **runtime_args}
@@ -982,7 +982,7 @@ class CompileLifecycle:
         }
         return task_payload
 
-    async def _save_submission(
+    async def save_submission(
         self,
         payload: Dict[str, Any],
         control: Dict[str, Any],
@@ -990,7 +990,11 @@ class CompileLifecycle:
         instruction_set: bool,
         ctx: RequestContext,
     ) -> Dict[str, Any]:
-        """Save submission settings and return their state, including the deletion boundary."""
+        """Save validated submission settings and return the target state.
+
+        Explicit schedule changes register before state is published, so failed
+        registration leaves the saved target unchanged and propagates to the caller.
+        """
         to, sources = payload["to"], payload["from"]
         self.validate_layout(to, sources)
         async with self._store.edit(ctx.account_id, to, create=True) as record:
@@ -1011,10 +1015,15 @@ class CompileLifecycle:
                 await self.apply_schedule(
                     record,
                     ctx,
-                    control.get("auto_update", record["auto_update"]),
+                    control.get(
+                        "auto_update",
+                        record["auto_update"] or control.get("update_schedule") is not None,
+                    ),
                     control.get("update_schedule", record["update_schedule"]),
                 )
-        if self.reschedule is not None:
+                if self.reschedule is not None:
+                    await self.reschedule(ctx.account_id, record, raise_on_error=True)
+        if not configures_schedule and self.reschedule is not None:
             await self.reschedule(ctx.account_id, record)
         return record
 
@@ -1047,7 +1056,7 @@ class CompileLifecycle:
             schedule = None
         changed = auto_update != record["auto_update"] or schedule != record["update_schedule"]
         if auto_update:
-            if self.save_credential is None:
+            if self.save_credential is None or self.reschedule is None:
                 # Credentials are encrypted only on scheduler instances, where they are decrypted.
                 raise FailedPreconditionError(
                     "Scheduled Compile is disabled on this instance "

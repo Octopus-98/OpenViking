@@ -409,8 +409,13 @@ class CompileService:
         connection: Mapping[str, Any],
         ctx: RequestContext,
         idempotency_key: str | None = None,
-    ) -> TaskRecord:
+    ) -> TaskRecord | dict[str, Any]:
+        """Save explicit update settings synchronously, or queue one immediate Compile run."""
+        control, _ = split_control_args(request.args)
+        configures_schedule = "auto_update" in control or "update_schedule" in control
         if request.is_memory_mode:
+            if configures_schedule:
+                raise InvalidArgumentError("Scheduled updates do not support --skill memory")
             if self._memory_runner is None:
                 raise UnavailableError(
                     "memory compile", "memory consolidation runner is not configured"
@@ -421,6 +426,15 @@ class CompileService:
                 ctx=ctx,
             )
         request = self._normalize_request_uris(request, ctx)
+        if configures_schedule:
+            lifecycle = self._require_lifecycle()
+            normalized = await self._normalize_request(request, ctx)
+            submitted, _ = self._split_payload(normalized)
+            control, runtime_args = split_control_args(submitted.get("args"))
+            record = await lifecycle.save_submission(
+                submitted, control, runtime_args, request._instruction_sent, ctx
+            )
+            return self._config_view(record)
         if idempotency_key:
             payload, private_payload = self._split_payload(request)
             existing = await self._tasks.recover_submission(
@@ -438,17 +452,6 @@ class CompileService:
         preparation = None
         if self._lifecycle is not None:
             control, runtime_args = split_control_args(submitted.get("args"))
-            if "auto_update" in control or "update_schedule" in control:
-                record = (
-                    await self._lifecycle.store.get_by_to(ctx.account_id, submitted["to"]) or {}
-                )
-                # Omitted rules reuse active settings; explicit null clears the supplied rule.
-                if control.get("auto_update", record.get("auto_update", False)) and (
-                    control.get("update_schedule", record.get("update_schedule")) is None
-                ):
-                    raise InvalidArgumentError(
-                        "update_schedule is required when auto_update is true"
-                    )
             payload = {key: value for key, value in submitted.items() if key != "args"}
             if runtime_args:
                 payload["args"] = runtime_args
@@ -708,8 +711,8 @@ class CompileService:
                 body.auto_update,
                 body.update_schedule.model_dump() if body.update_schedule is not None else None,
             )
-        if lifecycle.reschedule is not None:
-            await lifecycle.reschedule(ctx.account_id, record)
+            if lifecycle.reschedule is not None:
+                await lifecycle.reschedule(ctx.account_id, record, raise_on_error=True)
         return self._config_view(record)
 
     async def query_configs(self, body: CompileConfigQuery, ctx: RequestContext) -> dict[str, bool]:

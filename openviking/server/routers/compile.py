@@ -6,6 +6,7 @@ import asyncio
 import math
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, status
+from fastapi import Response as HTTPResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.path_variables import resolve_path_variables
@@ -24,16 +25,21 @@ from openviking_cli.exceptions import InvalidArgumentError
 router = APIRouter(prefix="/api/v1", tags=["compile"])
 
 
-@router.post("/compile", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/compile",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={status.HTTP_200_OK: {"description": "Compile update settings saved"}},
+)
 async def create_compile(
     body: CompileRequest,
+    response: HTTPResponse,
     ctx: RequestContext = Depends(get_request_context),
     idempotency_key: str | None = Header(
         None, min_length=16, max_length=128, pattern=r"^[A-Za-z0-9:._-]+$"
     ),
     x_request_id: str | None = Header(None),
 ):
-    """Queue a Compile task with the authenticated caller's forwarding identity."""
+    """Save explicit update settings, or queue a task with the caller's forwarding identity."""
     connection = {"api_key": ctx.api_key} if ctx.api_key else {}
     connection.update(account_id=ctx.account_id, user_id=ctx.user.user_id)
     if ctx.actor_peer_id:
@@ -41,13 +47,16 @@ async def create_compile(
     # Persist the submission's request ID for all asynchronous Runtime calls.
     if x_request_id:
         connection["request_id"] = x_request_id
-    task = await get_service().compile.create(
+    result = await get_service().compile.create(
         body,
         connection=connection,
         ctx=ctx,
         **({"idempotency_key": idempotency_key} if idempotency_key else {}),
     )
-    return Response(status="ok", result=task.to_dict())
+    if isinstance(result, dict):
+        response.status_code = status.HTTP_200_OK
+        return Response(status="ok", result=result)
+    return Response(status="ok", result=result.to_dict())
 
 
 __all__ = ["router"]

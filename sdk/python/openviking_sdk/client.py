@@ -1661,6 +1661,7 @@ class AsyncHTTPClient:
         skill: str,
         options: Optional[CompileOptions] = None,
     ) -> Dict[str, Any]:
+        """Return a queued task, or saved settings when args explicitly configure scheduling."""
         payload = self._build_options_payload(
             options,
             CompileOptions,
