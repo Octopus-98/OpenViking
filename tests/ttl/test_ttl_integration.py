@@ -96,6 +96,137 @@ async def test_real_queue_writes_keep_ttl_on_service_loop(tmp_path, enabled):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["release", "delete", "timeout", "disabled"])
+@pytest.mark.parametrize("level", [1, 2])
+async def test_embedding_queue_waits_for_ttl_directory_lock(tmp_path, monkeypatch, state, level):
+    """Real queue threads must retry native locks without repeating embedding."""
+    import asyncio
+    import threading
+    from unittest.mock import AsyncMock
+
+    from openviking.models.embedder.base import EmbedResult
+    from openviking.storage import collection_schemas
+    from openviking.storage.errors import LockAcquisitionError
+    from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+    from openviking.storage.queuefs.process_result import ProcessOutcome
+    from openviking.storage.queuefs.queue_manager import QueueManager
+    from openviking.ttl import wiring
+
+    agfs = create_agfs_client(
+        RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="local"))
+    )
+    fs = VikingFS(agfs=agfs)
+    engine = DirectoryTTL(resource_id="embedding-lock")
+    engine.fs = fs
+    engine.policy = AsyncMock(return_value=SimpleNamespace(enabled=state != "disabled"))
+    monkeypatch.setattr(wiring, "_adapter", engine)
+    if state == "timeout":
+        monkeypatch.setattr(collection_schemas, "_EMBEDDING_LOCK_WAIT_SECONDS", 0.3)
+    ctx = engine.context("a")
+    unit = "viking://user/u/memories/events/2026/10/26"
+    source = "viking://user/u/sessions/s/history/archive_001"
+    await fs.write_file(unit + "/event.md", "event", ctx=ctx)
+    await fs.write_file(source + "/.meta.json", "{}", ctx=ctx)
+    unit_path = fs._uri_to_path(unit, ctx=ctx)
+    source_path = fs._uri_to_path("viking://user/u/sessions/s", ctx=ctx)
+    contended = threading.Event()
+    attempts = []
+    acquire = fs._async_agfs.pathlock_acquire_exact
+
+    async def observe_acquire(path, *args, **kwargs):
+        attempts.append(path)
+        try:
+            return await acquire(path, *args, **kwargs)
+        except LockAcquisitionError:
+            contended.set()
+            raise
+
+    monkeypatch.setattr(fs._async_agfs, "pathlock_acquire_exact", observe_acquire)
+    embedder = SimpleNamespace(
+        prepare_embedding_input=lambda text: text,
+        embed_async=AsyncMock(return_value=EmbedResult(dense_vector=[1.0, 0.0])),
+    )
+
+    async def upsert(*args, **kwargs):
+        if state != "disabled":
+            with pytest.raises(LockAcquisitionError):
+                await fs._async_agfs.pathlock_acquire_tree(unit_path)
+        return "vector"
+
+    db = SimpleNamespace(
+        is_closing=False,
+        account_uses_content_field=AsyncMock(return_value=False),
+        upsert=AsyncMock(side_effect=upsert),
+    )
+    results, loops = [], []
+
+    class Handler(collection_schemas.TextEmbeddingHandler):
+        async def on_dequeue(self, data):
+            loops.append(asyncio.get_running_loop())
+            result = await super().on_dequeue(data)
+            results.append(result)
+            return result
+
+    queues = QueueManager(agfs)
+    queue = queues.get_queue(
+        queues.EMBEDDING,
+        dequeue_handler=Handler(db, SimpleNamespace(bind=lambda _: embedder)),
+        allow_create=True,
+    )
+    blocker = await (
+        fs._async_agfs.pathlock_acquire_tree(unit_path) if state == "delete" else acquire(unit_path)
+    )
+    try:
+        await queue.enqueue(
+            EmbeddingMsg(
+                "event",
+                {
+                    "account_id": "a",
+                    "owner_user_id": "u",
+                    "uri": unit if level == 1 else unit + "/event.md",
+                    "level": level,
+                    "context_type": "memory",
+                    "_write_source": source if level == 2 else "",
+                },
+            )
+        )
+        queues.start()
+        if state != "disabled":
+            assert await asyncio.to_thread(contended.wait, 5)
+            async with asyncio.timeout(5):
+                while await fs._async_agfs.pathlock_is_locked(source_path):
+                    await asyncio.sleep(0.01)
+            assert not results  # Contention must not immediately fail the delivery.
+            if state == "delete":
+                await fs.rm(unit, recursive=True, ctx=ctx, lease_ref=blocker, no_vector=True)
+            if state != "timeout":
+                await fs._async_agfs.pathlock_release(blocker)
+                blocker = None
+        async with asyncio.timeout(5):
+            while not results:
+                await asyncio.sleep(0.01)
+        success = state in {"release", "disabled"}
+        assert results[0].outcome is (ProcessOutcome.SUCCESS if success else ProcessOutcome.FAILED)
+        assert db.upsert.await_count == int(success)
+        embedder.embed_async.assert_awaited_once()
+        assert loops[0] is not asyncio.get_running_loop()
+        assert engine.redis is None
+        if state == "delete":
+            assert "not found" in results[0].error.lower()
+        elif state == "timeout":
+            assert "lock acquire timed out" in results[0].error
+        if state == "disabled":
+            assert attempts == []
+        else:
+            assert attempts.count(unit_path) >= 2
+    finally:
+        if blocker is not None:
+            await fs._async_agfs.pathlock_release(blocker)
+        await asyncio.to_thread(queues.stop)
+    assert (await fs._async_agfs.pathlock_observe())["active_locks"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(not os.environ.get("TTL_TEST_REDIS"), reason="requires an isolated local Redis")
 async def test_real_registration_reset_recycle(tmp_path):
     from uuid import uuid4

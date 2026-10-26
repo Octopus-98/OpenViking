@@ -52,6 +52,13 @@ directories use the directory date (`ZADD NX`). Deletion rechecks current policy
 and Session `messages.jsonl` ModTime under the existing directory lock. Redis
 index removal compares the original score to preserve a concurrent renewal.
 
+Vector writes keep the directory lock through the database write, so deletion
+cannot race with a late vector write. On lock contention, the embedding worker
+releases its acquired guards and retries with a five-second wait budget. It reuses
+the embedding result and checks that the source still exists after reacquiring
+the locks. Expired wait budgets and other errors still fail the task; disabled TTL
+adds no lock waiting.
+
 User TTL lives in `settings/user_config.json` and uses the existing
 `GET/PATCH /api/v1/admin/accounts/{account_id}/users/{user_id}/settings` API:
 

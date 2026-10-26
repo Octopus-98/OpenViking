@@ -27,6 +27,7 @@ from openviking.storage.errors import (
     CollectionNotFoundError,
     EmbeddingConfigurationError,
     EmbeddingRebuildRequiredError,
+    LockAcquisitionError,
 )
 from openviking.storage.index_action import FieldPatch, IndexAction
 from openviking.storage.queuefs.embedding_msg import (
@@ -55,6 +56,7 @@ logger = get_logger(__name__)
 EMBEDDING_META_MARKER = "\n\n[openviking.embedding]\n"
 
 _EMBEDDING_COMPATIBILITY_KEYS = ("provider", "model", "dimension", "model_identity")
+_EMBEDDING_LOCK_WAIT_SECONDS = 5.0
 
 
 @dataclass
@@ -931,20 +933,36 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         adapter = get_ttl_adapter()
                         async with AsyncExitStack() as guards:
                             if adapter is not None and hasattr(adapter, "write_guard"):
-                                await guards.enter_async_context(
-                                    adapter.source_guard(
-                                        write_source, ctx, task_id=embedding_msg.task_id
-                                    )
-                                )
-                                await guards.enter_async_context(
-                                    adapter.write_guard(
-                                        uri,
-                                        ctx,
-                                        lease_ref=write_lease,
-                                        require_exists=True,
-                                        recover_owner=True,
-                                    )
-                                )
+                                deadline = None
+                                while True:
+                                    try:
+                                        await guards.enter_async_context(
+                                            adapter.source_guard(
+                                                write_source, ctx, task_id=embedding_msg.task_id
+                                            )
+                                        )
+                                        await guards.enter_async_context(
+                                            adapter.write_guard(
+                                                uri,
+                                                ctx,
+                                                lease_ref=write_lease,
+                                                require_exists=True,
+                                                recover_owner=True,
+                                            )
+                                        )
+                                        break
+                                    except LockAcquisitionError:
+                                        # Never wait while holding a partial set of locks.
+                                        # Retry only the guards, retaining the computed vector.
+                                        await guards.aclose()
+                                        if deadline is None:
+                                            deadline = (
+                                                time.monotonic() + _EMBEDDING_LOCK_WAIT_SECONDS
+                                            )
+                                        remaining = deadline - time.monotonic()
+                                        if remaining <= 0:
+                                            raise
+                                        await asyncio.sleep(min(0.1, remaining))
                             result = await self._vikingdb.upsert(
                                 inserted_data, ctx=ctx, options=upsert_options
                             )
