@@ -50,7 +50,7 @@ from openviking_cli.exceptions import (
     UnavailableError,
 )
 from openviking_cli.session.user_id import UserIdentifier
-from openviking_cli.utils.config.ttl_config import TTLConfig, UserTTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig
 
 if TYPE_CHECKING:
     from openviking.server.api_keys import APIKeyManager
@@ -343,16 +343,10 @@ class DirectoryTTL:
             for root in (user + "/memories/events", user + "/sessions"):
                 if resolve_effective_ttl(*pair, root, config).enabled:
                     roots.add(root)
-            probe = user + "/peers/*/memories/events"
+            probe = user + "/peers"
             if resolve_effective_ttl(*pair, probe, config).enabled:
                 for peer in await self._children(user + "/peers", ctx):
-                    root = peer + "/memories/events"
-                    if resolve_effective_ttl(*pair, root, config).enabled:
-                        roots.add(root)
-            for peer in (config.peers or {}) if config else ():
-                root = user + f"/peers/{peer}/memories/events"
-                if resolve_effective_ttl(*pair, root, config).enabled:
-                    roots.add(root)
+                    roots.add(peer + "/memories/events")
         return sorted(roots)
 
     def prefix(self, account_id: str) -> str:
@@ -363,16 +357,13 @@ class DirectoryTTL:
         return RequestContext(user=UserIdentifier(account_id, "ttl-internal"), role=Role.ROOT)
 
     @staticmethod
-    def user_roots(user: str, config: UserTTLConfig | None = None) -> list[str]:
+    def user_roots(user: str) -> list[str]:
         base = f"viking://user/{user}"
-        roots = [
+        return [
             base + "/sessions",
             base + "/memories/events",
-            base + "/peers/*/memories/events",
+            base + "/peers",
         ]
-        if config is not None:
-            roots.extend(base + f"/peers/{peer}/memories/events" for peer in config.peers or {})
-        return roots
 
     def _cache_user_policy(self, key, config) -> None:
         self._user_policies[key] = (time.monotonic(), config)
@@ -380,7 +371,7 @@ class DirectoryTTL:
         while len(self._user_policies) > 1024:
             self._user_policies.popitem(last=False)
 
-    async def user_policy(self, account: str, user: str) -> UserTTLConfig | None:
+    async def user_policy(self, account: str, user: str) -> TTLConfig | None:
         """Share one snapshot per user; refresh on demand, not once per directory."""
         key = (account, user)
         cached = self._user_policies.get(key)
@@ -434,18 +425,15 @@ class DirectoryTTL:
         roots.update(state["reset_required"])
         for (scope, user), (_, config) in list(self._user_policies.items()):
             if scope == account and config is not None:
-                roots.update(self.user_roots(user, config))
+                roots.update(self.user_roots(user))
         policies.extend([await self.policy(account, root, pair) for root in sorted(roots)])
         return [policy for policy in policies if policy.enabled]
 
     async def prepare_user_configuration(self, ctx, before, after) -> None:
         pair = await self.policies(ctx.account_id)
-        roots = set(self.user_roots(ctx.user.user_id, before)) | set(
-            self.user_roots(ctx.user.user_id, after)
-        )
         opening = [
             root
-            for root in roots
+            for root in self.user_roots(ctx.user.user_id)
             if resolve_effective_ttl(*pair, root, after).enabled
             and not resolve_effective_ttl(*pair, root, before).enabled
         ]
@@ -471,7 +459,7 @@ class DirectoryTTL:
                 pair = await self.policies(ctx.account_id)
                 if any(
                     resolve_effective_ttl(*pair, root, config).enabled
-                    for root in self.user_roots(ctx.user.user_id, config)
+                    for root in self.user_roots(ctx.user.user_id)
                 ):
                     self._initial_requests.add(ctx.account_id)
                     self._wake_worker()
@@ -498,7 +486,7 @@ class DirectoryTTL:
         return [
             "viking://user/_ttl_/sessions",
             "viking://user/_ttl_/memories/events",
-            "viking://user/_ttl_/peers/*/memories/events",
+            "viking://user/_ttl_/peers",
         ]
 
     @classmethod

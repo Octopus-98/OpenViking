@@ -15,9 +15,9 @@ each node, then type-default > ``global`` > default-off) lives in
 
 from __future__ import annotations
 
-from typing import Annotated, Dict, Literal, Optional, Union
+from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from .runtime_field import RuntimeField
 
@@ -26,7 +26,7 @@ TTLPolicy = Union[Annotated[int, Field(strict=True, ge=1, le=365000)], Literal["
 
 
 class TTLConfig(BaseModel):
-    """Declarative TTL policy surface shared by cluster and account configs.
+    """Declarative TTL policy shared by cluster, account and user configs.
 
     Every field is a :func:`RuntimeField` so the config API can PATCH it, and
     every field defaults to ``None`` (unset / inherit) so an untouched document
@@ -42,19 +42,4 @@ class TTLConfig(BaseModel):
     sessions: Optional[TTLPolicy] = RuntimeField(default=None)
 
 
-class UserTTLConfig(TTLConfig):
-    """One user's defaults and independent Peer Events overrides."""
-
-    peers: Optional[Dict[str, TTLPolicy]] = None
-
-    @model_validator(mode="after")
-    def _validate_peers(self) -> "UserTTLConfig":
-        from openviking.core.identifiers import validate_identifier_part
-
-        for peer in self.peers or {}:
-            if error := validate_identifier_part(peer, "peer_id"):
-                raise ValueError(error)
-        return self
-
-
-__all__ = ["TTLConfig", "TTLPolicy", "UserTTLConfig"]
+__all__ = ["TTLConfig", "TTLPolicy"]

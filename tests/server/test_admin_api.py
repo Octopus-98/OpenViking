@@ -4298,7 +4298,7 @@ async def test_ttl_internal_preserves_error_contract(
     assert adapter.register_initial_backfill.await_count == 1
 
 
-async def test_user_ttl_reuses_settings_backup_and_sparse_peer_patch(
+async def test_user_ttl_reuses_settings_backup_and_sparse_type_patch(
     lightweight_admin_client, lightweight_admin_app, monkeypatch
 ):
     from types import SimpleNamespace
@@ -4323,24 +4323,41 @@ async def test_user_ttl_reuses_settings_backup_and_sparse_peer_patch(
         url,
         json={
             "memory_policy": {"memory_types": ["profile"]},
-            "ttl": {"sessions": 7, "peers": {"p1": 3, "p2": "disabled"}},
+            "ttl": {"sessions": 7, "peer_events": 3, "user_events": "disabled"},
         },
         headers=root_headers(),
     )
     assert response.status_code == 200, response.text
     settings = response.json()["result"]
-    assert settings["ttl"] == {"sessions": 7, "peers": {"p1": 3, "p2": "disabled"}}
+    assert settings["ttl"] == {"sessions": 7, "peer_events": 3, "user_events": "disabled"}
+    for path in (
+        "viking://user/alice/peers",
+        "viking://user/alice/peers/p1/memories/events",
+        "viking://user/alice/peers/p2/memories/events",
+    ):
+        queried = await lightweight_admin_client.get(
+            "/api/v1/admin/accounts/ttl-user/configuration",
+            params={"path": path},
+            headers=root_headers(),
+        )
+        assert queried.status_code == 200, queried.text
+        assert queried.json()["result"]["effective_policy"] == 3
+        assert queried.json()["result"]["user_ttl"] == settings["ttl"]
+    rejected = await lightweight_admin_client.patch(
+        url, json={"ttl": {"peers": {"p1": 1}}}, headers=root_headers()
+    )
+    assert rejected.status_code == 400, rejected.text
     response = await lightweight_admin_client.patch(
-        url, json={"ttl": {"peers": {"p1": None, "p3": 30}}}, headers=root_headers()
+        url, json={"ttl": {"peer_events": None, "user_events": 30}}, headers=root_headers()
     )
     assert response.status_code == 200, response.text
     settings = response.json()["result"]
-    assert settings["ttl"] == {"sessions": 7, "peers": {"p2": "disabled", "p3": 30}}
+    assert settings["ttl"] == {"sessions": 7, "user_events": 30}
     assert settings["memory_policy"]["memory_types"] == ["profile"]
     user_ctx = RequestContext(user=UserIdentifier("ttl-user", "alice"), role=Role.USER)
     fs = lightweight_admin_app.state.fake_service.viking_fs
     backup = json.loads(fs.files[user_config_backup_uri(user_ctx)])
-    assert backup["ttl"]["peers"]["p1"] == 3
+    assert backup["ttl"]["peer_events"] == 3
     # Existing memory-policy PATCH still replaces the whole policy; TTL is sparse.
     for policy in (
         {"self": {"enabled": False}, "memory_types": ["profile"]},

@@ -713,7 +713,7 @@ async def get_account_configuration(
         from openviking.core.namespace import uri_parts
 
         try:
-            validate_ttl_root(path)
+            validate_ttl_root(path, allow_peer_scope=True)
         except ValueError as exc:
             raise InvalidArgumentError(str(exc)) from exc
         user_ctx = RequestContext(

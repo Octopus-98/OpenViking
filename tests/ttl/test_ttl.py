@@ -10,7 +10,7 @@ import pytest_asyncio
 
 from openviking.ttl.adapter import TTLBackfillRequest, TTLRecycleRequest
 from openviking.ttl.runtime import DirectoryTTL, next_check_ms
-from openviking_cli.utils.config.ttl_config import TTLConfig, UserTTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig
 
 
 @pytest.fixture
@@ -167,20 +167,24 @@ async def test_expiry_restart_resumes_checkpoint_without_full_scan(
 @pytest.mark.parametrize("peer_days", [None, "disabled", 7])
 async def test_initial_discovers_roots_then_resumes_without_listing(engine, peer_days):
     e = engine
-    explicit = "viking://user/other/peers/special/memories/events"
     e.pair = (TTLConfig(sessions=7, peer_events=peer_days), None)
-    e._cache_user_policy(("a", "other"), UserTTLConfig(peers={"special": 7}))
+    e._cache_user_policy(("a", "other"), TTLConfig(peer_events=7))
     tree = {
         "viking://user": ["viking://user/u", "viking://user/other"],
         "viking://user/u/peers": ["viking://user/u/peers/p"],
+        "viking://user/other/peers": [
+            "viking://user/other/peers/p1",
+            "viking://user/other/peers/p2",
+        ],
     }
     e.fs.ls.side_effect = lambda uri, **kw: [{"uri": u, "isDir": True} for u in tree.get(uri, [])]
     await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
     state = await e.read_initial("a")
     roots = json.loads(state["roots"])
-    assert explicit in roots and "viking://user/u/sessions" in roots
+    assert "viking://user/u/sessions" in roots
+    assert all(root + "/memories/events" in roots for root in tree["viking://user/other/peers"])
     assert ("viking://user/u/peers/p/memories/events" in roots) == (peer_days == 7)
-    assert e.fs.ls.await_count == (3 if peer_days == 7 else 1)
+    assert e.fs.ls.await_count == (3 if peer_days == 7 else 2)
     assert all(call.kwargs["node_limit"] is None for call in e.fs.ls.call_args_list)
     e.fs.ls.reset_mock()
     await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
@@ -754,7 +758,7 @@ async def test_user_policy_cache_coalesces_refresh_and_preserves_new_save(engine
     async def read(*args):
         entered.set()
         await release.wait()
-        return UserConfig(ttl=UserTTLConfig(sessions=1))
+        return UserConfig(ttl=TTLConfig(sessions=1))
 
     reader = AsyncMock(side_effect=read)
     monkeypatch.setattr("openviking.server.user_config.read_user_config", reader)
@@ -762,7 +766,7 @@ async def test_user_policy_cache_coalesces_refresh_and_preserves_new_save(engine
     await entered.wait()
     await e.publish_user_configuration(
         RequestContext(user=UserIdentifier("a", "u"), role=Role.ROOT),
-        UserTTLConfig(sessions=7),
+        TTLConfig(sessions=7),
     )
     release.set()
     assert all(c.sessions == 7 for c in await asyncio.gather(*reads))
@@ -770,7 +774,7 @@ async def test_user_policy_cache_coalesces_refresh_and_preserves_new_save(engine
     for _ in range(100):
         assert (await e.user_policy("a", "u")).sessions == 7
     reader.assert_awaited_once()
-    e._user_policies[("a", "u")] = (0, UserTTLConfig(sessions=7))
+    e._user_policies[("a", "u")] = (0, TTLConfig(sessions=7))
     assert (await e.user_policy("a", "u")).sessions == 1
     assert reader.await_count == 2
     assert (await e.user_policy("b", "u")).sessions == 1
@@ -785,16 +789,21 @@ async def test_user_only_ttl_reset_and_restart_reuse_saved_roots(engine, schedul
     e = engine
     e.pair = (None, None)
     ctx = RequestContext(user=UserIdentifier("a", "u"), role=Role.ROOT)
-    config = UserTTLConfig(sessions=7, peers={"one": 2, "two": "disabled"})
+    config = TTLConfig(sessions=7, peer_events=2)
     await e.prepare_user_configuration(ctx, None, config)
     state = await e.read_initial("a")
     assert state["reset_required"] and scheduler.report.await_count == 1
     e._cache_user_policy(("a", "u"), config)
-    e.fs.ls.return_value = [{"uri": "viking://user/u", "isDir": True}]
+    tree = {
+        "viking://user": ["viking://user/u"],
+        "viking://user/u/peers": ["viking://user/u/peers/one", "viking://user/u/peers/two"],
+    }
+    e.fs.ls.side_effect = lambda uri, **kw: [{"uri": u, "isDir": True} for u in tree[uri]]
     await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
     state = await e.read_initial("a")
     assert json.loads(state["roots"]) == [
         "viking://user/u/peers/one/memories/events",
+        "viking://user/u/peers/two/memories/events",
         "viking://user/u/sessions",
     ]
     await e.redis.set(e.prefix("a") + "backfill:initial:done", "1")

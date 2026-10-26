@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""TTL policy precedence, explicit disabling and independent Peer overrides."""
+"""TTL policy precedence, explicit disabling and shared Peer Events policies."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from openviking.config.ttl import (
     TTLIndexType,
     classify_ttl_uri,
     resolve_effective_ttl,
+    validate_ttl_root,
 )
-from openviking_cli.utils.config.ttl_config import TTLConfig, UserTTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig
 
 USER_EVENTS_DIR = "viking://user/u1/memories/events/2026/10/01"
 USER_EVENTS_ROOT = "viking://user/u1/memories/events"
@@ -35,6 +36,7 @@ def _cfg(**kwargs) -> TTLConfig:
         (USER_EVENTS_DIR, TTLIndexType.USER_EVENTS),
         (USER_EVENTS_ROOT, TTLIndexType.USER_EVENTS),
         (PEER_EVENTS_DIR, TTLIndexType.PEER_EVENTS),
+        ("viking://user/u1/peers", TTLIndexType.PEER_EVENTS),
         (SESSION_DIR, TTLIndexType.SESSIONS),
         ("viking://user/u1/sessions", TTLIndexType.SESSIONS),
         ("viking://user/u1/memories/entities/x", None),
@@ -153,7 +155,7 @@ def test_user_account_global_precedence(kind, root):
     for cg, ag, ug, ct, at, ut in product((None, "disabled", 7), repeat=6):
         cluster = TTLConfig(global_=cg, **{kind.value: ct})
         account = TTLConfig(global_=ag, **{kind.value: at})
-        user = UserTTLConfig(global_=ug, **{kind.value: ut})
+        user = TTLConfig(global_=ug, **{kind.value: ut})
         value = next((v for v in (ut, at, ct, ug, ag, cg) if v is not None), "disabled")
         expected = (
             EffectiveTTL.off(kind) if value == "disabled" else EffectiveTTL(kind, True, value)
@@ -162,21 +164,25 @@ def test_user_account_global_precedence(kind, root):
             assert resolve_effective_ttl(cluster, account, uri, user) == expected
 
 
-def test_peer_override_is_independent_and_constant_lookup():
-    from unittest.mock import Mock
-
-    config = UserTTLConfig(peer_events=30, peers={"p1": 7, "p2": "disabled"})
-    mapping = Mock(wraps=config.peers)
-    mapping.items.side_effect = AssertionError("lookup traversed unrelated Peers")
-    config.peers = mapping
-    for peer, expected in (("p1", 7), ("p2", None), ("p10", 30)):
+@pytest.mark.parametrize("peer_days", [7, "disabled", None])
+def test_peers_share_user_policy_independently_of_user_events(peer_days):
+    config = TTLConfig(peer_events=peer_days, user_events=60)
+    account = TTLConfig(peer_events=30)
+    expected = {7: 7, "disabled": None, None: 30}[peer_days]
+    for suffix in ("", "/p1/memories/events", "/p2/memories/events/2026/10/01"):
         assert (
-            resolve_effective_ttl(
-                None, None, f"viking://user/u1/peers/{peer}/memories/events", config
-            ).days
+            resolve_effective_ttl(None, account, "viking://user/u1/peers" + suffix, config).days
             == expected
         )
-    assert mapping.get.call_count == 3
+    assert resolve_effective_ttl(None, account, USER_EVENTS_DIR, config).days == 60
+
+
+def test_peer_scope_is_queryable_but_not_a_concrete_scan_root():
+    scope = "viking://user/u1/peers"
+    validate_ttl_root(scope, allow_peer_scope=True)
+    with pytest.raises(ValueError):
+        validate_ttl_root(scope)
+    validate_ttl_root(scope + "/p1/memories/events")
 
 
 @pytest.mark.parametrize(
@@ -186,10 +192,9 @@ def test_peer_override_is_independent_and_constant_lookup():
         {"sessions": True},
         {"sessions": 0},
         {"sessions": 365001},
-        {"peers": {"../other": 7}},
-        {"peers": {"p1": False}},
+        {"peers": {"p1": 7}},
     ],
 )
 def test_reject_invalid_user_ttl(payload):
     with pytest.raises(ValueError):
-        UserTTLConfig.model_validate(payload)
+        TTLConfig.model_validate(payload)

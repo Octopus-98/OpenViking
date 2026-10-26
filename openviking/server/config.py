@@ -30,7 +30,7 @@ from openviking_cli.utils.config.consts import (
     OPENVIKING_CONFIG_ENV,
     SYSTEM_CONFIG_DIR,
 )
-from openviking_cli.utils.config.ttl_config import UserTTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig
 
 logger = get_logger(__name__)
 
@@ -142,7 +142,7 @@ class UserConfig(BaseModel):
 
     add_targets: AddTargetsConfig = Field(default_factory=AddTargetsConfig)
     memory_policy: Optional[Dict[str, Any]] = None
-    ttl: Optional[UserTTLConfig] = None
+    ttl: Optional[TTLConfig] = None
     agent_evolution: DeprecatedUserAgentEvolutionConfig = Field(
         default_factory=DeprecatedUserAgentEvolutionConfig,
         exclude=True,
