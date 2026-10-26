@@ -352,7 +352,20 @@ class ExternalTaskService:
             claimed = True
             on_start = getattr(provider, "on_start", None)
             if on_start is not None:
-                started = await on_start(task)
+                try:
+                    started = await on_start(task)
+                except Exception as exc:
+                    # Only unsubmitted work can fail without stopping a Runtime session.
+                    if task.status != TaskStatus.PENDING:
+                        raise
+                    if isinstance(exc, (ResourceBusyError, GitConcurrentCommitError)):
+                        started = "busy"
+                    else:
+                        started = ExternalTaskSnapshot(
+                            status="failed",
+                            error_code=getattr(exc, "code", None) or "INTERNAL",
+                            error_message=str(exc) or type(exc).__name__,
+                        )
                 if started == "busy":
                     self._release(task)
                     return False
