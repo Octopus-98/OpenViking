@@ -25,7 +25,6 @@ from openviking.session.checkpoints import (
 )
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
 from openviking.session.session import Session, _ArchiveSummaryResult
-from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import InternalError, UnavailableError
 
@@ -1590,12 +1589,7 @@ async def test_concurrent_stale_session_instances_use_one_authoritative_phase1_s
     results = await asyncio.gather(
         session_a.commit_async(memory_policy=disabled_policy),
         session_b.commit_async(memory_policy=disabled_policy),
-        return_exceptions=True,
     )
-    for index, result in enumerate(results):
-        if isinstance(result, LockAcquisitionError):
-            session = (session_a, session_b)[index]
-            results[index] = await session.commit_async(memory_policy=disabled_policy)
 
     assert sum(result["archived"] is True for result in results) == 1
     assert len(await session_a._archives.list_refs()) == 1
@@ -1610,17 +1604,10 @@ async def test_concurrent_stale_workers_append_without_losing_messages(
     session_b = client(session_id=session_a.session_id)
     await session_b.load()
 
-    results = await asyncio.gather(
+    await asyncio.gather(
         asyncio.to_thread(session_a.add_message, "user", [TextPart("from worker a")]),
         asyncio.to_thread(session_b.add_message, "user", [TextPart("from worker b")]),
-        return_exceptions=True,
     )
-    for index, result in enumerate(results):
-        if isinstance(result, LockAcquisitionError):
-            session = (session_a, session_b)[index]
-            await session.add_message_async(
-                "user", [TextPart(("from worker a", "from worker b")[index])]
-            )
 
     fresh = client(session_id=session_a.session_id)
     await fresh.load()
@@ -1630,7 +1617,7 @@ async def test_concurrent_stale_workers_append_without_losing_messages(
     ]
 
 
-async def test_session_state_lock_rejects_append_during_meta_update(
+async def test_session_state_lock_serializes_root_meta_without_blocking_archive_write(
     client,
     monkeypatch,
 ):
@@ -1667,12 +1654,14 @@ async def test_session_state_lock_rejects_append_during_meta_update(
         timeout=1.0,
     )
 
-    with pytest.raises(LockAcquisitionError):
-        await appending.add_message_async("assistant", [TextPart("second")])
+    append_task = asyncio.create_task(
+        appending.add_message_async("assistant", [TextPart("second")])
+    )
+    await asyncio.sleep(0.05)
+    assert not append_task.done()
 
     allow_phase2_save.set()
-    await merge_task
-    await appending.add_message_async("assistant", [TextPart("second")])
+    await asyncio.gather(merge_task, append_task)
 
     fresh = client(session_id=initial.session_id)
     await fresh.load()
@@ -1683,7 +1672,7 @@ async def test_session_state_lock_rejects_append_during_meta_update(
     assert fresh.meta.commit_count == 1
 
 
-async def test_add_rejects_commit_root_rewrite_until_retry(
+async def test_add_waits_for_commit_root_rewrite_and_remains_live(
     client,
     monkeypatch,
 ):
@@ -1718,11 +1707,13 @@ async def test_add_rejects_commit_root_rewrite_until_retry(
 
     commit_task = asyncio.create_task(committing.commit_async(memory_policy=disabled_policy))
     await commit_inside_rewrite.wait()
-    with pytest.raises(LockAcquisitionError):
-        await adding.add_message_async("assistant", [TextPart("keep me live")])
+    add_task = asyncio.create_task(
+        asyncio.to_thread(adding.add_message, "assistant", [TextPart("keep me live")])
+    )
+    await asyncio.sleep(0.05)
+    assert not add_task.done()
     allow_commit_rewrite.set()
-    await commit_task
-    await adding.add_message_async("assistant", [TextPart("keep me live")])
+    await asyncio.gather(commit_task, add_task)
 
     fresh = client(session_id=committing.session_id)
     await fresh.load()
