@@ -722,9 +722,7 @@ class Session:
         """Materialize session root and messages file if missing."""
         # Initial state must not overwrite a concurrent append or commit.
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(session_path)
         try:
             if await self.exists():
                 return
@@ -747,13 +745,10 @@ class Session:
         """
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
         agfs = self._viking_fs._async_agfs
-        session_lease = await agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
+        session_lease = await agfs.pathlock_acquire_exact(session_path)
         try:
             file_lease = await agfs.pathlock_acquire_exact_batch(
                 [f"{session_path}/{name}" for name in filenames],
-                timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
                 owner_lease_ref=session_lease,
             )
             try:
@@ -1503,9 +1498,7 @@ class Session:
         # state and archive-number allocation. Child files use their own exact
         # locks, so Phase 2 can keep writing an earlier archive concurrently.
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(session_path)
         publication_lease: Optional[Any] = None
         try:
             self._messages = await self._read_live_messages_strict()
@@ -1745,7 +1738,6 @@ class Session:
                 archive_path = self._viking_fs._uri_to_path(archive_uri, ctx=self.ctx)
                 publication_lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
                     archive_path,
-                    timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
                 )
                 await self._write_phase1_ready_marker(archive_uri)
                 if record_idle_commit_success:
