@@ -4397,3 +4397,10 @@ async def test_user_ttl_reuses_settings_backup_and_sparse_type_patch(
     monkeypatch.setattr(wiring, "_adapter", None)
     response = await lightweight_admin_client.patch(url, json={"ttl": None}, headers=root_headers())
     assert response.status_code == 501 and fs.files == before
+    monkeypatch.setattr(wiring, "_adapter", adapter)
+    cleared = await lightweight_admin_client.patch(url, json={"ttl": None}, headers=root_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["result"]["ttl"] is None
+    queried = await lightweight_admin_client.get(url, headers=root_headers())
+    assert queried.json()["result"]["ttl"] is None
+    assert queried.json()["result"]["memory_policy"]["memory_types"] == ["profile"]
