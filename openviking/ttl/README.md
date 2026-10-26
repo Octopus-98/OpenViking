@@ -56,12 +56,12 @@ User TTL lives in `settings/user_config.json` and uses the existing
 `GET/PATCH /api/v1/admin/accounts/{account_id}/users/{user_id}/settings` API:
 
 ```json
-{"ttl": {"sessions": 30, "user_events": 60, "peer_events": 60,
-         "peers": {"assistant-a": 7, "assistant-b": "disabled"}}}
+{"ttl": {"sessions": 30, "user_events": 60, "peer_events": 60}}
 ```
 
 For each field, User overrides Account, which overrides global configuration.
-An explicit Peer overrides `peer_events`; type defaults precede `global`.
+All Peers under one User share `peer_events`. `user_events` and `sessions`
+remain independent. Type defaults precede `global`.
 Missing fields inherit, `disabled` stops fallback, and PATCH `null` removes an
 override. `roots` is no longer part of the cluster/Account configuration schema.
 The existing UserConfig update lock, validation, backup and deletion apply.
