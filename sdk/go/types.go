@@ -161,7 +161,8 @@ type MountMCPToolOptions struct {
 
 // WaitOptions controls whether an asynchronous operation waits for processing.
 type WaitOptions struct {
-	Wait bool
+	Wait      bool
+	TargetURI string
 }
 
 // MCPToolMount describes one live context mount in a batch request.

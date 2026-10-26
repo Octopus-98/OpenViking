@@ -63,10 +63,16 @@ export type McpCatalogTool = {
   tool: McpToolDefinition
 }
 
+export type McpCatalogServer = {
+  name: string
+  root_uri: string
+  tools: McpCatalogTool[]
+}
+
 export type McpCatalog = {
   complete: boolean
   error?: string
-  servers: Array<{ name: string; tools: McpCatalogTool[] }>
+  servers: McpCatalogServer[]
   tools: McpCatalogTool[]
 }
 

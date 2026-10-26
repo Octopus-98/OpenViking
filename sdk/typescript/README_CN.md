@@ -65,9 +65,12 @@ await client.commitSession("s1", { keepRecentCount: 0, eventTags: [] });
 ## MCP Server 与实时上下文
 
 ```ts
-await client.addMCP("weather", "https://mcp.example.com/api", {
-  Authorization: "Bearer token",
-});
+await client.addMCP(
+  "weather",
+  "https://mcp.example.com/api",
+  { Authorization: "Bearer token" },
+  { targetUri: "viking://agent/tools" },
+);
 // 工具摘要和索引默认在后台继续处理。
 // 需要等待完成时，将 { wait: true } 作为第四个参数传入。
 const tools = await client.findMCPTools("当前天气", 5);
@@ -98,13 +101,19 @@ await client.batchUnmountMCPTools(
   ["viking://resources/arranger/shanghai-weather.md"],
   { wait: true },
 );
-const syncResult = await client.syncMCP("weather");
+const syncResult = await client.syncMCP("weather", {
+  targetUri: "viking://agent/tools",
+});
 console.log(syncResult.changes, syncResult.affected_mounts);
 ```
 
 客户端还提供 `removeMCP`、`listMCPs`、`validateMCP`、`getMCP`、
 `getMCPStatus`、`invokeMCPTool`、`batchMountMCPTools`、`unmountMCPTool`、
 `batchUnmountMCPTools` 和 `listMCPMounts`。
+
+注册默认写入 `viking://~/tools`。账号共享 Server 需传
+`targetUri: "viking://agent/tools"`。`listMCPs` 和 `findMCPTools`
+未指定路径时合并两个空间，其他名称型操作默认使用用户空间。
 
 OVPack 导出和备份与 Python、Go SDK 契约一致：内容会流式写入 Node.js 本地文件，并返回最终文件路径。
 

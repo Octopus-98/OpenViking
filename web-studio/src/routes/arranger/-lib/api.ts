@@ -24,6 +24,7 @@ import type {
   LiveMountIndex,
   LoadedDirectory,
   McpCatalog,
+  McpCatalogServer,
   McpCatalogTool,
   MountInput,
   MutationKind,
@@ -74,7 +75,9 @@ function invalidApiResponse(resource: ApiResource, value: unknown): Error {
   )
 }
 
-export function parseMcpServers(value: unknown): Array<{ name: string }> {
+export function parseMcpServers(
+  value: unknown,
+): Array<Omit<McpCatalogServer, 'tools'>> {
   const servers = Array.isArray(value)
     ? value
     : value &&
@@ -96,7 +99,16 @@ export function parseMcpServers(value: unknown): Array<{ name: string }> {
   ) {
     throw invalidApiResponse('mcpServerList', value)
   }
-  return servers as Array<{ name: string }>
+  return servers.map((server) => {
+    const parsedServer = server as { name: string; root_uri?: unknown }
+    return {
+      name: parsedServer.name,
+      root_uri:
+        typeof parsedServer.root_uri === 'string' && parsedServer.root_uri
+          ? normalizeVikingUri(parsedServer.root_uri)
+          : 'viking://agent/tools',
+    }
+  })
 }
 
 export function parseMcpMounts(value: unknown): LiveContextMount[] {
@@ -115,6 +127,7 @@ export function parseMcpMounts(value: unknown): LiveContextMount[] {
 export function parseMcpTools(
   server: string,
   value: unknown,
+  rootUri = 'viking://agent/tools',
 ): McpCatalogTool[] {
   const tools =
     value &&
@@ -163,7 +176,10 @@ export function parseMcpTools(
         name,
         title: typeof tool.title === 'string' ? tool.title : undefined,
       },
-      uri: `viking://agent/tools/${server}/${name}.json`,
+      uri:
+        'uri' in document && typeof document.uri === 'string'
+          ? normalizeVikingUri(document.uri)
+          : `${normalizeVikingUri(rootUri)}/${server}/${name}.json`,
     }
   })
 }
@@ -176,13 +192,18 @@ export async function loadMcpCatalog(): Promise<McpCatalog> {
   )
   const servers = parseMcpServers(serverResult)
   const settled = await Promise.allSettled(
-    servers.map(async ({ name }) => {
+    servers.map(async ({ name, root_uri }) => {
       const result = await getOvResult<unknown>(
         getOvClient().instance.get(`/api/v1/mcps/${encodeURIComponent(name)}`, {
           baseURL: apiBaseUrl(),
+          params: { target_uri: root_uri },
         }),
       )
-      return { name, tools: parseMcpTools(name, result) }
+      return {
+        name,
+        root_uri,
+        tools: parseMcpTools(name, result, root_uri),
+      }
     }),
   )
   const loaded = settled.flatMap((item) =>
@@ -408,11 +429,11 @@ export async function loadLiveMounts(rootUri: string): Promise<LiveMountIndex> {
     )
     const servers = parseMcpServers(serverResult)
     const settled = await Promise.allSettled(
-      servers.map(async ({ name }) => {
+      servers.map(async ({ name, root_uri }) => {
         const mountResult = await getOvResult<unknown>(
           getOvClient().instance.get('/api/v1/mcps/mounts', {
             baseURL: apiBaseUrl(),
-            params: { mcp: name },
+            params: { mcp: name, target_uri: root_uri },
           }),
         )
         return parseMcpMounts(mountResult)

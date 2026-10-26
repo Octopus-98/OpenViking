@@ -109,7 +109,6 @@ import { initialSchemaArguments, validateSchemaArguments } from './-lib/schema'
 import type { SchemaFormObject } from './-lib/schema'
 import {
   joinVikingUri,
-  mcpServerNameFromToolUri,
   nameFromVikingUri,
   normalizeVikingUri,
   parentVikingUri,
@@ -1280,7 +1279,7 @@ function ActionDialog({
       : defaultParent,
   )
   const [toolUri, setToolUri] = useState('')
-  const [serverName, setServerName] = useState('')
+  const [serverUri, setServerUri] = useState('')
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [timeout, setTimeoutValue] = useState('60')
@@ -1294,8 +1293,10 @@ function ActionDialog({
   const initializedMountRef = useRef<string | null>(null)
   const initializedArgumentsRef = useRef<string | null>(null)
   const selectedTool = catalog?.tools.find((tool) => tool.uri === toolUri)
-  const serverTools =
-    catalog?.servers.find((server) => server.name === serverName)?.tools || []
+  const selectedServer = catalog?.servers.find(
+    (server) => `${server.root_uri}/${server.name}` === serverUri,
+  )
+  const serverTools = selectedServer?.tools || []
 
   useEffect(() => {
     const source = action.source
@@ -1305,7 +1306,7 @@ function ActionDialog({
     initializedMountRef.current = source.uri
     setName(source.name)
     setToolUri(mount.tool_uri)
-    setServerName(mcpServerNameFromToolUri(mount.tool_uri) || mount.mcp)
+    setServerUri(parentVikingUri(mount.tool_uri))
     setTitle(mount.title || nameFromVikingUri(source.uri))
     setDescription(mount.description || '')
     setTimeoutValue(String(mount.timeout_seconds || 60))
@@ -1316,12 +1317,13 @@ function ActionDialog({
     if (
       action.kind !== 'mount' ||
       action.source ||
-      serverName ||
+      serverUri ||
       !catalog?.servers.length
     )
       return
-    setServerName(catalog.servers[0].name)
-  }, [action.kind, action.source, catalog?.servers, serverName])
+    const server = catalog.servers[0]
+    setServerUri(`${server.root_uri}/${server.name}`)
+  }, [action.kind, action.source, catalog?.servers, serverUri])
 
   useEffect(() => {
     const source = action.source
@@ -1483,9 +1485,9 @@ function ActionDialog({
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={t('fields.server')} required>
                   <Select
-                    value={serverName || null}
+                    value={serverUri || null}
                     onValueChange={(value) => {
-                      setServerName(value === null ? '' : String(value))
+                      setServerUri(value === null ? '' : String(value))
                       setToolUri('')
                       setArgumentValues({})
                       setArgumentErrors([])
@@ -1493,7 +1495,7 @@ function ActionDialog({
                   >
                     <SelectTrigger className="w-full">
                       <SelectValue>
-                        {serverName ||
+                        {selectedServer?.name ||
                           (catalogLoading
                             ? t('mount.loadingTools')
                             : t('mount.selectServer'))}
@@ -1501,8 +1503,14 @@ function ActionDialog({
                     </SelectTrigger>
                     <SelectContent>
                       {(catalog?.servers || []).map((server) => (
-                        <SelectItem key={server.name} value={server.name}>
+                        <SelectItem
+                          key={`${server.root_uri}/${server.name}`}
+                          value={`${server.root_uri}/${server.name}`}
+                        >
                           {server.name}
+                          <span className="text-xs text-muted-foreground">
+                            {server.root_uri}
+                          </span>
                           <span className="text-xs text-muted-foreground">
                             {t('mount.toolCount', {
                               count: server.tools.length,
@@ -1516,7 +1524,7 @@ function ActionDialog({
                 <Field label={t('fields.tool')} required>
                   <Select
                     value={toolUri || null}
-                    disabled={!serverName}
+                    disabled={!serverUri}
                     onValueChange={(value) => {
                       const uri = value === null ? '' : String(value)
                       const tool = catalog?.tools.find(

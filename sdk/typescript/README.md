@@ -65,9 +65,12 @@ Deployments using shared temporary storage can set `uploadMode: "shared"`; the s
 ## MCP Servers and Live Context
 
 ```ts
-await client.addMCP("weather", "https://mcp.example.com/api", {
-  Authorization: "Bearer token",
-});
+await client.addMCP(
+  "weather",
+  "https://mcp.example.com/api",
+  { Authorization: "Bearer token" },
+  { targetUri: "viking://agent/tools" },
+);
 // Tool summaries and indexing continue in the background by default.
 // Pass { wait: true } as the fourth argument to wait.
 const tools = await client.findMCPTools("current weather", 5);
@@ -98,13 +101,20 @@ await client.batchUnmountMCPTools(
   ["viking://resources/arranger/shanghai-weather.md"],
   { wait: true },
 );
-const syncResult = await client.syncMCP("weather");
+const syncResult = await client.syncMCP("weather", {
+  targetUri: "viking://agent/tools",
+});
 console.log(syncResult.changes, syncResult.affected_mounts);
 ```
 
 The client also exposes `removeMCP`, `listMCPs`, `validateMCP`, `getMCP`,
 `getMCPStatus`, `invokeMCPTool`, `batchMountMCPTools`, `unmountMCPTool`,
 `batchUnmountMCPTools`, and `listMCPMounts`.
+
+Registration defaults to `viking://~/tools`. Set `targetUri` to
+`viking://agent/tools` for account-shared servers. `listMCPs` and
+`findMCPTools` merge both spaces when it is omitted; name-based operations
+default to the user space.
 
 OVPack exports and backups follow the Python and Go SDK contract: they are streamed to a Node.js local file and return its final path.
 

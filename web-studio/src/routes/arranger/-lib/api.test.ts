@@ -6,6 +6,8 @@ import type * as OvClientModule from '#/lib/ov-client'
 
 import {
   isLiveContextDocument,
+  loadLiveMounts,
+  loadMcpCatalog,
   moveLiveContext,
   parseLiveContextMetadata,
   parseMcpMounts,
@@ -14,7 +16,7 @@ import {
   saveText,
 } from './api'
 
-const { post } = vi.hoisted(() => ({ post: vi.fn() }))
+const { get, post } = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn() }))
 
 vi.mock('#/lib/ov-client', async (importOriginal) => {
   const original = await importOriginal<typeof OvClientModule>()
@@ -22,12 +24,13 @@ vi.mock('#/lib/ov-client', async (importOriginal) => {
     ...original,
     getOvClient: () => ({
       getOptions: () => ({ baseUrl: 'http://localhost:1933' }),
-      instance: { post },
+      instance: { get, post },
     }),
   }
 })
 
 afterEach(() => {
+  get.mockReset()
   post.mockReset()
   vi.useRealTimers()
 })
@@ -92,11 +95,13 @@ describe('live context moving', () => {
 
 describe('MCP response parsing', () => {
   it('accepts result objects and direct arrays', () => {
-    expect(parseMcpServers({ servers: [{ name: 'k8s' }] })).toEqual([
-      { name: 'k8s' },
-    ])
+    expect(
+      parseMcpServers({
+        servers: [{ name: 'k8s', root_uri: 'viking://user/alice/tools' }],
+      }),
+    ).toEqual([{ name: 'k8s', root_uri: 'viking://user/alice/tools' }])
     expect(parseMcpServers([{ name: 'database' }])).toEqual([
-      { name: 'database' },
+      { name: 'database', root_uri: 'viking://agent/tools' },
     ])
     const mount = {
       arguments: { cluster: 'production' },
@@ -130,6 +135,7 @@ describe('MCP response parsing', () => {
           {
             input_revision: 'ir1',
             revision: 'r1',
+            uri: 'viking://user/alice/tools/demo/get-sum.json',
             tool: {
               description: 'Add two numbers',
               inputSchema: {
@@ -151,13 +157,61 @@ describe('MCP response parsing', () => {
         input_revision: 'ir1',
         revision: 'r1',
         server: 'demo',
-        uri: 'viking://agent/tools/demo/get-sum.json',
+        uri: 'viking://user/alice/tools/demo/get-sum.json',
         tool: expect.objectContaining({
           name: 'get-sum',
           title: 'Get sum',
         }),
       }),
     ])
+  })
+
+  it('forwards each server root when loading tools and mounts', async () => {
+    const response = (result: unknown) =>
+      Promise.resolve({
+        data: { result, status: 'ok' },
+        headers: {},
+        status: 200,
+      })
+    get
+      .mockReturnValueOnce(
+        response({
+          servers: [
+            { name: 'demo', root_uri: 'viking://user/alice/tools' },
+            { name: 'demo', root_uri: 'viking://agent/tools' },
+          ],
+        }),
+      )
+      .mockReturnValueOnce(response({ tools: [] }))
+      .mockReturnValueOnce(response({ tools: [] }))
+
+    const catalog = await loadMcpCatalog()
+
+    expect(catalog.servers).toEqual([
+      { name: 'demo', root_uri: 'viking://user/alice/tools', tools: [] },
+      { name: 'demo', root_uri: 'viking://agent/tools', tools: [] },
+    ])
+    expect(get.mock.calls[1]?.[1]?.params).toEqual({
+      target_uri: 'viking://user/alice/tools',
+    })
+    expect(get.mock.calls[2]?.[1]?.params).toEqual({
+      target_uri: 'viking://agent/tools',
+    })
+
+    get
+      .mockReturnValueOnce(
+        response({
+          servers: [{ name: 'demo', root_uri: 'viking://agent/tools' }],
+        }),
+      )
+      .mockReturnValueOnce(response({ mounts: [] }))
+
+    await loadLiveMounts('viking://resources/arranger')
+
+    expect(get.mock.calls[4]?.[1]?.params).toEqual({
+      mcp: 'demo',
+      target_uri: 'viking://agent/tools',
+    })
   })
 })
 

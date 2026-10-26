@@ -15,7 +15,9 @@ This module registers Streamable HTTP MCP servers, synchronizes and searches the
 - MCP servers must use Streamable HTTP, and URLs may use HTTP or HTTPS. HTTP does not encrypt transport; users are responsible for assessing exposure risks for credentials and tool data.
 - Server names may contain only letters, numbers, `_`, and `-`, up to 64 characters. Tool names must be valid OpenViking filenames.
 - HTTP headers submitted at registration are stored within the account scope. APIs return only sorted `header_names`, never header values.
-- Tool definitions live at `viking://agent/tools/<server>/<tool>.json`. Invocation and mount arguments are validated against the tool's `inputSchema`.
+- Tool definitions can live in the user space at `viking://~/tools/<server>/<tool>.json` or in the account-shared space at `viking://agent/tools/<server>/<tool>.json`. Invocation and mount arguments are validated against the tool's `inputSchema`.
+- `target_uri` accepts only `viking://~/tools` or `viking://agent/tools`. Registration and name-based operations default to the user space; list and search merge both spaces when omitted. The same server name may exist in both spaces.
+- Both tools roots are managed directories. Do not mutate them with ordinary `mkdir`, `rm`, `cp`, or `mv`; use the MCP management APIs.
 - A live context node URI must be a Viking URI available to the current account and end in `.md`.
 - `wait` controls whether catalog or node writes wait for background processing. It is not a tool-call timeout. `timeout_seconds` is the timeout for each live tool invocation.
 
@@ -42,7 +44,7 @@ This module registers Streamable HTTP MCP servers, synchronizes and searches the
 
 ### Validate and register
 
-`POST /api/v1/mcps/validate` connects to the server, performs MCP initialization, and discovers tools without changing the registry or tool catalog. `POST /api/v1/mcps` performs the same checks, then registers the server and publishes definitions under `viking://agent/tools/<name>/`. Registration fails if the name already exists.
+`POST /api/v1/mcps/validate` connects to the server, performs MCP initialization, and discovers tools without changing the registry or tool catalog. `POST /api/v1/mcps` performs the same checks, then registers the server and publishes definitions. It defaults to `viking://~/tools/<name>/`; set `target_uri` to publish under `viking://agent/tools/<name>/`. Registration fails when the name already exists in the selected space.
 
 **Request body**
 
@@ -51,6 +53,7 @@ This module registers Streamable HTTP MCP servers, synchronizes and searches the
 | `name` | string | Yes | - | Server name |
 | `url` | string | Yes | - | Streamable HTTP endpoint |
 | `headers` | object | No | `{}` | HTTP headers sent to the upstream server |
+| `target_uri` | string | No | `viking://~/tools` | User or shared tools root |
 | `wait` | boolean | No | `false` | Registration only; wait for tool catalog processing |
 
 Unknown fields return `INVALID_ARGUMENT`. Inject credentials from environment variables or a secret manager; do not put them in resource files or commit them to source control.
@@ -69,6 +72,7 @@ result = client.add_mcp(
     "weather",
     "https://mcp.example.com/mcp",
     headers=headers,
+    target_uri="viking://agent/tools",
     wait=True,
 )
 ```
@@ -82,7 +86,7 @@ const result = await client.addMCP(
   "weather",
   "https://mcp.example.com/mcp",
   headers,
-  { wait: true },
+  { wait: true, targetUri: "viking://agent/tools" },
 );
 ```
 
@@ -101,7 +105,7 @@ result, err := client.AddMCP(
     "weather",
     "https://mcp.example.com/mcp",
     headers,
-    &openviking.WaitOptions{Wait: true},
+    &openviking.WaitOptions{Wait: true, TargetURI: "viking://agent/tools"},
 )
 ```
 
@@ -124,6 +128,7 @@ curl -X POST http://localhost:1933/api/v1/mcps \
     "name": "weather",
     "url": "https://mcp.example.com/mcp",
     "headers": {"Authorization": "Bearer <token>"},
+    "target_uri": "viking://agent/tools",
     "wait": true
   }'
 ```
@@ -132,7 +137,7 @@ curl -X POST http://localhost:1933/api/v1/mcps \
 
 ```bash
 ov mcps validate '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer <token>"}}}}'
-ov mcps add --wait '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer <token>"}}}}'
+ov mcps add -p viking://agent/tools --wait '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer <token>"}}}}'
 ```
 
 **Validation response**
@@ -142,6 +147,7 @@ ov mcps add --wait '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp
   "status": "ok",
   "result": {
     "name": "weather",
+    "root_uri": "viking://agent/tools",
     "valid": true,
     "protocol_version": "2025-03-26",
     "server_info": {"name": "weather-server", "version": "1.0.0"},
@@ -171,35 +177,36 @@ With `wait=false`, the registration result may also contain the underlying catal
 
 ### List, inspect, and check status
 
-`GET /api/v1/mcps` returns servers in the current account, sorted by name. `GET /api/v1/mcps/{name}` also returns complete tool documents from the current catalog. `GET /api/v1/mcps/status?name=...` connects to the upstream server in real time. A connection failure still has a successful HTTP envelope, but `result.status` is `error`.
+Without `target_uri`, `GET /api/v1/mcps` merges user and shared servers and identifies each entry with `root_uri`. `GET /api/v1/mcps/{name}` and status default to the user space; pass `target_uri=viking://agent/tools` for a same-named shared server. A connection failure still has a successful HTTP envelope, but `result.status` is `error`.
 
 **SDK and CLI**
 
 ```python
 servers = client.list_mcps()
-server = client.get_mcp("weather")
-status = client.get_mcp_status("weather")
+server = client.get_mcp("weather", target_uri="viking://agent/tools")
+status = client.get_mcp_status("weather", target_uri="viking://agent/tools")
 ```
 
 ```typescript
 const servers = await client.listMCPs();
-const server = await client.getMCP("weather");
-const status = await client.getMCPStatus("weather");
+const server = await client.getMCP("weather", "viking://agent/tools");
+const status = await client.getMCPStatus("weather", "viking://agent/tools");
 ```
 
 ```bash
 ov mcps list
-ov mcps show weather
-ov mcps status weather
+ov mcps show -p viking://agent/tools weather
+ov mcps status -p viking://agent/tools weather
 ```
 
 **HTTP API**
 
 ```bash
 curl -H "X-API-Key: your-key" http://localhost:1933/api/v1/mcps
-curl -H "X-API-Key: your-key" http://localhost:1933/api/v1/mcps/weather
 curl -H "X-API-Key: your-key" \
-  "http://localhost:1933/api/v1/mcps/status?name=weather"
+  "http://localhost:1933/api/v1/mcps/weather?target_uri=viking%3A%2F%2Fagent%2Ftools"
+curl -H "X-API-Key: your-key" \
+  "http://localhost:1933/api/v1/mcps/status?name=weather&target_uri=viking%3A%2F%2Fagent%2Ftools"
 ```
 
 **List response**
@@ -210,6 +217,7 @@ curl -H "X-API-Key: your-key" \
   "result": {
     "servers": [{
       "name": "weather",
+      "root_uri": "viking://agent/tools",
       "url": "https://mcp.example.com/mcp",
       "created_at": "2026-10-21T08:00:00+00:00",
       "updated_at": "2026-10-21T08:00:00+00:00",
@@ -254,24 +262,28 @@ On a connection failure, `result` is `{"name":"weather","status":"error","error"
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `wait` | boolean | No | `false` | Wait for tool catalog processing; the whole body may be omitted |
+| `target_uri` | string | No | `viking://~/tools` | Server's tools root |
 
 **SDK, HTTP, and CLI**
 
 ```python
-result = client.sync_mcp("weather", wait=True)
+result = client.sync_mcp("weather", target_uri="viking://agent/tools", wait=True)
 ```
 
 ```typescript
-const result = await client.syncMCP("weather", { wait: true });
+const result = await client.syncMCP("weather", {
+  targetUri: "viking://agent/tools",
+  wait: true,
+});
 ```
 
 ```bash
 curl -X POST http://localhost:1933/api/v1/mcps/weather/sync \
   -H "X-API-Key: your-key" \
   -H "Content-Type: application/json" \
-  -d '{"wait":true}'
+  -d '{"target_uri":"viking://agent/tools","wait":true}'
 
-ov mcps sync --wait weather
+ov mcps sync -p viking://agent/tools --wait weather
 ```
 
 **Response contract**
@@ -305,15 +317,15 @@ ov mcps sync --wait weather
 
 ### Remove a server
 
-`DELETE /api/v1/mcps/{name}` removes the registry entry and the `viking://agent/tools/<name>/` catalog. It does not remove mounted live context nodes. Those nodes can no longer execute, so list and unmount them first.
+`DELETE /api/v1/mcps/{name}` removes the registry entry and catalog from the selected space. It does not remove mounted live context nodes. Those nodes can no longer execute, so list and unmount them first.
 
 ```python
-result = client.remove_mcp("weather")
+result = client.remove_mcp("weather", target_uri="viking://agent/tools")
 ```
 
 ```bash
-ov mcps mounts --mcp weather
-ov mcps remove weather
+ov mcps mounts -p viking://agent/tools --mcp weather
+ov mcps remove -p viking://agent/tools weather
 ```
 
 ```json
@@ -327,12 +339,13 @@ ov mcps remove weather
 
 ### Search tools semantically
 
-`POST /api/v1/mcps/find` searches semantically under `viking://agent/tools`. REST and SDK responses include the complete `tool` definition, allowing callers to supply only parameters required by its `inputSchema`.
+Without `target_uri`, `POST /api/v1/mcps/find` searches both the user and shared spaces and merges the results. Set it to restrict search to one tools root. REST and SDK responses include the complete `tool` definition, allowing callers to supply only parameters required by its `inputSchema`.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | - | Non-empty natural-language query |
 | `limit` | integer | No | `10` | Result limit, from 1 to 100 |
+| `target_uri` | string | No | Both spaces | Restrict search to the user or shared tools root |
 
 ```python
 result = client.find_mcp_tools("current weather for a city", limit=5)
@@ -531,7 +544,7 @@ Mount responses do not include `tags` because vector indexing may still be async
 
 ### List mounts
 
-`GET /api/v1/mcps/mounts` requires the `mcp` query parameter and accepts an optional `tool`. The server must still be registered.
+`GET /api/v1/mcps/mounts` requires `mcp`, accepts an optional `tool`, and uses `target_uri` to select the same-named server's space. It defaults to the user space. The server must still be registered.
 Returned `tags` are read from the vector index; the mount database does not keep a separate copy.
 
 ```python

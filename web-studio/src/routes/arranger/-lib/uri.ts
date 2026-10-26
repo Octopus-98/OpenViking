@@ -66,9 +66,10 @@ export function nameFromVikingUri(uri: string): string {
 
 export function mcpServerNameFromToolUri(uri: string): string | null {
   try {
-    const match = /^viking:\/\/agent\/tools\/([^/]+)\/[^/]+\.json$/.exec(
-      normalizeVikingUri(uri),
-    )
+    const match =
+      /^viking:\/\/(?:agent|user\/[^/]+)\/tools\/([^/]+)\/[^/]+\.json$/.exec(
+        normalizeVikingUri(uri),
+      )
     return match?.[1] || null
   } catch {
     return null

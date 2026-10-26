@@ -243,6 +243,61 @@ async def test_async_http_client_mcp_defaults_match_server_contract():
     ]
 
 
+@pytest.mark.asyncio
+async def test_async_http_client_scopes_mcp_operations_to_tools_root():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    fake_http = SimpleNamespace(request=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response = lambda _response: {}
+    target_uri = "viking://agent/tools"
+
+    await client.add_mcp("demo", "https://mcp.example.com/api", target_uri=target_uri)
+    await client.remove_mcp("demo", target_uri=target_uri)
+    await client.list_mcps(target_uri=target_uri)
+    await client.find_mcp_tools("weather", target_uri=target_uri)
+    await client.get_mcp("demo", target_uri=target_uri)
+    await client.sync_mcp("demo", target_uri=target_uri)
+    await client.get_mcp_status("demo", target_uri=target_uri)
+    await client.list_mcp_mounts("demo", target_uri=target_uri)
+
+    assert fake_http.request.await_args_list == [
+        call(
+            "POST",
+            "/api/v1/mcps",
+            json={
+                "name": "demo",
+                "url": "https://mcp.example.com/api",
+                "headers": {},
+                "target_uri": target_uri,
+                "wait": False,
+            },
+        ),
+        call("DELETE", "/api/v1/mcps/demo", params={"target_uri": target_uri}),
+        call("GET", "/api/v1/mcps", params={"target_uri": target_uri}),
+        call(
+            "POST",
+            "/api/v1/mcps/find",
+            json={"query": "weather", "limit": 10, "target_uri": target_uri},
+        ),
+        call("GET", "/api/v1/mcps/demo", params={"target_uri": target_uri}),
+        call(
+            "POST",
+            "/api/v1/mcps/demo/sync",
+            json={"wait": False, "target_uri": target_uri},
+        ),
+        call(
+            "GET",
+            "/api/v1/mcps/status",
+            params={"name": "demo", "target_uri": target_uri},
+        ),
+        call(
+            "GET",
+            "/api/v1/mcps/mounts",
+            params={"mcp": "demo", "target_uri": target_uri},
+        ),
+    ]
+
+
 def test_sync_http_client_exposes_and_forwards_mcp_operations():
     method_names = [
         "add_mcp",

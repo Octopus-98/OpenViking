@@ -69,23 +69,23 @@ pub async fn add(
     client: &HttpClient,
     raw_config: &str,
     wait: bool,
+    target_uri: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
     let config = parse_add_config(raw_config)?;
     let mut responses = Vec::with_capacity(config.mcp_servers.len());
     for (name, server) in config.mcp_servers {
-        let response: Value = client
-            .post(
-                "/api/v1/mcps",
-                &json!({
-                    "name": name,
-                    "url": server.url,
-                    "headers": server.headers,
-                    "wait": wait,
-                }),
-            )
-            .await?;
+        let mut body = json!({
+            "name": name,
+            "url": server.url,
+            "headers": server.headers,
+            "wait": wait,
+        });
+        if let Some(target_uri) = target_uri {
+            body["target_uri"] = json!(target_uri);
+        }
+        let response: Value = client.post("/api/v1/mcps", &body).await?;
         responses.push(response);
     }
     if !wait && matches!(output_format, OutputFormat::Table) {
@@ -106,17 +106,31 @@ pub async fn add(
 pub async fn remove(
     client: &HttpClient,
     name: &str,
+    target_uri: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
     validate_server_name(name)?;
-    let response: Value = client.delete(&format!("/api/v1/mcps/{name}"), &[]).await?;
+    let params = target_uri
+        .map(|uri| vec![("target_uri".to_string(), uri.to_string())])
+        .unwrap_or_default();
+    let response: Value = client
+        .delete(&format!("/api/v1/mcps/{name}"), &params)
+        .await?;
     print_response(&response, output_format, compact);
     Ok(())
 }
 
-pub async fn list(client: &HttpClient, output_format: OutputFormat, compact: bool) -> Result<()> {
-    let response: Value = client.get("/api/v1/mcps", &[]).await?;
+pub async fn list(
+    client: &HttpClient,
+    target_uri: Option<&str>,
+    output_format: OutputFormat,
+    compact: bool,
+) -> Result<()> {
+    let params = target_uri
+        .map(|uri| vec![("target_uri".to_string(), uri.to_string())])
+        .unwrap_or_default();
+    let response: Value = client.get("/api/v1/mcps", &params).await?;
     if let Some(rendered) = render_list_for_table(&response, output_format) {
         println!("{rendered}");
     } else {
@@ -169,6 +183,9 @@ fn render_list_for_table(response: &Value, output_format: OutputFormat) -> Optio
             theme::body(format!("{tool_count} {tool_noun}"))
         ));
         lines.push(format!("   {}", theme::sky_value(url).bold()));
+        if let Some(root_uri) = server.get("root_uri").and_then(Value::as_str) {
+            lines.push(format!("   {}", theme::muted(format!("root: {root_uri}"))));
+        }
 
         let header_names = server
             .get("header_names")
@@ -196,15 +213,15 @@ pub async fn find(
     client: &HttpClient,
     query: &str,
     limit: u8,
+    target_uri: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
-    let response: Value = client
-        .post(
-            "/api/v1/mcps/find",
-            &json!({"query": query, "limit": limit}),
-        )
-        .await?;
+    let mut body = json!({"query": query, "limit": limit});
+    if let Some(target_uri) = target_uri {
+        body["target_uri"] = json!(target_uri);
+    }
+    let response: Value = client.post("/api/v1/mcps/find", &body).await?;
     super::search::output_mcp_find_results(&response, output_format, compact, i32::from(limit));
     Ok(())
 }
@@ -241,11 +258,15 @@ pub async fn validate(
 pub async fn show(
     client: &HttpClient,
     name: &str,
+    target_uri: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
     validate_server_name(name)?;
-    let response: Value = client.get(&format!("/api/v1/mcps/{name}"), &[]).await?;
+    let params = target_uri
+        .map(|uri| vec![("target_uri".to_string(), uri.to_string())])
+        .unwrap_or_default();
+    let response: Value = client.get(&format!("/api/v1/mcps/{name}"), &params).await?;
     if let Some(rendered) = render_show_for_table(&response, output_format) {
         println!("{rendered}");
     } else {
@@ -262,6 +283,7 @@ fn render_show_for_table(response: &Value, output_format: OutputFormat) -> Optio
     let tools = server.get("tools")?.as_array()?;
     let mut lines = vec!["[metadata]".to_string()];
     push_show_field(&mut lines, "name", server.get("name"));
+    push_show_field(&mut lines, "root_uri", server.get("root_uri"));
     push_show_field(&mut lines, "url", server.get("url"));
     push_show_field(&mut lines, "tool_count", server.get("tool_count"));
     push_show_field(&mut lines, "header_names", server.get("header_names"));
@@ -369,15 +391,17 @@ pub async fn sync(
     client: &HttpClient,
     name: &str,
     wait: bool,
+    target_uri: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
     validate_server_name(name)?;
+    let mut body = json!({"wait": wait});
+    if let Some(target_uri) = target_uri {
+        body["target_uri"] = json!(target_uri);
+    }
     let response: Value = client
-        .post(
-            &format!("/api/v1/mcps/{name}/sync"),
-            &json!({"wait": wait}),
-        )
+        .post(&format!("/api/v1/mcps/{name}/sync"), &body)
         .await?;
     if !wait && matches!(output_format, OutputFormat::Table) {
         eprintln!("Note: MCP tool processing may continue in the background.");
@@ -476,11 +500,15 @@ fn push_sync_change_line(lines: &mut Vec<String>, label: &str, names: &[&str]) {
 pub async fn status(
     client: &HttpClient,
     name: &str,
+    target_uri: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
     validate_server_name(name)?;
-    let params = vec![("name".to_string(), name.to_string())];
+    let mut params = vec![("name".to_string(), name.to_string())];
+    if let Some(target_uri) = target_uri {
+        params.push(("target_uri".to_string(), target_uri.to_string()));
+    }
     let response: Value = client.get("/api/v1/mcps/status", &params).await?;
     print_response(&response, output_format, compact);
     Ok(())
@@ -537,6 +565,7 @@ pub async fn mounts(
     client: &HttpClient,
     mcp: &str,
     tool: Option<&str>,
+    target_uri: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -544,6 +573,9 @@ pub async fn mounts(
     let mut params = vec![("mcp".to_string(), mcp.to_string())];
     if let Some(tool) = tool {
         params.push(("tool".to_string(), tool.to_string()));
+    }
+    if let Some(target_uri) = target_uri {
+        params.push(("target_uri".to_string(), target_uri.to_string()));
     }
     let response: Value = client.get("/api/v1/mcps/mounts", &params).await?;
     if let Some(rendered) = render_mounts_for_table(&response, output_format) {

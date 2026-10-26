@@ -296,6 +296,7 @@ client.add_mcp(
     name="weather",
     url="https://mcp.example.com/api",
     headers={"Authorization": "Bearer token"},
+    target_uri="viking://agent/tools",
 )
 # Tool summaries and indexing continue in the background by default.
 # Pass wait=True when they must finish before this call returns.
@@ -325,7 +326,7 @@ client.batch_unmount_mcp_tools(
     ["viking://resources/arranger/shanghai-weather.md"],
     wait=True,
 )
-sync_result = client.sync_mcp("weather")
+sync_result = client.sync_mcp("weather", target_uri="viking://agent/tools")
 print(sync_result["changes"])
 print(sync_result["affected_mounts"])
 ```
@@ -335,6 +336,10 @@ The async client exposes the same methods. MCP operations include `add_mcp`,
 `get_mcp_status`, `find_mcp_tools`, `invoke_mcp_tool`, `mount_mcp_tool`,
 `batch_mount_mcp_tools`, `unmount_mcp_tool`, `batch_unmount_mcp_tools`, and
 `list_mcp_mounts`.
+
+Registration defaults to `viking://~/tools`. Pass `target_uri="viking://agent/tools"`
+for account-shared servers. `list_mcps` and `find_mcp_tools` merge both spaces
+when `target_uri` is omitted; name-based operations default to the user space.
 
 ### Core Parameters and Options
 

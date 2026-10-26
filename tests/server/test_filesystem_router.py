@@ -20,7 +20,7 @@ from openviking.server.routers import filesystem
 from openviking.service.fs_service import ListingPage
 from openviking.storage.queuefs.queue_manager import get_queue_manager
 from openviking.system_assets import builtin_memory_templates_dir
-from openviking_cli.exceptions import InvalidURIError
+from openviking_cli.exceptions import InvalidArgumentError, InvalidURIError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -112,6 +112,28 @@ def test_cp_request_defaults_to_non_recursive():
     )
 
     assert request.recursive is False
+
+
+@pytest.mark.parametrize(
+    ("operation", "uri"),
+    [
+        ("mkdir", "viking://agent/tools/demo"),
+        ("rm", "viking://user/alice/tools/demo/current.json"),
+        ("cp", "viking://agent/tools/demo/current.json"),
+        ("mv", "viking://user/alice/tools"),
+    ],
+)
+def test_managed_mcp_tools_reject_plain_filesystem_mutations(operation, uri):
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER)
+
+    with pytest.raises(InvalidArgumentError, match="use 'ov mcps' instead"):
+        filesystem._reject_managed_tools_uri(operation, [uri], ctx)
+
+    filesystem._reject_managed_tools_uri(
+        operation,
+        ["viking://resources/tools/demo"],
+        ctx,
+    )
 
 
 @pytest.mark.asyncio
@@ -504,10 +526,13 @@ async def test_service_startup_syncs_builtin_assets_and_custom_directory(service
     ctx = RequestContext(user=UserIdentifier("default", "default"), role=Role.ROOT)
     profile_uri = f"{SYSTEM_MEMORY_BUILTIN_ROOT}/profile.yaml"
 
-    assert await service.viking_fs.read_file_bytes(
-        profile_uri,
-        ctx=ctx,
-    ) == (builtin_memory_templates_dir() / "profile.yaml").read_bytes()
+    assert (
+        await service.viking_fs.read_file_bytes(
+            profile_uri,
+            ctx=ctx,
+        )
+        == (builtin_memory_templates_dir() / "profile.yaml").read_bytes()
+    )
     assert (
         await service.viking_fs.stat(
             SYSTEM_MEMORY_CUSTOM_ROOT,

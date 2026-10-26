@@ -947,34 +947,62 @@ class AsyncHTTPClient:
         url: str,
         headers: Optional[Mapping[str, str]] = None,
         *,
+        target_uri: Optional[str] = None,
         wait: bool = False,
     ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "name": name,
+            "url": url,
+            "headers": dict(headers or {}),
+            "wait": wait,
+        }
+        if target_uri is not None:
+            payload["target_uri"] = VikingURI.normalize(target_uri)
         response = await self._request(
             "POST",
             "/api/v1/mcps",
-            json={
-                "name": name,
-                "url": url,
-                "headers": dict(headers or {}),
-                "wait": wait,
-            },
+            json=payload,
         )
         return self._handle_response(response)
 
-    async def remove_mcp(self, name: str) -> Dict[str, Any]:
+    async def remove_mcp(
+        self,
+        name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
         name_path = self._path_segment(name)
-        response = await self._request("DELETE", f"/api/v1/mcps/{name_path}")
+        params = {"target_uri": VikingURI.normalize(target_uri)} if target_uri is not None else None
+        if params is None:
+            response = await self._request("DELETE", f"/api/v1/mcps/{name_path}")
+        else:
+            response = await self._request(
+                "DELETE",
+                f"/api/v1/mcps/{name_path}",
+                params=params,
+            )
         return self._handle_response(response)
 
-    async def list_mcps(self) -> Dict[str, Any]:
-        response = await self._request("GET", "/api/v1/mcps")
+    async def list_mcps(self, target_uri: Optional[str] = None) -> Dict[str, Any]:
+        params = {"target_uri": VikingURI.normalize(target_uri)} if target_uri is not None else None
+        if params is None:
+            response = await self._request("GET", "/api/v1/mcps")
+        else:
+            response = await self._request("GET", "/api/v1/mcps", params=params)
         return self._handle_response(response)
 
-    async def find_mcp_tools(self, query: str, limit: int = 10) -> Dict[str, Any]:
+    async def find_mcp_tools(
+        self,
+        query: str,
+        limit: int = 10,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"query": query, "limit": limit}
+        if target_uri is not None:
+            payload["target_uri"] = VikingURI.normalize(target_uri)
         response = await self._request(
             "POST",
             "/api/v1/mcps/find",
-            json={"query": query, "limit": limit},
+            json=payload,
         )
         return self._handle_response(response)
 
@@ -991,22 +1019,50 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    async def get_mcp(self, name: str) -> Dict[str, Any]:
+    async def get_mcp(
+        self,
+        name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
         name_path = self._path_segment(name)
-        response = await self._request("GET", f"/api/v1/mcps/{name_path}")
+        params = {"target_uri": VikingURI.normalize(target_uri)} if target_uri is not None else None
+        if params is None:
+            response = await self._request("GET", f"/api/v1/mcps/{name_path}")
+        else:
+            response = await self._request(
+                "GET",
+                f"/api/v1/mcps/{name_path}",
+                params=params,
+            )
         return self._handle_response(response)
 
-    async def sync_mcp(self, name: str, *, wait: bool = False) -> Dict[str, Any]:
+    async def sync_mcp(
+        self,
+        name: str,
+        *,
+        target_uri: Optional[str] = None,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
         name_path = self._path_segment(name)
+        payload: Dict[str, Any] = {"wait": wait}
+        if target_uri is not None:
+            payload["target_uri"] = VikingURI.normalize(target_uri)
         response = await self._request(
             "POST",
             f"/api/v1/mcps/{name_path}/sync",
-            json={"wait": wait},
+            json=payload,
         )
         return self._handle_response(response)
 
-    async def get_mcp_status(self, name: str) -> Dict[str, Any]:
-        response = await self._request("GET", "/api/v1/mcps/status", params={"name": name})
+    async def get_mcp_status(
+        self,
+        name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"name": name}
+        if target_uri is not None:
+            params["target_uri"] = VikingURI.normalize(target_uri)
+        response = await self._request("GET", "/api/v1/mcps/status", params=params)
         return self._handle_response(response)
 
     async def invoke_mcp_tool(
@@ -1115,10 +1171,13 @@ class AsyncHTTPClient:
         self,
         mcp: str,
         tool: Optional[str] = None,
+        target_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {"mcp": mcp}
         if tool is not None:
             params["tool"] = tool
+        if target_uri is not None:
+            params["target_uri"] = VikingURI.normalize(target_uri)
         response = await self._request("GET", "/api/v1/mcps/mounts", params=params)
         return self._handle_response(response)
 
@@ -2689,18 +2748,42 @@ class SyncHTTPClient:
         url: str,
         headers: Optional[Mapping[str, str]] = None,
         *,
+        target_uri: Optional[str] = None,
         wait: bool = False,
     ) -> Dict[str, Any]:
-        return run_async(self._async_client.add_mcp(name, url, headers=headers, wait=wait))
+        return run_async(
+            self._async_client.add_mcp(
+                name,
+                url,
+                headers=headers,
+                target_uri=target_uri,
+                wait=wait,
+            )
+        )
 
-    def remove_mcp(self, name: str) -> Dict[str, Any]:
-        return run_async(self._async_client.remove_mcp(name))
+    def remove_mcp(
+        self,
+        name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.remove_mcp(name, target_uri=target_uri))
 
-    def list_mcps(self) -> Dict[str, Any]:
-        return run_async(self._async_client.list_mcps())
+    def list_mcps(self, target_uri: Optional[str] = None) -> Dict[str, Any]:
+        return run_async(self._async_client.list_mcps(target_uri=target_uri))
 
-    def find_mcp_tools(self, query: str, limit: int = 10) -> Dict[str, Any]:
-        return run_async(self._async_client.find_mcp_tools(query, limit=limit))
+    def find_mcp_tools(
+        self,
+        query: str,
+        limit: int = 10,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return run_async(
+            self._async_client.find_mcp_tools(
+                query,
+                limit=limit,
+                target_uri=target_uri,
+            )
+        )
 
     def validate_mcp(
         self,
@@ -2710,14 +2793,34 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.validate_mcp(name, url, headers=headers))
 
-    def get_mcp(self, name: str) -> Dict[str, Any]:
-        return run_async(self._async_client.get_mcp(name))
+    def get_mcp(
+        self,
+        name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.get_mcp(name, target_uri=target_uri))
 
-    def sync_mcp(self, name: str, *, wait: bool = False) -> Dict[str, Any]:
-        return run_async(self._async_client.sync_mcp(name, wait=wait))
+    def sync_mcp(
+        self,
+        name: str,
+        *,
+        target_uri: Optional[str] = None,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
+        return run_async(
+            self._async_client.sync_mcp(
+                name,
+                target_uri=target_uri,
+                wait=wait,
+            )
+        )
 
-    def get_mcp_status(self, name: str) -> Dict[str, Any]:
-        return run_async(self._async_client.get_mcp_status(name))
+    def get_mcp_status(
+        self,
+        name: str,
+        target_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.get_mcp_status(name, target_uri=target_uri))
 
     def invoke_mcp_tool(
         self,
@@ -2773,8 +2876,15 @@ class SyncHTTPClient:
         self,
         mcp: str,
         tool: Optional[str] = None,
+        target_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return run_async(self._async_client.list_mcp_mounts(mcp, tool=tool))
+        return run_async(
+            self._async_client.list_mcp_mounts(
+                mcp,
+                tool=tool,
+                target_uri=target_uri,
+            )
+        )
 
     def list_watches(
         self,

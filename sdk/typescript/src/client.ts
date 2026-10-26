@@ -306,24 +306,38 @@ export class OpenVikingClient {
     name: string,
     url: string,
     headers: Record<string, string> = {},
-    options: Pick<WaitOptions, "wait"> = {},
+    options: Pick<WaitOptions, "wait"> & { targetUri?: string } = {},
   ): Promise<JsonObject> {
     return this.request("POST", "/api/v1/mcps", {
-      body: { name, url, headers, wait: options.wait ?? false },
+      body: compact({
+        name,
+        url,
+        headers,
+        target_uri: options.targetUri,
+        wait: options.wait ?? false,
+      }),
     });
   }
   /** Remove an MCP server and its tool catalog. */
-  removeMCP(name: string): Promise<JsonObject> {
-    return this.request("DELETE", `/api/v1/mcps/${pathPart(name)}`);
+  removeMCP(name: string, targetUri?: string): Promise<JsonObject> {
+    return this.request("DELETE", `/api/v1/mcps/${pathPart(name)}`, {
+      query: { target_uri: targetUri },
+    });
   }
   /** List registered MCP servers. */
-  listMCPs(): Promise<JsonObject> {
-    return this.request("GET", "/api/v1/mcps");
+  listMCPs(targetUri?: string): Promise<JsonObject> {
+    return this.request("GET", "/api/v1/mcps", {
+      query: { target_uri: targetUri },
+    });
   }
   /** Search the MCP tool catalog semantically. */
-  findMCPTools(query: string, limit = 10): Promise<JsonObject> {
+  findMCPTools(
+    query: string,
+    limit = 10,
+    targetUri?: string,
+  ): Promise<JsonObject> {
     return this.request("POST", "/api/v1/mcps/find", {
-      body: { query, limit },
+      body: compact({ query, limit, target_uri: targetUri }),
     });
   }
   /** Validate and discover an MCP server without registering it. */
@@ -337,22 +351,27 @@ export class OpenVikingClient {
     });
   }
   /** Get a registered MCP server and its current tool catalog. */
-  getMCP(name: string): Promise<JsonObject> {
-    return this.request("GET", `/api/v1/mcps/${pathPart(name)}`);
+  getMCP(name: string, targetUri?: string): Promise<JsonObject> {
+    return this.request("GET", `/api/v1/mcps/${pathPart(name)}`, {
+      query: { target_uri: targetUri },
+    });
   }
   /** Refresh an MCP tool catalog and report affected live context mounts. */
   syncMCP(
     name: string,
-    options: Pick<WaitOptions, "wait"> = {},
+    options: Pick<WaitOptions, "wait"> & { targetUri?: string } = {},
   ): Promise<MCPSyncResult> {
     return this.request("POST", `/api/v1/mcps/${pathPart(name)}/sync`, {
-      body: { wait: options.wait ?? false },
+      body: compact({
+        wait: options.wait ?? false,
+        target_uri: options.targetUri,
+      }),
     });
   }
   /** Check whether an MCP server is reachable. */
-  getMCPStatus(name: string): Promise<JsonObject> {
+  getMCPStatus(name: string, targetUri?: string): Promise<JsonObject> {
     return this.request("GET", "/api/v1/mcps/status", {
-      query: { name },
+      query: { name, target_uri: targetUri },
     });
   }
   /** Invoke a registered MCP tool through OpenViking. */
@@ -431,9 +450,13 @@ export class OpenVikingClient {
     });
   }
   /** List live context mounts for one MCP server and optional tool. */
-  listMCPMounts(mcp: string, tool?: string): Promise<JsonObject> {
+  listMCPMounts(
+    mcp: string,
+    tool?: string,
+    targetUri?: string,
+  ): Promise<JsonObject> {
     return this.request("GET", "/api/v1/mcps/mounts", {
-      query: { mcp, tool },
+      query: { mcp, tool, target_uri: targetUri },
     });
   }
   /** List resource watches. */

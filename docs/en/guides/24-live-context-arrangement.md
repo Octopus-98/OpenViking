@@ -15,7 +15,7 @@ The feature separates control-plane operations from data-plane execution:
 | Layer | Responsibility | Main entry points |
 | --- | --- | --- |
 | MCP registration and sync | Store MCP server connection details and synchronize tool definitions | `ov mcps add/validate/sync/status`, REST, SDK |
-| Tool Catalog | Make definitions searchable and readable; retain definition and input revisions | `viking://agent/tools/<server>/<tool>.json` |
+| Tool Catalog | Make definitions searchable and readable; retain definition and input revisions | `viking://~/tools/<server>/<tool>.json` or `viking://agent/tools/<server>/<tool>.json` |
 | Live Context | Bind one tool, preset arguments, and a destination URI | `ov mcps mount/unmount/mounts`, REST, SDK |
 | Agent Gateway | Discover infrequent tools by intent and proxy their execution | MCP `find_mcp_tools`, `invoke_mcp_tool` |
 | Context arrangement | Declare desired nodes, calculate a diff, and converge state | Studio Arranger, Python `ContextArranger` |
@@ -27,7 +27,8 @@ Remote MCP Server
         |
         | validate / add / sync
         v
-viking://agent/tools/<server>/<tool>.json
+viking://~/tools/<server>/<tool>.json
+or viking://agent/tools/<server>/<tool>.json
         |
         | mount + preset arguments
         v
@@ -50,6 +51,7 @@ Pre-mount frequent scenarios whose parameters are stable. For infrequent request
 - OpenViking stores headers on the server and uses them for upstream calls. Build CLI configuration from environment variables; never commit real credentials.
 - `invoke` and a live-node read may have external side effects. OpenViking does not automatically retry a tool call whose outcome is unknown.
 - Mount arguments are validated against the tool's `inputSchema`.
+- The user `viking://~/tools` and account-shared `viking://agent/tools` roots are managed directories. Do not mutate them with ordinary `mkdir`, `rm`, `cp`, or `mv`.
 
 ## Use `ov mcps`
 
@@ -64,7 +66,7 @@ ov mcps validate "$(jq -cn \
   '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
-Register it after validation. `add` writes the discovered Tool Catalog immediately and lets summaries and indexing continue in the background by default:
+Register it after validation. `add` defaults to the current user's `viking://~/tools`, writes the discovered Tool Catalog immediately, and lets summaries and indexing continue in the background:
 
 ```bash
 ov mcps add "$(jq -cn \
@@ -72,10 +74,18 @@ ov mcps add "$(jq -cn \
   '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
+Select the account-shared space explicitly when every account user should see it:
+
+```bash
+ov mcps add -p viking://agent/tools "$(jq -cn \
+  --arg token "$MCP_TOKEN" \
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+```
+
 Add `-w` or `--wait` when the command must return only after tool summaries and indexing finish:
 
 ```bash
-ov mcps add --wait "$(jq -cn \
+ov mcps add -p viking://agent/tools --wait "$(jq -cn \
   --arg token "$MCP_TOKEN" \
   '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
@@ -84,8 +94,8 @@ Inspect the registry and definitions:
 
 ```bash
 ov mcps list
-ov mcps show weather
-ov mcps status weather
+ov mcps show -p viking://agent/tools weather
+ov mcps status -p viking://agent/tools weather
 ```
 
 The management commands are:
@@ -93,11 +103,11 @@ The management commands are:
 | Command | Purpose |
 | --- | --- |
 | `ov mcps validate <json>` | Check connectivity and discovery without persisting |
-| `ov mcps add <json> [-w\|--wait]` | Register one or more servers and publish their catalogs; summaries and indexing run asynchronously by default |
-| `ov mcps list` | List servers in the current account |
-| `ov mcps show <name>` | Show server metadata, tool URIs, arguments, and descriptions |
-| `ov mcps status <name>` | Check the upstream now; a failed check still reports the cached tool count |
-| `ov mcps remove <name>` | Remove the server registration and Tool Catalog |
+| `ov mcps add <json> [-p <tools-root>] [-w\|--wait]` | Register servers; `-p` defaults to `viking://~/tools` |
+| `ov mcps list [-p <tools-root>]` | Merge user and shared servers by default; `-p` restricts the space |
+| `ov mcps show <name> [-p <tools-root>]` | Show a server; name-based operations default to the user space |
+| `ov mcps status <name> [-p <tools-root>]` | Check upstream status; name-based operations default to the user space |
+| `ov mcps remove <name> [-p <tools-root>]` | Remove the server from the selected space |
 
 ### Find and invoke a tool
 
@@ -106,6 +116,8 @@ The Tool Catalog supports semantic discovery:
 ```bash
 ov mcps find "weather in Beijing" --limit 5
 ```
+
+Without `-p`, `list` and `find` merge the user and shared spaces; other name-based management commands use the user space. The same server name may exist in both spaces. Use the returned `root_uri` and `-p` to disambiguate.
 
 Use the returned URI and schema to invoke it:
 
@@ -141,8 +153,8 @@ ov read viking://resources/arrange/beijing-weather.md
 List and remove mounts:
 
 ```bash
-ov mcps mounts --mcp weather
-ov mcps mounts --mcp weather --tool current
+ov mcps mounts -p viking://agent/tools --mcp weather
+ov mcps mounts -p viking://agent/tools --mcp weather --tool current
 ov mcps unmount viking://resources/arrange/beijing-weather.md --wait
 ```
 
@@ -153,13 +165,13 @@ ov mcps unmount viking://resources/arrange/beijing-weather.md --wait
 After an upstream definition changes, run:
 
 ```bash
-ov mcps sync weather
+ov mcps sync -p viking://agent/tools weather
 ```
 
 Summaries and indexing continue in the background by default. Wait for all Tool Catalog creates, updates, removals, and index refreshes with:
 
 ```bash
-ov mcps sync weather --wait
+ov mcps sync -p viking://agent/tools weather --wait
 ```
 
 The result classifies tools as `added`, `changed`, `unchanged`, or `removed`, and reports affected mounts:
@@ -203,10 +215,12 @@ Do not maintain this as ordinary Markdown. The account-level `live_context_nodes
 
 `retry` is reserved policy metadata in the node format. The current execution path does not automatically retry tool calls from this block, avoiding duplicate external side effects when an outcome is unknown.
 
-The catalog and mount database are managed account state:
+The catalogs, their space-specific registries, and the account mount database are managed state:
 
 ```text
+viking://~/tools/<server>/<tool>.json
 viking://agent/tools/<server>/<tool>.json
+<account>/_system/mcps/<user-id>.json
 <account>/_system/mcps.json
 <account>/_system/live_context_nodes.dat
 ```
@@ -363,7 +377,7 @@ The SDK and Studio use these endpoints:
 | `POST` | `/api/v1/mcps/batch-unmount` | Unmount a batch |
 | `GET` | `/api/v1/mcps/mounts?mcp=...&tool=...` | List mounts |
 
-Requests use the current OpenViking user's account context. Server registrations, catalogs, and mount records are account-scoped. Destination resource URIs still follow normal identity and ACL checks.
+Requests use the current OpenViking identity. User-space server registrations and catalogs are user-scoped; the shared space and mount database are account-scoped. Destination resource URIs still follow normal identity and ACL checks. Registration, removal, inspect, sync, status, and mount-list operations accept `target_uri`; list and search merge both spaces when it is omitted.
 
 ## Operational guidance
 

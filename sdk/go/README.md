@@ -254,6 +254,7 @@ _, err := client.AddMCP(
 	"weather",
 	"https://mcp.example.com/api",
 	map[string]string{"Authorization": "Bearer token"},
+	&openviking.WaitOptions{TargetURI: "viking://agent/tools"},
 )
 // Tool summaries and indexing continue in the background by default.
 // Pass &openviking.WaitOptions{Wait: true} as the final argument to wait.
@@ -284,10 +285,19 @@ batchUnmounted, err := client.BatchUnmountMCPTools(
 	[]string{"viking://resources/arranger/shanghai-weather.md"},
 	&openviking.WaitOptions{Wait: true},
 )
-syncResult, err := client.SyncMCP(ctx, "weather")
+syncResult, err := client.SyncMCP(
+	ctx,
+	"weather",
+	&openviking.WaitOptions{TargetURI: "viking://agent/tools"},
+)
 
 _, _, _, _, _, _ = tools, mounted, batchMounted, batchUnmounted, syncResult, err
 ```
+
+Registration defaults to `viking://~/tools`. Set `WaitOptions.TargetURI` to
+`viking://agent/tools` for account-shared servers. `ListMCPs` and
+`FindMCPTools` merge both spaces when no target URI is supplied; name-based
+operations default to the user space.
 
 ## Watch Management
 

@@ -22,12 +22,14 @@ class AddMCPRequest(BaseModel):
     name: str
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
+    target_uri: str | None = None
     wait: bool = False
 
 
 class SyncMCPRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    target_uri: str | None = None
     wait: bool = False
 
 
@@ -36,6 +38,7 @@ class FindMCPToolsRequest(BaseModel):
 
     query: str
     limit: int = Field(default=10, ge=1, le=100)
+    target_uri: str | None = None
 
 
 class InvokeMCPToolRequest(BaseModel):
@@ -80,12 +83,15 @@ async def add_mcp(
     body: AddMCPRequest,
     ctx: RequestContext = Depends(get_request_context),
 ):
+    kwargs: dict[str, Any] = {"wait": body.wait}
+    if body.target_uri is not None:
+        kwargs["target_uri"] = body.target_uri
     result = await get_service().mcps.add(
         body.name,
         body.url,
         body.headers,
         ctx,
-        wait=body.wait,
+        **kwargs,
     )
     return Response(status="ok", result=result)
 
@@ -157,24 +163,32 @@ async def batch_unmount_mcp_tools(
 async def list_mcp_mounts(
     mcp: str = Query(),
     tool: str | None = Query(default=None),
+    target_uri: str | None = Query(default=None),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.mounts(mcp, tool, ctx)
+    kwargs = {"target_uri": target_uri} if target_uri is not None else {}
+    result = await get_service().mcps.mounts(mcp, tool, ctx, **kwargs)
     return Response(status="ok", result=result)
 
 
 @router.delete("/{name}")
 async def remove_mcp(
     name: str,
+    target_uri: str | None = Query(default=None),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.remove(name, ctx)
+    kwargs = {"target_uri": target_uri} if target_uri is not None else {}
+    result = await get_service().mcps.remove(name, ctx, **kwargs)
     return Response(status="ok", result=result)
 
 
 @router.get("")
-async def list_mcps(ctx: RequestContext = Depends(get_request_context)):
-    result = await get_service().mcps.list(ctx)
+async def list_mcps(
+    target_uri: str | None = Query(default=None),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    kwargs = {"target_uri": target_uri} if target_uri is not None else {}
+    result = await get_service().mcps.list(ctx, **kwargs)
     return Response(status="ok", result=result)
 
 
@@ -183,11 +197,14 @@ async def find_mcp_tools(
     body: FindMCPToolsRequest,
     ctx: RequestContext = Depends(get_request_context),
 ):
+    kwargs = {"include_definition": True}
+    if body.target_uri is not None:
+        kwargs["target_uri"] = body.target_uri
     result = await get_service().mcps.find(
         body.query,
         body.limit,
         ctx,
-        include_definition=True,
+        **kwargs,
     )
     return Response(status="ok", result=result)
 
@@ -204,18 +221,22 @@ async def invoke_mcp_tool(
 @router.get("/status")
 async def mcp_status(
     name: str = Query(),
+    target_uri: str | None = Query(default=None),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.status(name, ctx)
+    kwargs = {"target_uri": target_uri} if target_uri is not None else {}
+    result = await get_service().mcps.status(name, ctx, **kwargs)
     return Response(status="ok", result=result)
 
 
 @router.get("/{name}")
 async def show_mcp(
     name: str,
+    target_uri: str | None = Query(default=None),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    result = await get_service().mcps.show(name, ctx)
+    kwargs = {"target_uri": target_uri} if target_uri is not None else {}
+    result = await get_service().mcps.show(name, ctx, **kwargs)
     return Response(status="ok", result=result)
 
 
@@ -234,9 +255,12 @@ async def sync_mcp(
     body: SyncMCPRequest | None = None,
     ctx: RequestContext = Depends(get_request_context),
 ):
+    kwargs: dict[str, Any] = {"wait": body.wait if body is not None else False}
+    if body is not None and body.target_uri is not None:
+        kwargs["target_uri"] = body.target_uri
     result = await get_service().mcps.sync(
         name,
         ctx,
-        wait=body.wait if body is not None else False,
+        **kwargs,
     )
     return Response(status="ok", result=result)

@@ -1919,15 +1919,25 @@ enum McpCommands {
         /// Wait until tool processing is complete
         #[arg(short = 'w', long)]
         wait: bool,
+        /// Tools root URI; defaults to the current user's private tools
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
     },
     /// Remove a registered MCP server
     Remove {
         /// MCP server name
         #[arg(value_name = "name")]
         name: String,
+        /// Resolve the server under a specific tools root URI
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
     },
     /// List registered MCP servers
-    List,
+    List {
+        /// Restrict listing to a specific tools root URI
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
+    },
     /// Find tools from registered MCP catalogs
     Find {
         /// Tool name or description query
@@ -1942,6 +1952,9 @@ enum McpCommands {
             value_name = "n"
         )]
         limit: u8,
+        /// Restrict search to a specific tools root URI
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
     },
     /// Validate connectivity and tool discovery
     Validate {
@@ -1954,6 +1967,9 @@ enum McpCommands {
         /// MCP server name
         #[arg(value_name = "name")]
         name: String,
+        /// Resolve the server under a specific tools root URI
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
     },
     /// Refresh a registered MCP server's tool catalog
     Sync {
@@ -1963,16 +1979,22 @@ enum McpCommands {
         /// Wait until tool processing is complete
         #[arg(short = 'w', long)]
         wait: bool,
+        /// Resolve the server under a specific tools root URI
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
     },
     /// Check a registered MCP server
     Status {
         /// Registered MCP server name
         #[arg(value_name = "name")]
         name: String,
+        /// Resolve the server under a specific tools root URI
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
     },
     /// Mount an MCP tool as a live context node
     Mount {
-        /// Tool URI under viking://agent/tools
+        /// Tool URI under a user or shared tools root
         #[arg(value_name = "mcp-tool-uri")]
         tool_uri: String,
         /// Markdown URI to create for the live context node
@@ -2011,10 +2033,13 @@ enum McpCommands {
         /// Optional MCP tool name
         #[arg(long = "tool", value_name = "tool")]
         tool: Option<String>,
+        /// Resolve the server under a specific tools root URI
+        #[arg(short = 'p', long = "uri", value_name = "uri")]
+        target_uri: Option<String>,
     },
     /// Invoke a registered MCP tool
     Invoke {
-        /// Tool URI under viking://agent/tools
+        /// Tool URI under a user or shared tools root
         #[arg(value_name = "uri")]
         uri: String,
         /// Tool arguments as a JSON object
@@ -3740,31 +3765,92 @@ async fn main() {
         Commands::Mcps { action } => {
             let client = ctx.get_client();
             match action {
-                McpCommands::Add { config, wait } => {
-                    commands::mcps::add(&client, &config, wait, ctx.output_format, ctx.compact)
-                        .await
+                McpCommands::Add {
+                    config,
+                    wait,
+                    target_uri,
+                } => {
+                    commands::mcps::add(
+                        &client,
+                        &config,
+                        wait,
+                        target_uri.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
-                McpCommands::Remove { name } => {
-                    commands::mcps::remove(&client, &name, ctx.output_format, ctx.compact).await
+                McpCommands::Remove { name, target_uri } => {
+                    commands::mcps::remove(
+                        &client,
+                        &name,
+                        target_uri.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
-                McpCommands::List => {
-                    commands::mcps::list(&client, ctx.output_format, ctx.compact).await
+                McpCommands::List { target_uri } => {
+                    commands::mcps::list(
+                        &client,
+                        target_uri.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
-                McpCommands::Find { query, limit } => {
-                    commands::mcps::find(&client, &query, limit, ctx.output_format, ctx.compact)
-                        .await
+                McpCommands::Find {
+                    query,
+                    limit,
+                    target_uri,
+                } => {
+                    commands::mcps::find(
+                        &client,
+                        &query,
+                        limit,
+                        target_uri.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
                 McpCommands::Validate { config } => {
                     commands::mcps::validate(&client, &config, ctx.output_format, ctx.compact).await
                 }
-                McpCommands::Show { name } => {
-                    commands::mcps::show(&client, &name, ctx.output_format, ctx.compact).await
+                McpCommands::Show { name, target_uri } => {
+                    commands::mcps::show(
+                        &client,
+                        &name,
+                        target_uri.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
-                McpCommands::Sync { name, wait } => {
-                    commands::mcps::sync(&client, &name, wait, ctx.output_format, ctx.compact).await
+                McpCommands::Sync {
+                    name,
+                    wait,
+                    target_uri,
+                } => {
+                    commands::mcps::sync(
+                        &client,
+                        &name,
+                        wait,
+                        target_uri.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
-                McpCommands::Status { name } => {
-                    commands::mcps::status(&client, &name, ctx.output_format, ctx.compact).await
+                McpCommands::Status { name, target_uri } => {
+                    commands::mcps::status(
+                        &client,
+                        &name,
+                        target_uri.as_deref(),
+                        ctx.output_format,
+                        ctx.compact,
+                    )
+                    .await
                 }
                 McpCommands::Mount {
                     tool_uri,
@@ -3799,11 +3885,16 @@ async fn main() {
                     )
                     .await
                 }
-                McpCommands::Mounts { mcp, tool } => {
+                McpCommands::Mounts {
+                    mcp,
+                    tool,
+                    target_uri,
+                } => {
                     commands::mcps::mounts(
                         &client,
                         &mcp,
                         tool.as_deref(),
+                        target_uri.as_deref(),
                         ctx.output_format,
                         ctx.compact,
                     )
@@ -6818,8 +6909,13 @@ mod tests {
                 assert!(matches!(
                     &mounts.command,
                     Commands::Mcps {
-                        action: McpCommands::Mounts { mcp, tool }
+                        action: McpCommands::Mounts {
+                            mcp,
+                            tool,
+                            target_uri,
+                        }
                     } if mcp == "weather" && tool.as_deref() == Some("current")
+                        && target_uri.is_none()
                 ));
             })
             .unwrap()
@@ -6838,8 +6934,8 @@ mod tests {
                 assert!(matches!(
                     &status.command,
                     Commands::Mcps {
-                        action: McpCommands::Status { name }
-                    } if name == "demo"
+                        action: McpCommands::Status { name, target_uri }
+                    } if name == "demo" && target_uri.is_none()
                 ));
             })
             .unwrap()
@@ -6849,54 +6945,75 @@ mod tests {
 
     #[test]
     fn cli_parses_mcp_add_and_invoke() {
-        let add = Cli::try_parse_from([
-            "ov",
-            "mcps",
-            "add",
-            r#"{"mcpServers":{"weather":{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer token"}}}}"#,
-            "--wait",
-        ])
-        .expect("mcps add should parse");
-        match add.command {
-            Commands::Mcps {
-                action: McpCommands::Add { config, wait },
-            } => {
-                assert!(config.contains(r#""weather""#));
-                assert!(config.contains(r#""Authorization""#));
-                assert!(wait);
-            }
-            _ => panic!("expected mcps add"),
-        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let add = Cli::try_parse_from([
+                    "ov",
+                    "mcps",
+                    "add",
+                    r#"{"mcpServers":{"weather":{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer token"}}}}"#,
+                    "--wait",
+                    "-p",
+                    "viking://agent/tools",
+                ])
+                .expect("mcps add should parse");
+                match add.command {
+                    Commands::Mcps {
+                        action:
+                            McpCommands::Add {
+                                config,
+                                wait,
+                                target_uri,
+                            },
+                    } => {
+                        assert!(config.contains(r#""weather""#));
+                        assert!(config.contains(r#""Authorization""#));
+                        assert!(wait);
+                        assert_eq!(target_uri.as_deref(), Some("viking://agent/tools"));
+                    }
+                    _ => panic!("expected mcps add"),
+                }
 
-        let sync = Cli::try_parse_from(["ov", "mcps", "sync", "weather", "-w"])
-            .expect("mcps sync should parse");
-        match sync.command {
-            Commands::Mcps {
-                action: McpCommands::Sync { name, wait },
-            } => {
-                assert_eq!(name, "weather");
-                assert!(wait);
-            }
-            _ => panic!("expected mcps sync"),
-        }
+                let sync = Cli::try_parse_from(["ov", "mcps", "sync", "weather", "-w"])
+                    .expect("mcps sync should parse");
+                match sync.command {
+                    Commands::Mcps {
+                        action:
+                            McpCommands::Sync {
+                                name,
+                                wait,
+                                target_uri,
+                            },
+                    } => {
+                        assert_eq!(name, "weather");
+                        assert!(wait);
+                        assert!(target_uri.is_none());
+                    }
+                    _ => panic!("expected mcps sync"),
+                }
 
-        let invoke = Cli::try_parse_from([
-            "ov",
-            "mcps",
-            "invoke",
-            "viking://agent/tools/weather/current.json",
-            "--args",
-            r#"{"city":"Beijing"}"#,
-        ])
-        .expect("mcps invoke should parse");
-        match invoke.command {
-            Commands::Mcps {
-                action: McpCommands::Invoke { uri, arguments },
-            } => {
-                assert_eq!(uri, "viking://agent/tools/weather/current.json");
-                assert_eq!(arguments, r#"{"city":"Beijing"}"#);
-            }
-            _ => panic!("expected mcps invoke"),
-        }
+                let invoke = Cli::try_parse_from([
+                    "ov",
+                    "mcps",
+                    "invoke",
+                    "viking://agent/tools/weather/current.json",
+                    "--args",
+                    r#"{"city":"Beijing"}"#,
+                ])
+                .expect("mcps invoke should parse");
+                match invoke.command {
+                    Commands::Mcps {
+                        action: McpCommands::Invoke { uri, arguments },
+                    } => {
+                        assert_eq!(uri, "viking://agent/tools/weather/current.json");
+                        assert_eq!(arguments, r#"{"city":"Beijing"}"#);
+                    }
+                    _ => panic!("expected mcps invoke"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

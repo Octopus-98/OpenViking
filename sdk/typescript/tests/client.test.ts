@@ -1145,6 +1145,43 @@ describe("OpenVikingClient", () => {
     ).toBe(false);
   });
 
+  it("scopes MCP registry operations to a tools root", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => ok({ changes: {}, affected_mounts: [] }));
+    const client = new OpenVikingClient({
+      baseUrl: "https://example.com",
+      fetch: fetcher,
+    });
+    const targetUri = "viking://agent/tools";
+
+    await client.addMCP(
+      "demo",
+      "https://mcp.example.com/api",
+      {},
+      { targetUri },
+    );
+    await client.removeMCP("demo", targetUri);
+    await client.listMCPs(targetUri);
+    await client.findMCPTools("weather", 10, targetUri);
+    await client.getMCP("demo", targetUri);
+    await client.syncMCP("demo", { targetUri });
+    await client.getMCPStatus("demo", targetUri);
+    await client.listMCPMounts("demo", undefined, targetUri);
+
+    const bodies = [0, 3, 5].map((index) =>
+      JSON.parse(String(fetcher.mock.calls[index]![1]?.body)),
+    );
+    expect(bodies.every((body) => body.target_uri === targetUri)).toBe(true);
+    for (const index of [1, 2, 4, 6, 7]) {
+      expect(
+        new URL(String(fetcher.mock.calls[index]![0])).searchParams.get(
+          "target_uri",
+        ),
+      ).toBe(targetUri);
+    }
+  });
+
   it("uses public Compile and task routes with SDK-compatible options", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

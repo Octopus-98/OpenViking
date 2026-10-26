@@ -15,7 +15,7 @@ description: 接入远程 MCP Server，将工具挂载为实时上下文，并�
 | 层次 | 职责 | 主要入口 |
 | --- | --- | --- |
 | MCP 注册与同步 | 保存 MCP Server 连接信息，将 Tool 定义同步进 OpenViking | `ov mcps add/validate/sync/status`、REST、SDK |
-| Tool Catalog | 让 Tool 定义可检索、可读取，并保存完整定义和输入版本 | `viking://agent/tools/<server>/<tool>.json` |
+| Tool Catalog | 让 Tool 定义可检索、可读取，并保存完整定义和输入版本 | `viking://~/tools/<server>/<tool>.json` 或 `viking://agent/tools/<server>/<tool>.json` |
 | 实时上下文 | 将一个 Tool、固定参数和目标 URI 绑定为可读节点 | `ov mcps mount/unmount/mounts`、REST、SDK |
 | Agent Gateway | 按意图发现低频 Tool，并安全代理调用 | MCP `find_mcp_tools`、`invoke_mcp_tool` |
 | 上下文编排 | 声明一组期望节点，计算差异并持续收敛 | Studio Arranger、Python `ContextArranger` |
@@ -27,7 +27,8 @@ Remote MCP Server
         |
         | validate / add / sync
         v
-viking://agent/tools/<server>/<tool>.json
+viking://~/tools/<server>/<tool>.json
+or viking://agent/tools/<server>/<tool>.json
         |
         | mount + preset arguments
         v
@@ -50,6 +51,7 @@ OpenViking resolves credentials -> calls upstream Tool -> returns native Tool re
 - Header 由 OpenViking 服务端保存并用于上游调用。CLI 示例应从环境变量构造配置，不要把真实凭证提交到仓库。
 - `invoke` 和实时节点读取可能产生外部副作用。OpenViking 不会自动重试未知结果的 Tool 调用。
 - 挂载参数会按 Tool 的 `inputSchema` 校验；缺少必填参数或类型不匹配时挂载失败。
+- 用户空间 `viking://~/tools` 和账号共享空间 `viking://agent/tools` 都是受管目录，不能使用普通 `mkdir`、`rm`、`cp` 或 `mv` 修改。
 
 ## 使用 `ov mcps`
 
@@ -64,7 +66,7 @@ ov mcps validate "$(jq -cn \
   '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
-验证通过后注册。`add` 会立即写入发现到的 Tool Catalog，并默认让摘要和索引在后台继续处理：
+验证通过后注册。`add` 默认写入当前用户的 `viking://~/tools`，会立即写入发现到的 Tool Catalog，并让摘要和索引在后台继续处理：
 
 ```bash
 ov mcps add "$(jq -cn \
@@ -72,10 +74,18 @@ ov mcps add "$(jq -cn \
   '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
 
+共享给账号内所有用户时显式选择账号空间：
+
+```bash
+ov mcps add -p viking://agent/tools "$(jq -cn \
+  --arg token "$MCP_TOKEN" \
+  '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
+```
+
 需要确认 Tool 摘要和索引处理完成后再返回时，加 `-w` 或 `--wait`：
 
 ```bash
-ov mcps add --wait "$(jq -cn \
+ov mcps add -p viking://agent/tools --wait "$(jq -cn \
   --arg token "$MCP_TOKEN" \
   '{mcpServers:{weather:{url:"https://mcp.example.com/mcp",headers:{Authorization:("Bearer " + $token)}}}}')"
 ```
@@ -84,8 +94,8 @@ ov mcps add --wait "$(jq -cn \
 
 ```bash
 ov mcps list
-ov mcps show weather
-ov mcps status weather
+ov mcps show -p viking://agent/tools weather
+ov mcps status -p viking://agent/tools weather
 ```
 
 相关命令：
@@ -93,11 +103,11 @@ ov mcps status weather
 | 命令 | 用途 |
 | --- | --- |
 | `ov mcps validate <json>` | 验证连接和 Tool discovery，不持久化 |
-| `ov mcps add <json> [-w\|--wait]` | 注册一个或多个 Server，并发布 Tool Catalog；默认异步处理摘要和索引 |
-| `ov mcps list` | 列出当前账号注册的 Server |
-| `ov mcps show <name>` | 查看 Server 元数据、Tool URI、参数和说明 |
-| `ov mcps status <name>` | 实时检查连接状态；连接失败时仍返回已缓存 Tool 数量 |
-| `ov mcps remove <name>` | 删除 Server 注册和 Tool Catalog |
+| `ov mcps add <json> [-p <tools-root>] [-w\|--wait]` | 注册一个或多个 Server；`-p` 默认 `viking://~/tools` |
+| `ov mcps list [-p <tools-root>]` | 默认合并列出用户与共享 Server；`-p` 限定空间 |
+| `ov mcps show <name> [-p <tools-root>]` | 查看 Server；名称型操作默认用户空间 |
+| `ov mcps status <name> [-p <tools-root>]` | 实时检查连接状态；名称型操作默认用户空间 |
+| `ov mcps remove <name> [-p <tools-root>]` | 删除指定空间的 Server 注册和 Tool Catalog |
 
 ### 查找和直接调用 Tool
 
@@ -106,6 +116,8 @@ Tool Catalog 支持语义检索：
 ```bash
 ov mcps find "查询北京的天气" --limit 5
 ```
+
+`list` 和 `find` 未传 `-p` 时会合并用户与共享空间；其他名称型管理命令未传 `-p` 时使用用户空间。同名 Server 可以同时存在于两个空间，通过返回的 `root_uri` 和 `-p` 消歧。
 
 根据结果中的 Tool URI 和参数定义直接调用：
 
@@ -141,8 +153,8 @@ ov read viking://resources/arrange/beijing-weather.md
 查看和删除挂载：
 
 ```bash
-ov mcps mounts --mcp weather
-ov mcps mounts --mcp weather --tool current
+ov mcps mounts -p viking://agent/tools --mcp weather
+ov mcps mounts -p viking://agent/tools --mcp weather --tool current
 ov mcps unmount viking://resources/arrange/beijing-weather.md --wait
 ```
 
@@ -153,13 +165,13 @@ ov mcps unmount viking://resources/arrange/beijing-weather.md --wait
 上游 Tool 定义变化后执行：
 
 ```bash
-ov mcps sync weather
+ov mcps sync -p viking://agent/tools weather
 ```
 
 摘要和索引默认在后台继续处理。需要等待 Tool Catalog 的新增、更新、删除及索引刷新全部完成时执行：
 
 ```bash
-ov mcps sync weather --wait
+ov mcps sync -p viking://agent/tools weather --wait
 ```
 
 同步结果把 Tool 分为 `added`、`changed`、`unchanged` 和 `removed`，并列出受影响的实时节点：
@@ -203,10 +215,12 @@ x-openviking:
 
 `retry` 是节点格式中的预留策略元数据。当前执行链路不会据此自动重试 Tool 调用，避免在结果未知时重复产生外部副作用。
 
-Tool Catalog 和挂载数据库都属于账号级受管状态：
+Tool Catalog 与对应空间的注册表，以及账号级挂载数据库都属于受管状态：
 
 ```text
+viking://~/tools/<server>/<tool>.json
 viking://agent/tools/<server>/<tool>.json
+<account>/_system/mcps/<user-id>.json
 <account>/_system/mcps.json
 <account>/_system/live_context_nodes.dat
 ```
@@ -362,7 +376,7 @@ SDK 和 Studio 使用以下接口：
 | `POST` | `/api/v1/mcps/batch-unmount` | 批量卸载 |
 | `GET` | `/api/v1/mcps/mounts?mcp=...&tool=...` | 查询挂载 |
 
-接口使用当前 OpenViking 用户的账号上下文。Server 注册、Tool Catalog 和挂载记录按账号隔离；目标资源 URI 仍按正常的身份和 ACL 规则校验。
+接口使用当前 OpenViking 用户的身份上下文。用户空间的 Server 注册和 Tool Catalog 按用户隔离，共享空间及挂载数据库按账号隔离；目标资源 URI 仍按正常的身份和 ACL 规则校验。注册、删除、查看、同步、状态和挂载查询支持 `target_uri`，列出和检索在未指定时合并两个空间。
 
 ## 运维建议
 

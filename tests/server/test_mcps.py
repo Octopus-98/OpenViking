@@ -76,12 +76,15 @@ async def test_add_stores_headers_only_in_internal_registry(monkeypatch):
     assert result["processing"] == {"queue_status": "pending"}
     assert "headers" not in result
     publish.assert_awaited_once()
-    assert publish.await_args.kwargs == {"wait": False}
-    stored = writes["/local/account-1/_system/mcps.json"]["servers"]["weather"]
+    assert publish.await_args.kwargs == {
+        "tools_root": "viking://user/user-1/tools",
+        "wait": False,
+    }
+    stored = writes["/local/account-1/_system/mcps/user-1.json"]["servers"]["weather"]
     assert "tools" not in stored
     assert "header_names" not in stored
     assert stored["headers"]["Authorization"] == "Bearer secret"
-    assert list(writes) == ["/local/account-1/_system/mcps.json"]
+    assert list(writes) == ["/local/account-1/_system/mcps/user-1.json"]
 
 
 async def test_publish_catalog_forwards_wait_to_batch_write(monkeypatch):
@@ -109,6 +112,64 @@ async def test_publish_catalog_forwards_wait_to_batch_write(monkeypatch):
     assert batch_write.await_args.kwargs["wait"] is False
     remove.assert_awaited_once()
     assert remove.await_args.kwargs["wait"] is False
+
+
+async def test_list_combines_user_and_shared_servers_with_same_name(monkeypatch):
+    service = MCPService(SimpleNamespace())
+    registries = {
+        "viking://user/user-1/tools": {
+            "version": 1,
+            "servers": {
+                "demo": {
+                    "name": "demo",
+                    "url": "https://user.example.com/mcp",
+                    "headers": {},
+                }
+            },
+        },
+        "viking://agent/tools": {
+            "version": 1,
+            "servers": {
+                "demo": {
+                    "name": "demo",
+                    "url": "https://shared.example.com/mcp",
+                    "headers": {},
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(
+        service,
+        "_load",
+        AsyncMock(side_effect=lambda _ctx, root: registries[root]),
+    )
+    monkeypatch.setattr(
+        service,
+        "_catalog_names",
+        AsyncMock(side_effect=lambda _name, _ctx, root: {root.rsplit("/", 1)[-1]}),
+    )
+
+    result = await service.list(_ctx())
+
+    assert result["root_uris"] == [
+        "viking://user/user-1/tools",
+        "viking://agent/tools",
+    ]
+    assert [(item["name"], item["root_uri"]) for item in result["servers"]] == [
+        ("demo", "viking://user/user-1/tools"),
+        ("demo", "viking://agent/tools"),
+    ]
+    assert result["total"] == 2
+
+
+async def test_tools_root_rejects_other_users_and_non_tools_paths():
+    service = MCPService(SimpleNamespace())
+
+    assert service._resolve_tools_root(_ctx(), "viking://~/tools") == "viking://user/user-1/tools"
+    with pytest.raises(InvalidArgumentError, match="Unsupported MCP tools root"):
+        service._resolve_tools_root(_ctx(), "viking://user/other/tools")
+    with pytest.raises(InvalidArgumentError, match="Unsupported MCP tools root"):
+        service._resolve_tools_root(_ctx(), "viking://agent/skills")
 
 
 async def test_url_and_tool_filename_validation(monkeypatch):
@@ -503,10 +564,15 @@ async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch, includ
         return_value={
             "resources": [
                 {
+                    "uri": "viking://user/user-1/tools/weather/private.json",
+                    "score": 0.99,
+                    "abstract": "Result outside the requested root",
+                },
+                {
                     "uri": "viking://agent/tools/weather/current.json",
                     "score": 0.87,
                     "abstract": "Live atmospheric conditions",
-                }
+                },
             ]
         }
     )
@@ -536,10 +602,19 @@ async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch, includ
 
     if include_definition:
         result = await service.find(
-            "Should I carry an umbrella?", 5, _ctx(), include_definition=True
+            "Should I carry an umbrella?",
+            5,
+            _ctx(),
+            include_definition=True,
+            target_uri="viking://agent/tools",
         )
     else:
-        result = await service.find("Should I carry an umbrella?", 5, _ctx())
+        result = await service.find(
+            "Should I carry an umbrella?",
+            5,
+            _ctx(),
+            target_uri="viking://agent/tools",
+        )
 
     search.assert_awaited_once_with(
         query="Should I carry an umbrella?",
@@ -562,6 +637,7 @@ async def test_find_uses_semantic_search_scoped_to_mcp_tools(monkeypatch, includ
             }
         ],
         "total": 1,
+        "root_uri": "viking://agent/tools",
     }
 
 
@@ -620,13 +696,9 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         write=AsyncMock(return_value={}),
         read=AsyncMock(),
         rm=AsyncMock(return_value={}),
-        can_read_many=AsyncMock(
-            side_effect=lambda uris, _ctx: dict.fromkeys(uris, True)
-        ),
+        can_read_many=AsyncMock(side_effect=lambda uris, _ctx: dict.fromkeys(uris, True)),
         get_tags_many=AsyncMock(
-            side_effect=lambda uris, _ctx, **_kwargs: {
-                uri: list(current_tags) for uri in uris
-            }
+            side_effect=lambda uris, _ctx, **_kwargs: {uri: list(current_tags) for uri in uris}
         ),
     )
     backing = SimpleNamespace(
@@ -729,7 +801,12 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     assert fs.write.await_args.kwargs["wait"] is False
 
     current_tags[:] = ["environment=staging"]
-    listed = await service.mounts("weather", "current", _ctx())
+    listed = await service.mounts(
+        "weather",
+        "current",
+        _ctx(),
+        target_uri="viking://agent/tools",
+    )
     assert listed["total"] == 1
     assert listed["mounts"][0] == {
         "node_uri": node_uri,
@@ -766,9 +843,7 @@ async def test_mounts_only_returns_nodes_visible_to_caller(monkeypatch):
         SimpleNamespace(
             fs=SimpleNamespace(
                 can_read_many=can_read_many,
-                get_tags_many=AsyncMock(
-                    return_value={visible_uri: ["scope=shared"]}
-                ),
+                get_tags_many=AsyncMock(return_value={visible_uri: ["scope=shared"]}),
             )
         )
     )
@@ -813,7 +888,12 @@ async def test_mounts_only_returns_nodes_visible_to_caller(monkeypatch):
         AsyncMock(side_effect=mount_database),
     )
 
-    result = await service.mounts("demo", "current", _ctx())
+    result = await service.mounts(
+        "demo",
+        "current",
+        _ctx(),
+        target_uri="viking://agent/tools",
+    )
 
     assert result["total"] == 1
     assert result["mounts"][0]["node_uri"] == visible_uri
@@ -847,11 +927,7 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
         mkdir=AsyncMock(return_value={}),
         get_tags_many=AsyncMock(
             side_effect=lambda uris, _ctx: {
-                uri: (
-                    ["project=demo"]
-                    if uri == "viking://resources/demo/current.md"
-                    else []
-                )
+                uri: (["project=demo"] if uri == "viking://resources/demo/current.md" else [])
                 for uri in uris
             }
         ),
@@ -883,7 +959,7 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
     monkeypatch.setattr(service, "_tool", tool_mock)
     mounts = [
         MCPToolMount(
-            tool_uri="viking://agent/tools/weather/current.json",
+            tool_uri="viking://~/tools/weather/current.json",
             node_uri="viking://resources/demo/current.md",
             title="Current weather",
             description=None,
@@ -892,7 +968,7 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
             tags=["project=demo"],
         ),
         MCPToolMount(
-            tool_uri="viking://agent/tools/weather/current.json",
+            tool_uri="viking://~/tools/weather/current.json",
             node_uri="viking://resources/demo/forecast.md",
             title="Weather forecast",
             description="Forecast",
@@ -916,7 +992,7 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
     assert "tags" not in batch_call["operations"][1]
     assert fs.write.await_count == 0
     tool_mock.assert_awaited_once_with(
-        "viking://agent/tools/weather/current.json",
+        "viking://~/tools/weather/current.json",
         _ctx(),
     )
 
@@ -924,10 +1000,11 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
     connection = sqlite3.connect(":memory:")
     connection.deserialize(database)
     rows = connection.execute(
-        "SELECT node_uri FROM live_context_nodes ORDER BY node_uri"
+        "SELECT node_uri, tool_uri FROM live_context_nodes ORDER BY node_uri"
     ).fetchall()
     connection.close()
     assert [row[0] for row in rows] == sorted(mount.node_uri for mount in mounts)
+    assert {row[1] for row in rows} == {"viking://user/user-1/tools/weather/current.json"}
 
     fs.rm.side_effect = [{}, RuntimeError("delete failed")]
     with pytest.raises(RuntimeError, match="delete failed"):
@@ -1140,7 +1217,12 @@ async def test_sync_writes_changed_definitions_without_changing_input_revision(m
     monkeypatch.setattr(service, "_load", AsyncMock(return_value=registry))
     monkeypatch.setattr(service, "_write_document", AsyncMock())
 
-    result = await service.sync("demo", _ctx(), wait=True)
+    result = await service.sync(
+        "demo",
+        _ctx(),
+        target_uri="viking://agent/tools",
+        wait=True,
+    )
 
     assert existing[1]["input_revision"] == current["definition-only"]["input_revision"]
     assert existing[1]["revision"] != current["definition-only"]["revision"]
@@ -1162,6 +1244,7 @@ async def test_sync_writes_changed_definitions_without_changing_input_revision(m
         published,
         {"removed"},
         _ctx(),
+        tools_root="viking://agent/tools",
         wait=True,
     )
 
@@ -1169,13 +1252,9 @@ async def test_sync_writes_changed_definitions_without_changing_input_revision(m
 async def test_affected_mounts_are_recomputed_without_updating_revisions(monkeypatch):
     hidden_uri = "viking://user/alice/resources/private.md"
     can_read_many = AsyncMock(
-        side_effect=lambda uris, _ctx: {
-            uri: uri != hidden_uri for uri in uris
-        }
+        side_effect=lambda uris, _ctx: {uri: uri != hidden_uri for uri in uris}
     )
-    service = MCPService(
-        SimpleNamespace(fs=SimpleNamespace(can_read_many=can_read_many))
-    )
+    service = MCPService(SimpleNamespace(fs=SimpleNamespace(can_read_many=can_read_many)))
 
     def mount_database(_ctx):
         connection = sqlite3.connect(":memory:")
@@ -1295,19 +1374,44 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
         (
             "POST",
             "/api/v1/mcps",
-            {"name": "demo", "url": "https://example.com/mcp", "wait": True},
+            {
+                "name": "demo",
+                "url": "https://example.com/mcp",
+                "target_uri": "viking://agent/tools",
+                "wait": True,
+            },
         ),
-        ("DELETE", "/api/v1/mcps/demo", None),
-        ("GET", "/api/v1/mcps", None),
-        ("POST", "/api/v1/mcps/find", {"query": "weather"}),
+        (
+            "DELETE",
+            "/api/v1/mcps/demo?target_uri=viking%3A%2F%2Fagent%2Ftools",
+            None,
+        ),
+        ("GET", "/api/v1/mcps?target_uri=viking%3A%2F%2Fagent%2Ftools", None),
+        (
+            "POST",
+            "/api/v1/mcps/find",
+            {"query": "weather", "target_uri": "viking://agent/tools"},
+        ),
         (
             "POST",
             "/api/v1/mcps/validate",
             {"name": "demo", "url": "https://example.com/mcp"},
         ),
-        ("GET", "/api/v1/mcps/demo", None),
-        ("POST", "/api/v1/mcps/demo/sync", {"wait": True}),
-        ("GET", "/api/v1/mcps/status?name=demo", None),
+        (
+            "GET",
+            "/api/v1/mcps/demo?target_uri=viking%3A%2F%2Fagent%2Ftools",
+            None,
+        ),
+        (
+            "POST",
+            "/api/v1/mcps/demo/sync",
+            {"target_uri": "viking://agent/tools", "wait": True},
+        ),
+        (
+            "GET",
+            "/api/v1/mcps/status?name=demo&target_uri=viking%3A%2F%2Fagent%2Ftools",
+            None,
+        ),
         (
             "POST",
             "/api/v1/mcps/invoke",
@@ -1357,7 +1461,11 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
                 "wait": True,
             },
         ),
-        ("GET", "/api/v1/mcps/mounts?mcp=demo&tool=current", None),
+        (
+            "GET",
+            "/api/v1/mcps/mounts?mcp=demo&tool=current&target_uri=viking%3A%2F%2Fagent%2Ftools",
+            None,
+        ),
     ]
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         for method, path, body in requests:
@@ -1370,6 +1478,7 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
         "https://example.com/mcp",
         {},
         _ctx(),
+        target_uri="viking://agent/tools",
         wait=True,
     )
     methods["mount"].assert_awaited_once_with(
@@ -1388,8 +1497,39 @@ async def test_router_exposes_and_delegates_only_requested_operations(monkeypatc
         10,
         _ctx(),
         include_definition=True,
+        target_uri="viking://agent/tools",
     )
-    methods["sync"].assert_awaited_once_with("demo", _ctx(), wait=True)
+    methods["sync"].assert_awaited_once_with(
+        "demo",
+        _ctx(),
+        target_uri="viking://agent/tools",
+        wait=True,
+    )
+    methods["remove"].assert_awaited_once_with(
+        "demo",
+        _ctx(),
+        target_uri="viking://agent/tools",
+    )
+    methods["list"].assert_awaited_once_with(
+        _ctx(),
+        target_uri="viking://agent/tools",
+    )
+    methods["show"].assert_awaited_once_with(
+        "demo",
+        _ctx(),
+        target_uri="viking://agent/tools",
+    )
+    methods["status"].assert_awaited_once_with(
+        "demo",
+        _ctx(),
+        target_uri="viking://agent/tools",
+    )
+    methods["mounts"].assert_awaited_once_with(
+        "demo",
+        "current",
+        _ctx(),
+        target_uri="viking://agent/tools",
+    )
     methods["batch_mount"].assert_awaited_once_with(
         [
             MCPToolMount(

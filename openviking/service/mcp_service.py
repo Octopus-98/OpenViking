@@ -24,6 +24,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, InitializeResult, Tool
 
+from openviking.core.namespace import canonical_user_root
+from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs import AGFSNotFoundError, AsyncAGFSClient
 from openviking.server.identity import RequestContext
@@ -38,10 +40,11 @@ from openviking_cli.exceptions import (
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _TOOL_URI_RE = re.compile(
-    r"^viking://agent/tools/(?P<server>[A-Za-z0-9_-]{1,64})/"
+    r"^viking://(?P<scope>agent|user/[^/]+)/tools/"
+    r"(?P<server>[A-Za-z0-9_-]{1,64})/"
     r"(?P<tool>[A-Za-z0-9_.-]{1,128})\.json$"
 )
-_TOOLS_ROOT = "viking://agent/tools"
+_AGENT_TOOLS_ROOT = "viking://agent/tools"
 _REGISTRY_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _MOUNT_SCHEMA = """
@@ -108,7 +111,9 @@ class MCPService:
         return self._locks.setdefault(account_id, asyncio.Lock())
 
     @staticmethod
-    def _registry_path(account_id: str) -> str:
+    def _registry_path(account_id: str, user_id: str | None = None) -> str:
+        if user_id is not None:
+            return f"/local/{account_id}/_system/mcps/{user_id}.json"
         return f"/local/{account_id}/_system/mcps.json"
 
     @staticmethod
@@ -191,8 +196,75 @@ class MCPService:
         await self._agfs().ensure_parent_dirs(path)
         await self._agfs().write(path, payload)
 
-    async def _load(self, ctx: RequestContext) -> dict[str, Any]:
-        registry = await self._read_document(self._registry_path(ctx.account_id))
+    @staticmethod
+    def _user_tools_root(ctx: RequestContext) -> str:
+        return f"{canonical_user_root(ctx)}/tools"
+
+    @classmethod
+    def _tools_roots(cls, ctx: RequestContext) -> tuple[str, str]:
+        return cls._user_tools_root(ctx), _AGENT_TOOLS_ROOT
+
+    @classmethod
+    def _resolve_tools_root(
+        cls,
+        ctx: RequestContext,
+        target_uri: str | None,
+    ) -> str:
+        if target_uri is None:
+            return cls._user_tools_root(ctx)
+        normalized = validate_request_viking_uri(
+            resolve_path_variables(target_uri),
+            ctx,
+            field_name="target_uri",
+        ).rstrip("/")
+        allowed = cls._tools_roots(ctx)
+        if normalized not in allowed:
+            raise InvalidArgumentError(
+                f"Unsupported MCP tools root URI: {target_uri}",
+                details={
+                    "field": "target_uri",
+                    "allowed": list(allowed),
+                },
+            )
+        return normalized
+
+    @classmethod
+    def _registry_path_for_root(cls, ctx: RequestContext, tools_root: str) -> str:
+        if tools_root == _AGENT_TOOLS_ROOT:
+            return cls._registry_path(ctx.account_id)
+        return cls._registry_path(ctx.account_id, ctx.user.user_id)
+
+    @classmethod
+    def _parse_tool_uri(
+        cls,
+        uri: str,
+        ctx: RequestContext,
+    ) -> tuple[str, str, str, str]:
+        normalized = validate_request_viking_uri(
+            resolve_path_variables(uri),
+            ctx,
+            field_name="tool URI",
+        ).rstrip("/")
+        match = _TOOL_URI_RE.fullmatch(normalized)
+        if match is None:
+            raise InvalidArgumentError(
+                "Tool URI must match viking://agent/tools/<server>/<tool>.json "
+                "or viking://~/tools/<server>/<tool>.json"
+            )
+        suffix = f"/{match.group('server')}/{match.group('tool')}.json"
+        tools_root = normalized[: -len(suffix)]
+        if tools_root not in cls._tools_roots(ctx):
+            raise InvalidArgumentError(
+                "Tool URI must belong to the current user's tools space or the shared agent space"
+            )
+        return normalized, tools_root, match.group("server"), match.group("tool")
+
+    async def _load(
+        self,
+        ctx: RequestContext,
+        tools_root: str = _AGENT_TOOLS_ROOT,
+    ) -> dict[str, Any]:
+        registry = await self._read_document(self._registry_path_for_root(ctx, tools_root))
         for server in registry["servers"].values():
             if isinstance(server, dict):
                 server.pop("tools", None)
@@ -232,12 +304,17 @@ class MCPService:
         return normalized
 
     @staticmethod
-    def _public_server(server: dict[str, Any], tool_count: int) -> dict[str, Any]:
+    def _public_server(
+        server: dict[str, Any],
+        tool_count: int,
+        tools_root: str,
+    ) -> dict[str, Any]:
         return {
             key: value
             for key, value in server.items()
             if key not in {"header_names", "headers", "tools"}
         } | {
+            "root_uri": tools_root,
             "header_names": sorted(server.get("headers", {})),
             "tool_count": tool_count,
         }
@@ -347,10 +424,11 @@ class MCPService:
         removed_names: set[str],
         ctx: RequestContext,
         *,
+        tools_root: str = _AGENT_TOOLS_ROOT,
         wait: bool = True,
     ) -> dict[str, Any] | None:
-        server_root = f"{_TOOLS_ROOT}/{server_name}"
-        await self._ensure_directory(_TOOLS_ROOT, ctx)
+        server_root = f"{tools_root}/{server_name}"
+        await self._ensure_directory(tools_root, ctx)
         await self._ensure_directory(server_root, ctx)
 
         operations = [
@@ -379,8 +457,13 @@ class MCPService:
             )
         return result
 
-    async def _catalog_uris(self, server_name: str, ctx: RequestContext) -> list[str]:
-        root = f"{_TOOLS_ROOT}/{server_name}"
+    async def _catalog_uris(
+        self,
+        server_name: str,
+        ctx: RequestContext,
+        tools_root: str = _AGENT_TOOLS_ROOT,
+    ) -> list[str]:
+        root = f"{tools_root}/{server_name}"
         uris: list[str] = []
         offset = 0
         while True:
@@ -408,16 +491,26 @@ class MCPService:
                 raise RuntimeError(f"Unable to paginate MCP tool catalog: {root}")
             offset += len(entries)
 
-    async def _catalog_names(self, server_name: str, ctx: RequestContext) -> set[str]:
-        prefix = f"{_TOOLS_ROOT}/{server_name}/"
+    async def _catalog_names(
+        self,
+        server_name: str,
+        ctx: RequestContext,
+        tools_root: str = _AGENT_TOOLS_ROOT,
+    ) -> set[str]:
+        prefix = f"{tools_root}/{server_name}/"
         return {
             uri[len(prefix) : -len(".json")]
-            for uri in await self._catalog_uris(server_name, ctx)
+            for uri in await self._catalog_uris(server_name, ctx, tools_root)
             if uri.startswith(prefix)
         }
 
-    async def _catalog(self, server_name: str, ctx: RequestContext) -> list[dict[str, Any]]:
-        uris = await self._catalog_uris(server_name, ctx)
+    async def _catalog(
+        self,
+        server_name: str,
+        ctx: RequestContext,
+        tools_root: str = _AGENT_TOOLS_ROOT,
+    ) -> list[dict[str, Any]]:
+        uris = await self._catalog_uris(server_name, ctx, tools_root)
         contents = await asyncio.gather(*(self._service.fs.read(uri, ctx=ctx) for uri in uris))
         documents: list[dict[str, Any]] = []
         for uri, content in zip(uris, contents, strict=True):
@@ -427,7 +520,7 @@ class MCPService:
                 tool_name = tool["name"]
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise RuntimeError(f"Invalid MCP tool document: {uri}") from exc
-            expected_uri = f"{_TOOLS_ROOT}/{server_name}/{tool_name}.json"
+            expected_uri = f"{tools_root}/{server_name}/{tool_name}.json"
             if (
                 not isinstance(document, dict)
                 or not isinstance(tool, dict)
@@ -440,14 +533,8 @@ class MCPService:
         return documents
 
     async def _tool(self, uri: str, ctx: RequestContext) -> dict[str, Any]:
-        match = _TOOL_URI_RE.fullmatch(uri)
-        if match is None:
-            raise InvalidArgumentError(
-                "Tool URI must match viking://agent/tools/<server>/<tool>.json"
-            )
-        server_name = match.group("server")
-        tool_name = match.group("tool")
-        await self._registered(server_name, ctx)
+        uri, tools_root, server_name, tool_name = self._parse_tool_uri(uri, ctx)
+        await self._registered(server_name, ctx, target_uri=tools_root)
         try:
             content = await self._service.fs.read(uri, ctx=ctx)
             document = json.loads(content)
@@ -512,16 +599,17 @@ class MCPService:
         server_name: str,
         current_tools: dict[str, dict[str, Any]],
         ctx: RequestContext,
+        tools_root: str = _AGENT_TOOLS_ROOT,
     ) -> list[dict[str, Any]]:
         connection = await self._open_mount_database(ctx)
         try:
             rows = connection.execute(
                 """
                 SELECT * FROM live_context_nodes
-                WHERE mcp_name = ?
+                WHERE mcp_name = ? AND tool_uri LIKE ?
                 ORDER BY tool_name, node_uri
                 """,
-                (server_name,),
+                (server_name, f"{tools_root}/{server_name}/%"),
             ).fetchall()
         finally:
             self._close_mount_database(connection)
@@ -647,8 +735,10 @@ class MCPService:
         headers: dict[str, str],
         ctx: RequestContext,
         *,
+        target_uri: str | None = None,
         wait: bool = False,
     ) -> dict[str, Any]:
+        tools_root = self._resolve_tools_root(ctx, target_uri)
         name = self._validate_server_name(name)
         url = self._validate_url(url)
         headers = self._validate_headers(headers)
@@ -666,7 +756,7 @@ class MCPService:
             )
 
         async with self._lock(ctx.account_id):
-            registry = await self._load(ctx)
+            registry = await self._load(ctx, tools_root)
             if name in registry["servers"]:
                 raise AlreadyExistsError(name, "MCP server")
             timestamp = _now()
@@ -677,53 +767,101 @@ class MCPService:
                 "created_at": timestamp,
                 "updated_at": timestamp,
             }
-            processing = await self._publish_catalog(name, tools, set(), ctx, wait=wait)
+            processing = await self._publish_catalog(
+                name,
+                tools,
+                set(),
+                ctx,
+                tools_root=tools_root,
+                wait=wait,
+            )
             registry["servers"][name] = server
-            await self._write_document(self._registry_path(ctx.account_id), registry)
+            await self._write_document(
+                self._registry_path_for_root(ctx, tools_root),
+                registry,
+            )
 
         result = {
-            **self._public_server(server, len(tools)),
+            **self._public_server(server, len(tools), tools_root),
             "protocol_version": initialized.protocolVersion,
         }
         if processing is not None:
             result["processing"] = processing
         return result
 
-    async def remove(self, name: str, ctx: RequestContext) -> dict[str, Any]:
+    async def remove(
+        self,
+        name: str,
+        ctx: RequestContext,
+        *,
+        target_uri: str | None = None,
+    ) -> dict[str, Any]:
+        tools_root = self._resolve_tools_root(ctx, target_uri)
         name = self._validate_server_name(name)
         async with self._lock(ctx.account_id):
-            registry = await self._load(ctx)
+            registry = await self._load(ctx, tools_root)
             if name not in registry["servers"]:
                 raise NotFoundError(name, "MCP server")
             await self._service.fs.rm(
-                f"{_TOOLS_ROOT}/{name}",
+                f"{tools_root}/{name}",
                 ctx=ctx,
                 recursive=True,
                 wait=True,
             )
             registry["servers"].pop(name)
-            await self._write_document(self._registry_path(ctx.account_id), registry)
-        return {"name": name, "removed": True}
+            await self._write_document(
+                self._registry_path_for_root(ctx, tools_root),
+                registry,
+            )
+        return {"name": name, "root_uri": tools_root, "removed": True}
 
-    async def list(self, ctx: RequestContext) -> dict[str, Any]:
-        registry = await self._load(ctx)
-        items = sorted(registry["servers"].items())
-        counts = await asyncio.gather(*(self._catalog_names(name, ctx) for name, _ in items))
-        servers = [
-            self._public_server(server, len(tool_names))
-            for (_, server), tool_names in zip(items, counts, strict=True)
+    async def list(
+        self,
+        ctx: RequestContext,
+        *,
+        target_uri: str | None = None,
+    ) -> dict[str, Any]:
+        roots = (
+            (self._resolve_tools_root(ctx, target_uri),)
+            if target_uri is not None
+            else self._tools_roots(ctx)
+        )
+        registries = await asyncio.gather(*(self._load(ctx, root) for root in roots))
+        entries = [
+            (root, name, server)
+            for root, registry in zip(roots, registries, strict=True)
+            for name, server in sorted(registry["servers"].items())
         ]
-        return {"servers": servers, "total": len(servers)}
+        counts = await asyncio.gather(
+            *(self._catalog_names(name, ctx, root) for root, name, _ in entries)
+        )
+        servers = [
+            self._public_server(server, len(tool_names), root)
+            for (root, _, server), tool_names in zip(entries, counts, strict=True)
+        ]
+        result: dict[str, Any] = {"servers": servers, "total": len(servers)}
+        if target_uri is not None:
+            result["root_uri"] = roots[0]
+        else:
+            result["root_uris"] = list(roots)
+        return result
 
-    async def show(self, name: str, ctx: RequestContext) -> dict[str, Any]:
+    async def show(
+        self,
+        name: str,
+        ctx: RequestContext,
+        *,
+        target_uri: str | None = None,
+    ) -> dict[str, Any]:
+        tools_root = self._resolve_tools_root(ctx, target_uri)
         name = self._validate_server_name(name)
-        registry = await self._load(ctx)
+        registry = await self._load(ctx, tools_root)
         server = registry["servers"].get(name)
         if server is None:
             raise NotFoundError(name, "MCP server")
-        tools = await self._catalog(name, ctx)
+        tools = await self._catalog(name, ctx, tools_root)
         return {
-            **self._public_server(server, len(tools)),
+            **self._public_server(server, len(tools), tools_root),
             "tools": tools,
         }
 
@@ -734,58 +872,80 @@ class MCPService:
         ctx: RequestContext,
         *,
         include_definition: bool = False,
+        target_uri: str | None = None,
     ) -> dict[str, Any]:
         query = query.strip()
         if not query:
             raise InvalidArgumentError("Tool search query must not be empty")
 
-        search_result = await self._service.search.find(
-            query=query,
-            ctx=ctx,
-            target_uri=_TOOLS_ROOT,
-            limit=limit,
-            level=[2],
+        roots = (
+            (self._resolve_tools_root(ctx, target_uri),)
+            if target_uri is not None
+            else self._tools_roots(ctx)
         )
-        result_dict = (
-            search_result.to_dict()
-            if hasattr(search_result, "to_dict")
-            else dict(search_result or {})
+        search_results = await asyncio.gather(
+            *(
+                self._service.search.find(
+                    query=query,
+                    ctx=ctx,
+                    target_uri=root,
+                    limit=limit,
+                    level=[2],
+                )
+                for root in roots
+            )
         )
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for hit in result_dict.get("resources", []):
-            uri = hit.get("uri")
-            match = _TOOL_URI_RE.fullmatch(uri) if isinstance(uri, str) else None
-            if match is None or uri in seen:
-                continue
-            try:
-                document = await self._tool(uri, ctx)
-            except NotFoundError:
-                continue
-            seen.add(uri)
-            tool = document["tool"]
-            results.append(
-                {
-                    "uri": uri,
-                    "server": match.group("server"),
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "revision": document["revision"],
-                    "input_revision": document["input_revision"],
-                    "score": hit.get("score", 0.0),
-                }
+        for root, search_result in zip(roots, search_results, strict=True):
+            result_dict = (
+                search_result.to_dict()
+                if hasattr(search_result, "to_dict")
+                else dict(search_result or {})
             )
-            if include_definition:
-                results[-1]["tool"] = tool
-        return {"tools": results, "total": len(results)}
+            for hit in result_dict.get("resources", []):
+                uri = hit.get("uri")
+                match = _TOOL_URI_RE.fullmatch(uri) if isinstance(uri, str) else None
+                if match is None or not uri.startswith(f"{root}/") or uri in seen:
+                    continue
+                try:
+                    document = await self._tool(uri, ctx)
+                except NotFoundError:
+                    continue
+                seen.add(uri)
+                tool = document["tool"]
+                results.append(
+                    {
+                        "uri": uri,
+                        "server": match.group("server"),
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "revision": document["revision"],
+                        "input_revision": document["input_revision"],
+                        "score": hit.get("score", 0.0),
+                    }
+                )
+                if include_definition:
+                    results[-1]["tool"] = tool
+        results.sort(key=lambda item: item["score"], reverse=True)
+        results = results[:limit]
+        result = {"tools": results, "total": len(results)}
+        if target_uri is not None:
+            result["root_uri"] = roots[0]
+        else:
+            result["root_uris"] = list(roots)
+        return result
 
     async def _registered(
         self,
         name: str,
         ctx: RequestContext,
+        *,
+        target_uri: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
+        tools_root = self._resolve_tools_root(ctx, target_uri)
         name = self._validate_server_name(name)
-        registry = await self._load(ctx)
+        registry = await self._load(ctx, tools_root)
         server = registry["servers"].get(name)
         if server is None:
             raise NotFoundError(name, "MCP server")
@@ -815,10 +975,12 @@ class MCPService:
         name: str,
         ctx: RequestContext,
         *,
+        target_uri: str | None = None,
         wait: bool = False,
     ) -> dict[str, Any]:
+        tools_root = self._resolve_tools_root(ctx, target_uri)
         async with self._lock(ctx.account_id):
-            server, headers = await self._registered(name, ctx)
+            server, headers = await self._registered(name, ctx, target_uri=tools_root)
             initialized, discovered = await self._discover(server, headers)
             tools = [self._tool_document(server, tool) for tool in discovered]
             invalid_names = [
@@ -831,7 +993,8 @@ class MCPService:
                     f"MCP tool names are not valid OpenViking filenames: {', '.join(invalid_names)}"
                 )
             existing_tools = {
-                document["tool"]["name"]: document for document in await self._catalog(name, ctx)
+                document["tool"]["name"]: document
+                for document in await self._catalog(name, ctx, tools_root)
             }
             current_tools = {document["tool"]["name"]: document for document in tools}
             existing_names = set(existing_tools)
@@ -856,16 +1019,26 @@ class MCPService:
                 [current_tools[tool_name] for tool_name in definitions_to_publish],
                 set(removed),
                 ctx,
+                tools_root=tools_root,
                 wait=wait,
             )
-            affected_mounts = await self._affected_mounts(name, current_tools, ctx)
-            registry = await self._load(ctx)
+            affected_mounts = await self._affected_mounts(
+                name,
+                current_tools,
+                ctx,
+                tools_root,
+            )
+            registry = await self._load(ctx, tools_root)
             current = registry["servers"][name]
             current.pop("tools", None)
             current["updated_at"] = _now()
-            await self._write_document(self._registry_path(ctx.account_id), registry)
+            await self._write_document(
+                self._registry_path_for_root(ctx, tools_root),
+                registry,
+            )
         return {
             "name": name,
+            "root_uri": tools_root,
             "synced": True,
             "protocol_version": initialized.protocolVersion,
             "tool_count": len(tools),
@@ -882,9 +1055,16 @@ class MCPService:
     def _valid_tool_name(name: str) -> bool:
         return name not in {".", ".."} and _TOOL_NAME_RE.fullmatch(name) is not None
 
-    async def status(self, name: str, ctx: RequestContext) -> dict[str, Any]:
+    async def status(
+        self,
+        name: str,
+        ctx: RequestContext,
+        *,
+        target_uri: str | None = None,
+    ) -> dict[str, Any]:
+        tools_root = self._resolve_tools_root(ctx, target_uri)
         name = self._validate_server_name(name)
-        registry = await self._load(ctx)
+        registry = await self._load(ctx, tools_root)
         server = registry["servers"].get(name)
         if server is None:
             raise NotFoundError(name, "MCP server")
@@ -893,14 +1073,16 @@ class MCPService:
             initialized, tools = await self._discover(server, headers)
             return {
                 "name": name,
+                "root_uri": tools_root,
                 "status": "running",
                 "protocol_version": initialized.protocolVersion,
                 "tool_count": len(tools),
             }
         except (InvalidArgumentError, UnavailableError) as exc:
-            tool_names = await self._catalog_names(name, ctx)
+            tool_names = await self._catalog_names(name, ctx, tools_root)
             return {
                 "name": name,
+                "root_uri": tools_root,
                 "status": "error",
                 "error": str(exc),
                 "tool_count": len(tool_names),
@@ -927,10 +1109,7 @@ class MCPService:
         async with self._lock(ctx.account_id):
             tool_document = await self._tool(tool_uri, ctx)
             self._validate_tool_arguments(tool_document, arguments)
-            match = _TOOL_URI_RE.fullmatch(tool_uri)
-            assert match is not None
-            server_name = match.group("server")
-            tool_name = match.group("tool")
+            tool_uri, _, server_name, tool_name = self._parse_tool_uri(tool_uri, ctx)
 
             connection = await self._open_mount_database(ctx)
             try:
@@ -1037,11 +1216,10 @@ class MCPService:
                     tool_document = await self._tool(tool_uri, ctx)
                     tool_documents[tool_uri] = tool_document
                 self._validate_tool_arguments(tool_document, arguments)
-                match = _TOOL_URI_RE.fullmatch(tool_uri)
-                assert match is not None
+                tool_uri, _, server_name, tool_name = self._parse_tool_uri(tool_uri, ctx)
                 prepared.append(
                     {
-                        "tool_uri": mount.tool_uri,
+                        "tool_uri": tool_uri,
                         "node_uri": node_uri,
                         "title": mount.title,
                         "description": mount.description,
@@ -1049,8 +1227,8 @@ class MCPService:
                         "arguments": mount.arguments,
                         "tags": mount.tags,
                         "tool_document": tool_document,
-                        "server_name": match.group("server"),
-                        "tool_name": match.group("tool"),
+                        "server_name": server_name,
+                        "tool_name": tool_name,
                         "content": self._render_live_context_node(
                             tool_uri,
                             tool_document,
@@ -1306,19 +1484,29 @@ class MCPService:
         mcp_name: str,
         tool_name: str | None,
         ctx: RequestContext,
+        *,
+        target_uri: str | None = None,
     ) -> dict[str, Any]:
+        tools_root = self._resolve_tools_root(ctx, target_uri)
         mcp_name = self._validate_server_name(mcp_name)
-        await self._registered(mcp_name, ctx)
+        await self._registered(mcp_name, ctx, target_uri=tools_root)
         if tool_name is not None and not self._valid_tool_name(tool_name):
             raise InvalidArgumentError("Invalid MCP tool name")
 
         connection = await self._open_mount_database(ctx)
         try:
-            query = "SELECT * FROM live_context_nodes WHERE mcp_name = ?"
-            parameters: tuple[str, ...] = (mcp_name,)
+            query = "SELECT * FROM live_context_nodes WHERE mcp_name = ? AND tool_uri LIKE ?"
+            parameters: tuple[str, ...] = (
+                mcp_name,
+                f"{tools_root}/{mcp_name}/%",
+            )
             if tool_name is not None:
                 query += " AND tool_name = ?"
-                parameters = (mcp_name, tool_name)
+                parameters = (
+                    mcp_name,
+                    f"{tools_root}/{mcp_name}/%",
+                    tool_name,
+                )
             query += " ORDER BY tool_name, node_uri"
             rows = connection.execute(query, parameters).fetchall()
         finally:
@@ -1348,7 +1536,11 @@ class MCPService:
                     "created_at": row["created_at"],
                 }
             )
-        return {"mounts": items, "total": len(items)}
+        return {
+            "root_uri": tools_root,
+            "mounts": items,
+            "total": len(items),
+        }
 
     @staticmethod
     def _parse_live_context_node(content: str) -> tuple[str, dict[str, Any], int] | None:
@@ -1466,15 +1658,13 @@ class MCPService:
         *,
         require_read_only: bool = False,
     ) -> dict[str, Any]:
-        match = _TOOL_URI_RE.fullmatch(uri)
-        if match is None:
-            raise InvalidArgumentError(
-                "Tool URI must match viking://agent/tools/<server>/<tool>.json"
-            )
-        server_name = match.group("server")
-        tool_name = match.group("tool")
-        server, headers = await self._registered(server_name, ctx)
-        if tool_name not in await self._catalog_names(server_name, ctx):
+        uri, tools_root, server_name, tool_name = self._parse_tool_uri(uri, ctx)
+        server, headers = await self._registered(
+            server_name,
+            ctx,
+            target_uri=tools_root,
+        )
+        if tool_name not in await self._catalog_names(server_name, ctx, tools_root):
             raise NotFoundError(uri, "MCP tool")
         tool_document = await self._tool(uri, ctx)
         if require_read_only and not self._tool_is_read_only(tool_document):

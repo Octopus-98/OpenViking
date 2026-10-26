@@ -14,7 +14,9 @@
 - MCP Server 只支持 Streamable HTTP，地址可以使用 HTTP 或 HTTPS。HTTP 不提供传输加密，使用方需自行评估凭证和工具数据的暴露风险。
 - Server 名称只能包含字母、数字、`_` 和 `-`，最长 64 个字符。工具名必须能作为 OpenViking 文件名使用。
 - 注册时提交的 HTTP Header 按账号保存，但 API 只返回按字母排序的 `header_names`，不会返回 Header 值。
-- 工具目录位于 `viking://agent/tools/<server>/<tool>.json`。调用和挂载参数会按工具的 `inputSchema` 校验。
+- 工具目录可以位于用户空间 `viking://~/tools/<server>/<tool>.json`，也可以位于账号共享空间 `viking://agent/tools/<server>/<tool>.json`。调用和挂载参数会按工具的 `inputSchema` 校验。
+- `target_uri` 只接受 `viking://~/tools` 或 `viking://agent/tools`。注册及名称型操作未指定时使用用户空间；列出和检索未指定时合并两个空间。同名 Server 可以同时存在于两个空间。
+- 两个 tools 目录都是受管目录，不能通过普通 `mkdir`、`rm`、`cp` 或 `mv` 修改，应使用 MCP 管理接口。
 - 实时上下文节点 URI 必须是当前账号可访问的 Viking URI，并以 `.md` 结尾。
 - `wait` 只控制目录或节点写入是否等待后台处理完成，不是 MCP 工具调用超时。`timeout_seconds` 是每次实时工具调用的超时时间。
 
@@ -41,7 +43,7 @@
 
 ### 校验和注册
 
-`POST /api/v1/mcps/validate` 会连接 Server、完成 MCP 初始化并列出工具，但不会写入注册表或工具目录。`POST /api/v1/mcps` 执行相同校验，然后注册 Server 并把工具定义发布到 `viking://agent/tools/<name>/`。同名 Server 已存在时注册失败。
+`POST /api/v1/mcps/validate` 会连接 Server、完成 MCP 初始化并列出工具，但不会写入注册表或工具目录。`POST /api/v1/mcps` 执行相同校验，然后注册 Server 并发布工具定义。默认发布到 `viking://~/tools/<name>/`；通过 `target_uri` 可以选择 `viking://agent/tools/<name>/`。同一空间内的同名 Server 已存在时注册失败。
 
 **请求体**
 
@@ -50,6 +52,7 @@
 | `name` | string | 是 | - | Server 名称 |
 | `url` | string | 是 | - | Streamable HTTP 地址 |
 | `headers` | object | 否 | `{}` | 发往上游的 HTTP Header |
+| `target_uri` | string | 否 | `viking://~/tools` | 用户或共享 tools 根目录 |
 | `wait` | boolean | 否 | `false` | 仅注册接口使用；是否等待工具目录处理完成 |
 
 未知字段会返回 `INVALID_ARGUMENT`。凭证应从环境变量或密钥系统注入请求，不要写入资源文件或提交到代码仓库。
@@ -68,6 +71,7 @@ result = client.add_mcp(
     "weather",
     "https://mcp.example.com/mcp",
     headers=headers,
+    target_uri="viking://agent/tools",
     wait=True,
 )
 ```
@@ -81,7 +85,7 @@ const result = await client.addMCP(
   "weather",
   "https://mcp.example.com/mcp",
   headers,
-  { wait: true },
+  { wait: true, targetUri: "viking://agent/tools" },
 );
 ```
 
@@ -100,7 +104,7 @@ result, err := client.AddMCP(
     "weather",
     "https://mcp.example.com/mcp",
     headers,
-    &openviking.WaitOptions{Wait: true},
+    &openviking.WaitOptions{Wait: true, TargetURI: "viking://agent/tools"},
 )
 ```
 
@@ -123,6 +127,7 @@ curl -X POST http://localhost:1933/api/v1/mcps \
     "name": "weather",
     "url": "https://mcp.example.com/mcp",
     "headers": {"Authorization": "Bearer <token>"},
+    "target_uri": "viking://agent/tools",
     "wait": true
   }'
 ```
@@ -131,7 +136,7 @@ curl -X POST http://localhost:1933/api/v1/mcps \
 
 ```bash
 ov mcps validate '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer <token>"}}}}'
-ov mcps add --wait '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer <token>"}}}}'
+ov mcps add -p viking://agent/tools --wait '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer <token>"}}}}'
 ```
 
 **校验响应**
@@ -141,6 +146,7 @@ ov mcps add --wait '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp
   "status": "ok",
   "result": {
     "name": "weather",
+    "root_uri": "viking://agent/tools",
     "valid": true,
     "protocol_version": "2025-03-26",
     "server_info": {"name": "weather-server", "version": "1.0.0"},
@@ -170,35 +176,36 @@ ov mcps add --wait '{"mcpServers":{"weather":{"url":"https://mcp.example.com/mcp
 
 ### 列出、查看和检查状态
 
-`GET /api/v1/mcps` 返回当前账号的 Server，按名称排序。`GET /api/v1/mcps/{name}` 还返回当前工具目录中的完整工具文档。`GET /api/v1/mcps/status?name=...` 实时连接上游；连接失败仍是成功的 HTTP 响应，但 `result.status` 为 `error`。
+`GET /api/v1/mcps` 未指定 `target_uri` 时合并用户空间和共享空间的 Server，每项用 `root_uri` 标识所属空间。`GET /api/v1/mcps/{name}` 和状态接口默认操作用户空间；使用同名共享 Server 时必须指定 `target_uri=viking://agent/tools`。连接失败仍是成功的 HTTP 响应，但 `result.status` 为 `error`。
 
 **SDK 与 CLI**
 
 ```python
 servers = client.list_mcps()
-server = client.get_mcp("weather")
-status = client.get_mcp_status("weather")
+server = client.get_mcp("weather", target_uri="viking://agent/tools")
+status = client.get_mcp_status("weather", target_uri="viking://agent/tools")
 ```
 
 ```typescript
 const servers = await client.listMCPs();
-const server = await client.getMCP("weather");
-const status = await client.getMCPStatus("weather");
+const server = await client.getMCP("weather", "viking://agent/tools");
+const status = await client.getMCPStatus("weather", "viking://agent/tools");
 ```
 
 ```bash
 ov mcps list
-ov mcps show weather
-ov mcps status weather
+ov mcps show -p viking://agent/tools weather
+ov mcps status -p viking://agent/tools weather
 ```
 
 **HTTP API**
 
 ```bash
 curl -H "X-API-Key: your-key" http://localhost:1933/api/v1/mcps
-curl -H "X-API-Key: your-key" http://localhost:1933/api/v1/mcps/weather
 curl -H "X-API-Key: your-key" \
-  "http://localhost:1933/api/v1/mcps/status?name=weather"
+  "http://localhost:1933/api/v1/mcps/weather?target_uri=viking%3A%2F%2Fagent%2Ftools"
+curl -H "X-API-Key: your-key" \
+  "http://localhost:1933/api/v1/mcps/status?name=weather&target_uri=viking%3A%2F%2Fagent%2Ftools"
 ```
 
 **列表响应**
@@ -209,6 +216,7 @@ curl -H "X-API-Key: your-key" \
   "result": {
     "servers": [{
       "name": "weather",
+      "root_uri": "viking://agent/tools",
       "url": "https://mcp.example.com/mcp",
       "created_at": "2026-10-21T08:00:00+00:00",
       "updated_at": "2026-10-21T08:00:00+00:00",
@@ -253,24 +261,28 @@ curl -H "X-API-Key: your-key" \
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `wait` | boolean | 否 | `false` | 是否等待工具目录处理完成；也可以省略整个请求体 |
+| `target_uri` | string | 否 | `viking://~/tools` | Server 所属 tools 根目录 |
 
 **SDK、HTTP 与 CLI**
 
 ```python
-result = client.sync_mcp("weather", wait=True)
+result = client.sync_mcp("weather", target_uri="viking://agent/tools", wait=True)
 ```
 
 ```typescript
-const result = await client.syncMCP("weather", { wait: true });
+const result = await client.syncMCP("weather", {
+  targetUri: "viking://agent/tools",
+  wait: true,
+});
 ```
 
 ```bash
 curl -X POST http://localhost:1933/api/v1/mcps/weather/sync \
   -H "X-API-Key: your-key" \
   -H "Content-Type: application/json" \
-  -d '{"wait":true}'
+  -d '{"target_uri":"viking://agent/tools","wait":true}'
 
-ov mcps sync --wait weather
+ov mcps sync -p viking://agent/tools --wait weather
 ```
 
 **响应契约**
@@ -304,15 +316,15 @@ ov mcps sync --wait weather
 
 ### 删除 Server
 
-`DELETE /api/v1/mcps/{name}` 删除注册信息和 `viking://agent/tools/<name>/` 工具目录。它不删除已挂载的实时上下文节点；这些节点之后无法执行，应先查询并卸载挂载。
+`DELETE /api/v1/mcps/{name}` 删除指定空间中的注册信息和工具目录。它不删除已挂载的实时上下文节点；这些节点之后无法执行，应先查询并卸载挂载。
 
 ```python
-result = client.remove_mcp("weather")
+result = client.remove_mcp("weather", target_uri="viking://agent/tools")
 ```
 
 ```bash
-ov mcps mounts --mcp weather
-ov mcps remove weather
+ov mcps mounts -p viking://agent/tools --mcp weather
+ov mcps remove -p viking://agent/tools weather
 ```
 
 ```json
@@ -326,12 +338,13 @@ ov mcps remove weather
 
 ### 语义检索工具
 
-`POST /api/v1/mcps/find` 在 `viking://agent/tools` 下做语义检索。REST 和 SDK 响应包含完整 `tool` 定义，可据此只补充 `inputSchema` 要求的参数。
+`POST /api/v1/mcps/find` 未指定 `target_uri` 时合并检索用户空间和共享空间；指定后只检索对应 tools 根目录。REST 和 SDK 响应包含完整 `tool` 定义，可据此只补充 `inputSchema` 要求的参数。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `query` | string | 是 | - | 非空的自然语言查询 |
 | `limit` | integer | 否 | `10` | 返回上限，范围 1-100 |
+| `target_uri` | string | 否 | 合并两个空间 | 限定用户或共享 tools 根目录 |
 
 ```python
 result = client.find_mcp_tools("查询城市当前天气", limit=5)
@@ -530,7 +543,7 @@ ov mcps mount \
 
 ### 查询挂载
 
-`GET /api/v1/mcps/mounts` 的 `mcp` 查询参数必填，`tool` 可选。Server 必须仍处于已注册状态。
+`GET /api/v1/mcps/mounts` 的 `mcp` 查询参数必填，`tool` 可选，`target_uri` 用于选择同名 Server 所属空间；未指定时使用用户空间。Server 必须仍处于已注册状态。
 响应中的 `tags` 从向量索引读取，挂载数据库不再保存独立副本。
 
 ```python

@@ -306,3 +306,64 @@ func TestMCPDefaultsMatchServerContract(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMCPOperationsScopeToolsRoot(t *testing.T) {
+	const targetURI = "viking://agent/tools"
+	requestIndex := 0
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requestIndex {
+		case 0:
+			if body := readJSONBody(t, r); body["target_uri"] != targetURI {
+				t.Fatalf("add target_uri = %#v", body["target_uri"])
+			}
+		case 1, 2, 4, 6, 7:
+			if got := r.URL.Query().Get("target_uri"); got != targetURI {
+				t.Fatalf("request %d target_uri = %q", requestIndex, got)
+			}
+		case 3, 5:
+			if body := readJSONBody(t, r); body["target_uri"] != targetURI {
+				t.Fatalf("request %d target_uri = %#v", requestIndex, body["target_uri"])
+			}
+		default:
+			t.Fatalf("unexpected request")
+		}
+		requestIndex++
+		writeOK(t, w, map[string]any{})
+	}))
+	defer closeServer()
+
+	ctx := context.Background()
+	if _, err := client.AddMCP(
+		ctx,
+		"demo",
+		"https://mcp.example.com/api",
+		nil,
+		&WaitOptions{TargetURI: targetURI},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RemoveMCP(ctx, "demo", targetURI); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListMCPs(ctx, targetURI); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.FindMCPTools(ctx, "weather", 10, targetURI); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetMCP(ctx, "demo", targetURI); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SyncMCP(ctx, "demo", &WaitOptions{TargetURI: targetURI}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetMCPStatus(ctx, "demo", targetURI); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListMCPMounts(ctx, "demo", "", targetURI); err != nil {
+		t.Fatal(err)
+	}
+	if requestIndex != 8 {
+		t.Fatalf("received %d requests, want 8", requestIndex)
+	}
+}

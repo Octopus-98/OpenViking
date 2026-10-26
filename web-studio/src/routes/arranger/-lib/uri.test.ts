@@ -94,6 +94,11 @@ describe('arranger Viking URI boundaries', () => {
       ),
     ).toBe('mcp_service_volcengine_tls')
     expect(
+      mcpServerNameFromToolUri(
+        'viking://user/alice/tools/local_demo/search.json',
+      ),
+    ).toBe('local_demo')
+    expect(
       mcpServerNameFromToolUri('viking://resources/arrange/status.md'),
     ).toBeNull()
     expect(mcpServerNameFromToolUri('not-a-viking-uri')).toBeNull()
