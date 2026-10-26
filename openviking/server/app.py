@@ -48,6 +48,7 @@ from openviking.server.routers import (
     pack_router,
     privacy_configs_router,
     resources_router,
+    rules_router,
     search_router,
     sessions_router,
     skills_router,
@@ -640,6 +641,7 @@ def create_app(
     app.include_router(agent_evolution_router)
     app.include_router(compile_router)
     app.include_router(resources_router)
+    app.include_router(rules_router)
     app.include_router(filesystem_router)
     app.include_router(mcps_router)
     app.include_router(content_router)
