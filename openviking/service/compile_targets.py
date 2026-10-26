@@ -48,7 +48,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from openviking.core.namespace import classify_uri
+from openviking.core.namespace import classify_uri, uri_parts
 from openviking.pyagfs import AsyncAGFSClient
 from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
 from openviking.pyagfs.exceptions import (
@@ -1036,6 +1036,36 @@ class CompileLifecycle:
                 raise InvalidArgumentError(
                     f"Compile 'from' directories must not overlap 'to': {source}"
                 )
+
+    async def validate_target_nesting(self, to: str, ctx: RequestContext) -> None:
+        """Reject canonical ``to`` when an ancestor or existing descendant is an active target.
+
+        The caller checks write access first. Internal traversal includes restricted
+        descendants so ACL filtering cannot hide conflicts; their URIs stay private.
+        Self and deleted registrations are allowed. Storage errors propagate.
+        """
+        parts = uri_parts(to)
+        related = {"viking://" + "/".join(parts[:index]) for index in range(1, len(parts))}
+        try:
+            entries = await self._fs.tree(
+                to,
+                ctx=task_ctx(ctx.account_id, ctx.user.user_id),
+                directories_only=True,
+                show_all_hidden=False,
+                node_limit=None,
+                level_limit=None,
+            )
+        except NotFoundError:
+            entries = []
+        related.update(entry["uri"].rstrip("/") for entry in entries if entry.get("isDir"))
+        related.discard(to)
+        records = await asyncio.gather(
+            *(self._store.get_by_to(ctx.account_id, uri) for uri in sorted(related))
+        )
+        if any(record is not None for record in records):
+            raise InvalidArgumentError(
+                "Compile target must not contain or be contained in another Compile target"
+            )
 
     @staticmethod
     def apply_sources(record: Dict[str, Any], sources: List[str], skill: str) -> None:
