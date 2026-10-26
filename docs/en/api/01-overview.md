@@ -429,6 +429,8 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | POST | `/api/v1/sessions/{session_id}/messages` | Add one message |
 | POST | `/api/v1/sessions/{session_id}/messages/batch` | Add messages in a batch |
 | POST | `/api/v1/search/recall` | Deprecated: thin preset over the search endpoint with `mode="context"` |
+| POST | `/api/v1/rules/compile` | Compile user rules asynchronously |
+| POST | `/api/v1/rules/search` | Retrieve complete rules applicable to a task |
 | GET | `/api/v1/agent-evolution/experiences/trajectories` | List trajectories that consumed an Experience |
 | GET | `/api/v1/agent-evolution/experiences/outcomes` | Aggregate outcomes of trajectories that consumed an Experience |
 
