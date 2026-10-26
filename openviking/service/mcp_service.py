@@ -948,12 +948,10 @@ class MCPService:
                 )
                 arguments_json = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
                 created_at = existing["created_at"] if existing is not None else _now()
-                existing_data = json.loads(existing["data"]) if existing is not None else {}
                 mount_data = {
                     "title": title,
                     "description": description,
                     "timeout_seconds": timeout_seconds,
-                    "tags": tags if tags is not None else existing_data.get("tags", []),
                 }
                 await self._service.fs.write(
                     node_uri,
@@ -1002,7 +1000,6 @@ class MCPService:
             "description": description,
             "timeout_seconds": timeout_seconds,
             "arguments": arguments,
-            "tags": mount_data["tags"],
             "created_at": created_at,
             "mounted": True,
         }
@@ -1069,20 +1066,14 @@ class MCPService:
             try:
                 for item in prepared:
                     existing = connection.execute(
-                        "SELECT created_at, data FROM live_context_nodes WHERE node_uri = ?",
+                        "SELECT created_at FROM live_context_nodes WHERE node_uri = ?",
                         (item["node_uri"],),
                     ).fetchone()
                     item["created_at"] = existing["created_at"] if existing is not None else _now()
-                    existing_data = json.loads(existing["data"]) if existing is not None else {}
                     item["data"] = {
                         "title": item["title"],
                         "description": item["description"],
                         "timeout_seconds": item["timeout_seconds"],
-                        "tags": (
-                            item["tags"]
-                            if item["tags"] is not None
-                            else existing_data.get("tags", [])
-                        ),
                     }
 
                 operations_by_root: dict[str, list[dict[str, Any]]] = {}
@@ -1164,7 +1155,6 @@ class MCPService:
                 "description": item.get("description"),
                 "timeout_seconds": item["timeout_seconds"],
                 "arguments": item["arguments"],
-                "tags": item["data"]["tags"],
                 "created_at": item["created_at"],
                 "mounted": True,
             }
@@ -1335,6 +1325,11 @@ class MCPService:
             self._close_mount_database(connection)
 
         rows = await self._readable_mount_rows(rows, ctx)
+        tags_by_uri = await self._service.fs.get_tags_many(
+            [row["node_uri"] for row in rows],
+            ctx,
+            check_access=False,
+        )
         items = []
         for row in rows:
             data = json.loads(row["data"])
@@ -1349,7 +1344,7 @@ class MCPService:
                     "title": data["title"],
                     "description": data.get("description"),
                     "timeout_seconds": data["timeout_seconds"],
-                    "tags": data.get("tags", []),
+                    "tags": tags_by_uri.get(row["node_uri"], []),
                     "created_at": row["created_at"],
                 }
             )

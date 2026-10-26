@@ -106,6 +106,54 @@ async def test_can_read_many_enforces_user_namespace_visibility(request_context)
 
 
 @pytest.mark.asyncio
+async def test_get_tags_many_returns_vector_backed_tags(request_context, monkeypatch):
+    can_access_many = AsyncMock(
+        return_value={
+            "viking://resources/a.md": True,
+            "viking://resources/b.md": True,
+        }
+    )
+    service = FSService(
+        viking_fs=SimpleNamespace(_can_access_many=can_access_many)
+    )
+    attach_tags = AsyncMock(
+        return_value=[
+            {"uri": "viking://resources/a.md", "isDir": False, "tags": ["env=prod"]},
+            {"uri": "viking://resources/b.md", "isDir": False, "tags": []},
+        ]
+    )
+    monkeypatch.setattr(service, "_attach_and_filter_tags", attach_tags)
+
+    result = await service.get_tags_many(
+        [
+            "viking://resources/a.md",
+            "viking://resources/b.md",
+            "viking://resources/a.md",
+        ],
+        request_context,
+    )
+
+    assert result == {
+        "viking://resources/a.md": ["env=prod"],
+        "viking://resources/b.md": [],
+    }
+    can_access_many.assert_awaited_once_with(
+        ["viking://resources/a.md", "viking://resources/b.md"],
+        request_context,
+        action=AclAction.READ,
+    )
+    attach_tags.assert_awaited_once_with(
+        [
+            {"uri": "viking://resources/a.md", "isDir": False},
+            {"uri": "viking://resources/b.md", "isDir": False},
+        ],
+        request_context,
+        tags=None,
+        include_tags=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_stat_forwards_optional_fields_without_changing_defaults(request_context):
     viking_fs = SimpleNamespace(stat=AsyncMock(return_value={"isDir": True}))
     service = FSService(viking_fs=viking_fs)

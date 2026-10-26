@@ -428,7 +428,7 @@ ov mcps invoke viking://agent/tools/weather/current.json \
 | `description` | string/null | 否 | `null` | 节点说明 |
 | `timeout_seconds` | integer | 否 | `60` | 单次工具调用超时，必须大于 0 |
 | `arguments` | object | 否 | `{}` | 固定注入并按工具 schema 校验的参数 |
-| `tags` | string[]/null | 否 | `null` | 节点检索标签；替换挂载时省略则保留原标签，传 `[]` 则清空 |
+| `tags` | string[]/null | 否 | `null` | 节点检索标签；省略或传 `[]` 均保留原标签，清空标签需调用 `set_tags` 的 clear 模式 |
 | `wait` | boolean | 否 | `false` | 是否等待节点处理完成；批量接口位于最外层 |
 
 **Python SDK**
@@ -507,7 +507,6 @@ ov mcps mount \
     "description": "查询北京当前天气",
     "timeout_seconds": 60,
     "arguments": {"city": "Beijing"},
-    "tags": ["source=mcp"],
     "created_at": "2026-10-21T08:30:00+00:00",
     "mounted": true
   }
@@ -527,10 +526,12 @@ ov mcps mount \
 ```
 
 每个 `mounts` 项的完整字段与单项挂载响应一致。
+挂载响应不返回 `tags`，因为向量索引处理可能仍在异步进行。需要当前标签时应调用查询挂载接口，以向量索引中的标签为准。
 
 ### 查询挂载
 
 `GET /api/v1/mcps/mounts` 的 `mcp` 查询参数必填，`tool` 可选。Server 必须仍处于已注册状态。
+响应中的 `tags` 从向量索引读取，挂载数据库不再保存独立副本。
 
 ```python
 result = client.list_mcp_mounts("weather", tool="current")

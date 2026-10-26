@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import json
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -600,6 +601,7 @@ async def test_show_uses_catalog_instead_of_legacy_registry_tools(monkeypatch):
 
 async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     stored: dict[str, bytes] = {}
+    current_tags = ["project=demo", "kind=live-context"]
 
     async def read_storage(path):
         if path not in stored:
@@ -620,6 +622,11 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         rm=AsyncMock(return_value={}),
         can_read_many=AsyncMock(
             side_effect=lambda uris, _ctx: dict.fromkeys(uris, True)
+        ),
+        get_tags_many=AsyncMock(
+            side_effect=lambda uris, _ctx, **_kwargs: {
+                uri: list(current_tags) for uri in uris
+            }
         ),
     )
     backing = SimpleNamespace(
@@ -670,6 +677,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     )
 
     assert mounted["mounted"] is True
+    assert "tags" not in mounted
     assert "idempotent" not in mounted
     assert mounted["input_revision"] == "input-revision-1"
     written = fs.write.await_args.args[1]
@@ -697,6 +705,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     connection.close()
     assert row[0] == node_uri
     assert row[1:4] == ("weather", "current", tool_uri)
+    assert "tags" not in json.loads(row[6])
 
     repeated = await service.mount(
         tool_uri,
@@ -708,6 +717,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         _ctx(),
     )
     assert repeated["mounted"] is True
+    assert "tags" not in repeated
     assert "idempotent" not in repeated
     assert repeated["created_at"] == mounted["created_at"]
     assert fs.write.await_count == 2
@@ -718,6 +728,7 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
     assert "timeout_seconds: 120" in updated
     assert fs.write.await_args.kwargs["wait"] is False
 
+    current_tags[:] = ["environment=staging"]
     listed = await service.mounts("weather", "current", _ctx())
     assert listed["total"] == 1
     assert listed["mounts"][0] == {
@@ -730,10 +741,10 @@ async def test_mount_list_and_unmount_persist_sqlite_database(monkeypatch):
         "title": "Shanghai Weather",
         "description": "Current weather in Shanghai",
         "timeout_seconds": 120,
-        "tags": ["project=demo", "kind=live-context"],
+        "tags": ["environment=staging"],
         "created_at": mounted["created_at"],
     }
-    assert repeated["tags"] == ["project=demo", "kind=live-context"]
+    assert fs.get_tags_many.await_count == 1
 
     fs.read.return_value = updated
     unmounted = await service.unmount(node_uri, _ctx(), wait=True)
@@ -752,7 +763,14 @@ async def test_mounts_only_returns_nodes_visible_to_caller(monkeypatch):
         }
     )
     service = MCPService(
-        SimpleNamespace(fs=SimpleNamespace(can_read_many=can_read_many))
+        SimpleNamespace(
+            fs=SimpleNamespace(
+                can_read_many=can_read_many,
+                get_tags_many=AsyncMock(
+                    return_value={visible_uri: ["scope=shared"]}
+                ),
+            )
+        )
     )
     monkeypatch.setattr(
         service,
@@ -779,7 +797,7 @@ async def test_mounts_only_returns_nodes_visible_to_caller(monkeypatch):
                 ('{visible_uri}', 'demo', 'current',
                  'viking://agent/tools/demo/current.json', 'visible-revision',
                  '{{"scope": "shared"}}',
-                 '{{"title": "Shared", "timeout_seconds": 60}}',
+                 '{{"title": "Shared", "timeout_seconds": 60, "tags": ["stale=true"]}}',
                  '2026-10-23T00:00:00+00:00'),
                 ('{hidden_uri}', 'demo', 'current',
                  'viking://agent/tools/demo/current.json', 'hidden-revision',
@@ -800,6 +818,7 @@ async def test_mounts_only_returns_nodes_visible_to_caller(monkeypatch):
     assert result["total"] == 1
     assert result["mounts"][0]["node_uri"] == visible_uri
     assert result["mounts"][0]["arguments"] == {"scope": "shared"}
+    assert result["mounts"][0]["tags"] == ["scope=shared"]
     checked_uris = can_read_many.await_args.args[0]
     assert set(checked_uris) == {visible_uri, hidden_uri}
 
@@ -826,6 +845,16 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
         read=AsyncMock(return_value="content"),
         rm=AsyncMock(return_value={}),
         mkdir=AsyncMock(return_value={}),
+        get_tags_many=AsyncMock(
+            side_effect=lambda uris, _ctx: {
+                uri: (
+                    ["project=demo"]
+                    if uri == "viking://resources/demo/current.md"
+                    else []
+                )
+                for uri in uris
+            }
+        ),
     )
     backing = SimpleNamespace(
         fs=fs,
@@ -877,8 +906,8 @@ async def test_batch_mount_and_unmount_share_filesystem_and_database_work(monkey
 
     assert mounted["total"] == 2
     assert [item["node_uri"] for item in mounted["mounts"]] == [mount.node_uri for mount in mounts]
-    assert mounted["mounts"][0]["tags"] == ["project=demo"]
-    assert mounted["mounts"][1]["tags"] == []
+    assert all("tags" not in item for item in mounted["mounts"])
+    fs.get_tags_many.assert_not_awaited()
     fs.batch_write.assert_awaited_once()
     batch_call = fs.batch_write.await_args.kwargs
     assert batch_call["root_uri"] == "viking://resources/demo"

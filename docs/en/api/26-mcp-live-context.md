@@ -429,7 +429,7 @@ Any tool can be mounted. Missing or empty annotations are treated as read-only f
 | `description` | string/null | No | `null` | Node description |
 | `timeout_seconds` | integer | No | `60` | Per-call timeout; must be positive |
 | `arguments` | object | No | `{}` | Preset arguments validated against the tool schema |
-| `tags` | string[]/null | No | `null` | Retrieval tags; omission preserves existing tags on replacement, while `[]` clears them |
+| `tags` | string[]/null | No | `null` | Retrieval tags; omission or `[]` preserves existing tags. Use `set_tags` with clear mode to remove tags |
 | `wait` | boolean | No | `false` | Wait for node processing; at the outer level for a batch |
 
 **Python SDK**
@@ -508,7 +508,6 @@ The current CLI `mount` command has no `--tags` option. Use an SDK or HTTP when 
     "description": "Query current weather in Beijing",
     "timeout_seconds": 60,
     "arguments": {"city": "Beijing"},
-    "tags": ["source=mcp"],
     "created_at": "2026-10-21T08:30:00+00:00",
     "mounted": true
   }
@@ -528,10 +527,12 @@ A batch body is `{"mounts":[<single-item parameters without wait>],"wait":false}
 ```
 
 Each `mounts` item has the full set of fields shown in the single-mount response.
+Mount responses do not include `tags` because vector indexing may still be asynchronous. Use the list-mounts API to read the current vector-backed tags.
 
 ### List mounts
 
 `GET /api/v1/mcps/mounts` requires the `mcp` query parameter and accepts an optional `tool`. The server must still be registered.
+Returned `tags` are read from the vector index; the mount database does not keep a separate copy.
 
 ```python
 result = client.list_mcp_mounts("weather", tool="current")
