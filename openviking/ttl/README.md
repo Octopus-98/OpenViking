@@ -40,8 +40,11 @@ An omitted or disabled `server.ttl_adapter` installs no write hook, starts no TT
 worker and loads no TTL Redis client. Explicit policy writes then return
 `501 UNIMPLEMENTED`: `Redis-backed TTL is not enabled in this deployment.`
 An enabled adapter still skips Redis, stat and TTL locks when the target's
-effective policy is disabled. A reader uses `config.writer=false`: Events
-filtering and expiry display are available, but it never scans or recycles.
+effective policy is disabled. UserConfig is read once on a cache miss or refresh,
+not once per file. A reader uses `config.writer=false`: expiry display is
+available, but it never scans or recycles. TTL is soft: searches and reads keep
+returning expired content until physical deletion. Historical Event writes are
+allowed; they do not renew the date directory's lifetime.
 
 The existing write path buffers successful writes and flushes them asynchronously
 in batches. Session directory scores use the write time (`ZADD GT`); Event date
@@ -49,9 +52,22 @@ directories use the directory date (`ZADD NX`). Deletion rechecks current policy
 and Session `messages.jsonl` ModTime under the existing directory lock. Redis
 index removal compares the original score to preserve a concurrent renewal.
 
-Policy lookup selects the URI's canonical Session, User Events or Peer Events
-root directly. At each node, Account overrides Cluster; precedence remains
-root > type > global > disabled. No separate policy cache is needed.
+User TTL lives in `settings/user_config.json` and uses the existing
+`GET/PATCH /api/v1/admin/accounts/{account_id}/users/{user_id}/settings` API:
+
+```json
+{"ttl": {"sessions": 30, "user_events": 60, "peer_events": 60,
+         "peers": {"assistant-a": 7, "assistant-b": "disabled"}}}
+```
+
+For each field, User overrides Account, which overrides global configuration.
+An explicit Peer overrides `peer_events`; type defaults precede `global`.
+Missing fields inherit, `disabled` stops fallback, and PATCH `null` removes an
+override. `roots` is no longer part of the cluster/Account configuration schema.
+The existing UserConfig update lock, validation, backup and deletion apply.
+TTL caches at most 1024 user snapshots, keyed by Account and User. A local save
+publishes immediately; other processes refresh on demand after 30 seconds.
+Concurrent misses share one load. This cache adds no periodic filesystem scan.
 
 The hidden ROOT-authenticated `/api/v1/admin/ttl/initial` endpoint registers or
 resets a fixed `initial` scan. Redis keeps its pending marker, checkpoint and done

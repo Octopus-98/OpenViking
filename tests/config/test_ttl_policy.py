@@ -1,12 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Unit tests for effective TTL policy resolution.
-
-TTL is default-off. These tests pin the two-stage
-resolution contract from the technical design: per-node account-over-cluster
-merge, then specific-root > type-default > ``global`` > default-off, with
-``disabled`` stopping the fallback.
-"""
+"""TTL policy precedence, explicit disabling and independent Peer overrides."""
 
 from __future__ import annotations
 
@@ -20,7 +14,7 @@ from openviking.config.ttl import (
     classify_ttl_uri,
     resolve_effective_ttl,
 )
-from openviking_cli.utils.config.ttl_config import TTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig, UserTTLConfig
 
 USER_EVENTS_DIR = "viking://user/u1/memories/events/2026/10/01"
 USER_EVENTS_ROOT = "viking://user/u1/memories/events"
@@ -91,23 +85,6 @@ def test_type_default_beats_global():
     assert result.days == 30
 
 
-def test_specific_root_beats_type_default():
-    cluster = _cfg(sessions=30, roots={"viking://user/u1/sessions": 7})
-    result = resolve_effective_ttl(cluster, None, SESSION_DIR)
-    assert result.days == 7
-
-
-def test_specific_root_prefix_matches_descendant():
-    cluster = _cfg(sessions=30, roots={"viking://user/u1/sessions": 7})
-    result = resolve_effective_ttl(cluster, None, SESSION_DIR)
-    assert result.days == 7
-
-
-def test_reject_session_level_override():
-    with pytest.raises(ValueError):
-        _cfg(roots={SESSION_DIR: 3})
-
-
 def test_peer_events_type_default():
     cluster = _cfg(peer_events=14, user_events=60)
     result = resolve_effective_ttl(cluster, None, PEER_EVENTS_DIR)
@@ -129,12 +106,6 @@ def test_disabled_type_stops_fallback_to_global():
     result = resolve_effective_ttl(cluster, None, SESSION_DIR)
     assert result.enabled is False
     assert result.index_type is TTLIndexType.SESSIONS
-
-
-def test_disabled_root_stops_fallback():
-    cluster = _cfg(global_=45, sessions=30, roots={"viking://user/u1/sessions": "disabled"})
-    result = resolve_effective_ttl(cluster, None, SESSION_DIR)
-    assert result.enabled is False
 
 
 # -- per-node account-over-cluster merge -----------------------------------
@@ -163,27 +134,11 @@ def test_account_global_overrides_cluster_global_only():
     assert result.days == 90
 
 
-def test_account_root_overrides_cluster_root_same_uri():
-    cluster = _cfg(roots={"viking://user/u1/sessions": 7})
-    account = _cfg(roots={"viking://user/u1/sessions": 2})
-    result = resolve_effective_ttl(cluster, account, SESSION_DIR)
-    assert result.days == 2
-
-
 def test_account_disable_overrides_cluster_enabled_type():
     cluster = _cfg(sessions=30)
     account = _cfg(sessions="disabled")
     result = resolve_effective_ttl(cluster, account, SESSION_DIR)
     assert result.enabled is False
-
-
-def test_specific_root_still_wins_after_account_merge():
-    # Account raises the type default, but a specific cluster root stays most
-    # specific and keeps priority.
-    cluster = _cfg(sessions=30, roots={"viking://user/u1/sessions": 7})
-    account = _cfg(sessions=90)
-    result = resolve_effective_ttl(cluster, account, SESSION_DIR)
-    assert result.days == 7
 
 
 @pytest.mark.parametrize(
@@ -194,69 +149,47 @@ def test_specific_root_still_wins_after_account_merge():
         (TTLIndexType.PEER_EVENTS, "viking://user/u1/peers/p1/memories/events"),
     ],
 )
-def test_policy_precedence_matrix(kind, root):
-    # All 729 combinations of inherit/disabled/days across six policy nodes.
-    nodes = [(None, "disabled", days) for days in (31, 37, 19, 23, 7, 11)]
-    for cg, ag, ct, at, cr, ar in product(*nodes):
-        cluster = _cfg(global_=cg, **{kind.value: ct}, roots={root: cr} if cr else None)
-        account = _cfg(global_=ag, **{kind.value: at}, roots={root: ar} if ar else None)
-        value = next((v for v in (ar, cr, at, ct, ag, cg) if v is not None), "disabled")
+def test_user_account_global_precedence(kind, root):
+    for cg, ag, ug, ct, at, ut in product((None, "disabled", 7), repeat=6):
+        cluster = TTLConfig(global_=cg, **{kind.value: ct})
+        account = TTLConfig(global_=ag, **{kind.value: at})
+        user = UserTTLConfig(global_=ug, **{kind.value: ut})
+        value = next((v for v in (ut, at, ct, ug, ag, cg) if v is not None), "disabled")
         expected = (
             EffectiveTTL.off(kind) if value == "disabled" else EffectiveTTL(kind, True, value)
         )
         for uri in (root, root + "/child/nested"):
-            assert resolve_effective_ttl(cluster, account, uri) == expected, (
-                uri,
-                cg,
-                ag,
-                ct,
-                at,
-                cr,
-                ar,
-            )
+            assert resolve_effective_ttl(cluster, account, uri, user) == expected
+
+
+def test_peer_override_is_independent_and_constant_lookup():
+    from unittest.mock import Mock
+
+    config = UserTTLConfig(peer_events=30, peers={"p1": 7, "p2": "disabled"})
+    mapping = Mock(wraps=config.peers)
+    mapping.items.side_effect = AssertionError("lookup traversed unrelated Peers")
+    config.peers = mapping
+    for peer, expected in (("p1", 7), ("p2", None), ("p10", 30)):
+        assert (
+            resolve_effective_ttl(
+                None, None, f"viking://user/u1/peers/{peer}/memories/events", config
+            ).days
+            == expected
+        )
+    assert mapping.get.call_count == 3
 
 
 @pytest.mark.parametrize(
-    "uri,expected_days",
+    "payload",
     [
-        ("viking://user/u1/sessions/", 7),
-        ("viking://user/u1/sessions/s1/messages.jsonl?offset=1", 7),
-        ("viking://user//u1/sessions//s1/messages.jsonl", 7),
-        ("viking://user/u10/sessions/s1", 30),
-        ("viking://user/u1/memories/events/2026/10/01/event.md", 11),
-        ("viking://user/u10/memories/events/2026/10/01/event.md", 30),
-        ("viking://user/u1/peers/p1/memories/events/2026/10/01/event.md", 13),
-        ("viking://user/u1/peers/p10/memories/events/2026/10/01/event.md", 30),
-        ("viking://user/u1/sessions_old/s1", None),
-        ("viking://user/u1/memories/events_old/event.md", None),
+        {"roots": {USER_EVENTS_ROOT: 7}},
+        {"sessions": True},
+        {"sessions": 0},
+        {"sessions": 365001},
+        {"peers": {"../other": 7}},
+        {"peers": {"p1": False}},
     ],
 )
-def test_root_lookup_preserves_uri_boundaries(uri, expected_days):
-    config = _cfg(
-        global_=30,
-        roots={
-            "viking://user/u1/sessions": 7,
-            USER_EVENTS_ROOT: 11,
-            "viking://user/u1/peers/p1/memories/events": 13,
-        },
-    )
-    assert resolve_effective_ttl(config, None, uri).days == expected_days
-
-
-@pytest.mark.parametrize("root_count", [0, 100, 10000])
-def test_root_lookup_does_not_walk_unrelated_roots(root_count):
-    from unittest.mock import Mock
-
-    root = "viking://user/u1/sessions"
-    roots = {f"viking://user/other{i}/sessions": "disabled" for i in range(root_count)}
-    cluster = _cfg(roots={**roots, root: 7})
-    account = _cfg(roots=roots)
-    # Keep config validation real, then forbid traversal on the published mappings.
-    for config in (cluster, account):
-        mapping = Mock(wraps=config.roots)
-        mapping.items.side_effect = AssertionError("policy lookup traversed roots")
-        mapping.keys.side_effect = AssertionError("policy lookup copied roots")
-        config.roots = mapping
-    assert resolve_effective_ttl(cluster, account, SESSION_DIR).days == 7
-    account.roots.get.assert_called_once_with(root)
-    cluster.roots.get.assert_called_once_with(root)
+def test_reject_invalid_user_ttl(payload):
+    with pytest.raises(ValueError):
+        UserTTLConfig.model_validate(payload)

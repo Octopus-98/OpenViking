@@ -30,7 +30,6 @@ from openviking.server.user_config import (
     validate_add_targets,
     validate_user_memory_policy,
     write_user_config,
-    write_user_memory_policy,
 )
 from openviking.service.legacy_migration import LegacyDataMigration
 from openviking.service.task_store import (
@@ -197,7 +196,8 @@ def _visible_account_config(
 
 
 class UserSettingsPatch(BaseModel):
-    memory_policy: Optional[dict]
+    memory_policy: Optional[dict] = None
+    ttl: Optional[dict] = None
 
     model_config = {"extra": "forbid"}
 
@@ -323,7 +323,10 @@ def _has_add_targets(user_config: UserConfig | None) -> bool:
 
 
 def _has_initial_user_config(user_config: UserConfig | None) -> bool:
-    return bool(_has_add_targets(user_config) or (user_config and user_config.memory_policy))
+    return bool(
+        _has_add_targets(user_config)
+        or (user_config and (user_config.memory_policy or user_config.ttl is not None))
+    )
 
 
 async def _validate_initial_user_config(
@@ -342,6 +345,8 @@ async def _validate_initial_user_config(
             viking_fs=service.viking_fs,
         )
     if user_config is not None:
+        if user_config.ttl is not None:
+            _reject_unsupported_ttl_config({"ttl": {}})
         validate_user_memory_policy(user_config.memory_policy)
 
 
@@ -445,6 +450,9 @@ def _user_settings_result(
         "account_id": account_id,
         "user_id": user_id,
         "memory_policy": memory_policy,
+        "ttl": user_config.ttl.model_dump(by_alias=True, exclude_none=True)
+        if user_config.ttl is not None
+        else None,
     }
 
 
@@ -693,22 +701,31 @@ async def get_account_configuration(
     """Return this account layer's explicit runtime configuration."""
     _check_account_access(ctx, account_id)
     await _check_account_exists(request, account_id)
-    settings = await _get_runtime_config_manager().get_settings(ConfigScope.account(account_id))
+    settings = await _get_runtime_config_manager().get_settings(
+        ConfigScope.account(account_id)
+    )
     result = {
         "account_id": account_id,
         "settings": _visible_account_config(ctx, settings),
     }
     if path is not None:
-        from openviking.config.ttl import resolve_effective_ttl
-        from openviking_cli.utils.config.ttl_config import TTLConfig
+        from openviking.config.ttl import resolve_effective_ttl, validate_ttl_root
+        from openviking.core.namespace import uri_parts
 
-        _reject_unsupported_ttl_config({"ttl": {}})
         try:
-            TTLConfig(roots={path: "disabled"})
+            validate_ttl_root(path)
         except ValueError as exc:
             raise InvalidArgumentError(str(exc)) from exc
+        user_ctx = RequestContext(
+            user=UserIdentifier(account_id, uri_parts(path)[1]), role=Role.USER
+        )
+        config = await read_user_config(get_service().viking_fs, user_ctx)
         policy = await _get_runtime_config_manager().resolve_account(
-            account_id, lambda view: resolve_effective_ttl(view.cluster.ttl, view.account.ttl, path)
+            account_id,
+            lambda v: resolve_effective_ttl(v.cluster.ttl, v.account.ttl, path, config.ttl),
+        )
+        result["user_ttl"] = (
+            config.ttl.model_dump(by_alias=True, exclude_none=True) if config.ttl else None
         )
         result["path"] = path
         result["effective_policy"] = policy.days if policy.enabled else "disabled"
@@ -847,9 +864,7 @@ async def patch_account_configuration(
             await _get_runtime_config_manager().patch_account(account_id, body.settings)
     except (ConfigPatchError, ValueError) as exc:
         raise InvalidArgumentError(str(exc)) from exc
-    settings = await _get_runtime_config_manager().get_settings(
-        ConfigScope.account(account_id)
-    )
+    settings = await _get_runtime_config_manager().get_settings(ConfigScope.account(account_id))
     return Response(
         status="ok",
         result={
@@ -1163,7 +1178,7 @@ async def patch_user_settings(
     user_id: str = Path(..., description="User ID"),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    """Update or clear the allowlisted User memory policy without restarting."""
+    """Patch the allowlisted User memory and TTL policies without restarting."""
     _check_account_access(ctx, account_id)
     manager = await _check_account_exists(request, account_id)
     await _check_user_exists(request, account_id, user_id, manager)
@@ -1174,8 +1189,11 @@ async def patch_user_settings(
         user=UserIdentifier(account_id, user_id),
         role=Role.USER,
     )
-    await write_user_memory_policy(service.viking_fs, user_ctx, body.memory_policy)
-    user_config = await read_user_config(service.viking_fs, user_ctx)
+    from openviking.server.user_config import patch_user_config
+
+    patch = body.model_dump(exclude_unset=True)
+    _reject_unsupported_ttl_config(patch)
+    user_config = await patch_user_config(service.viking_fs, user_ctx, patch)
     return Response(
         status="ok",
         result=_user_settings_result(

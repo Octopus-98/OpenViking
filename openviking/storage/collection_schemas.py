@@ -682,6 +682,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 queue_wait_ms = max((time.time() - embedding_msg.queue_enqueued_at) * 1000.0, 0.0)
             inserted_data = dict(embedding_msg.context_data)
             write_source = inserted_data.pop("_write_source", "")
+            write_lease = inserted_data.pop("_write_lease", None)
             logger.debug(
                 "Processing embedding message: %s action=%s",
                 self._embedding_delivery_log_context(embedding_msg),
@@ -936,7 +937,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                                     )
                                 )
                                 await guards.enter_async_context(
-                                    adapter.write_guard(uri, ctx, require_exists=True)
+                                    adapter.write_guard(
+                                        uri,
+                                        ctx,
+                                        lease_ref=write_lease,
+                                        require_exists=True,
+                                        recover_owner=True,
+                                    )
                                 )
                             result = await self._vikingdb.upsert(
                                 inserted_data, ctx=ctx, options=upsert_options

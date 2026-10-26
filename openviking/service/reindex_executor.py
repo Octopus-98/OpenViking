@@ -1001,6 +1001,9 @@ class ReindexExecutor:
         run: _ReindexRunContext,
         recursive: bool = True,
     ) -> None:
+        from openviking.ttl.wiring import get_ttl_adapter
+
+        write_options = {"write_lease": run.lease} if get_ttl_adapter() is not None else {}
         counters = run.counters
         ctx = run.ctx
         if mode == "semantic_and_vectors":
@@ -1015,7 +1018,7 @@ class ReindexExecutor:
                 if not recursive:
                     semantic_kwargs["recursive"] = False
                 await self._run_semantic_processor(**semantic_kwargs)
-            vector_kwargs = {"uri": uri, "counters": counters, "ctx": ctx}
+            vector_kwargs = {"uri": uri, "counters": counters, "ctx": ctx, **write_options}
             if not recursive:
                 vector_kwargs["recursive"] = False
             await self._reindex_memory_vectors(
@@ -1032,6 +1035,7 @@ class ReindexExecutor:
                     "counters": counters,
                     "ctx": ctx,
                     "recursive": recursive,
+                    **write_options,
                 },
                 run.ingest_options,
             )
@@ -1349,6 +1353,7 @@ class ReindexExecutor:
         ctx: RequestContext,
         recursive: bool = True,
         ingest_options: IngestOptions | None = None,
+        write_lease: dict | None = None,
     ) -> None:
         viking_fs = get_viking_fs()
         if await viking_fs.exists(uri, ctx=ctx):
@@ -1368,6 +1373,7 @@ class ReindexExecutor:
                     **self._with_ingest_options(
                         {
                             "directory_uris": sorted(directory_uris),
+                            "write_lease": write_lease,
                             "counters": counters,
                             "ctx": ctx,
                         },
@@ -1419,6 +1425,7 @@ class ReindexExecutor:
                         level=ContextLevel.DETAIL,
                         ctx=ctx,
                         ingest_options=ingest_options,
+                        write_lease=write_lease,
                     )
                     file_counters.rebuilt_records += 1
                 except Exception as exc:
@@ -1437,6 +1444,7 @@ class ReindexExecutor:
                     level=ContextLevel.DETAIL,
                     ctx=ctx,
                     ingest_options=ingest_options,
+                    write_lease=write_lease,
                 )
                 file_counters.rebuilt_records += 1
                 file_counters.warnings.append(
@@ -1469,6 +1477,7 @@ class ReindexExecutor:
         counters: _ReindexCounters,
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
+        write_lease: dict | None = None,
     ) -> None:
         for directory_uri in directory_uris:
             counters.scanned_records += 1
@@ -1492,6 +1501,7 @@ class ReindexExecutor:
                         level=ContextLevel.ABSTRACT,
                         ctx=ctx,
                         ingest_options=ingest_options,
+                        write_lease=write_lease,
                     )
                     counters.rebuilt_records += 1
                 except Exception as exc:
@@ -1512,6 +1522,7 @@ class ReindexExecutor:
                         level=ContextLevel.OVERVIEW,
                         ctx=ctx,
                         ingest_options=ingest_options,
+                        write_lease=write_lease,
                     )
                     counters.rebuilt_records += 1
                 except Exception as exc:
@@ -1607,6 +1618,7 @@ class ReindexExecutor:
         meta: Optional[dict[str, Any]] = None,
         ingest_options: IngestOptions | None = None,
         md5: str | None = None,
+        write_lease: dict | None = None,
     ) -> None:
         service = get_service()
         assert service.vikingdb_manager is not None
@@ -1635,6 +1647,8 @@ class ReindexExecutor:
                 code="FAILED_PRECONDITION",
                 details={"uri": uri},
             )
+        if write_lease is not None:
+            msg.context_data["_write_lease"] = write_lease
         enqueue_error = f"Failed to enqueue reindex vector for {uri}"
         enqueued = await service.vikingdb_manager.enqueue_embedding_msg(msg)
         if not enqueued:

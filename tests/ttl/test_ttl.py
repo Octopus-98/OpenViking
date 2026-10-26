@@ -10,7 +10,7 @@ import pytest_asyncio
 
 from openviking.ttl.adapter import TTLBackfillRequest, TTLRecycleRequest
 from openviking.ttl.runtime import DirectoryTTL, next_check_ms
-from openviking_cli.utils.config.ttl_config import TTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig, UserTTLConfig
 
 
 @pytest.fixture
@@ -168,9 +168,10 @@ async def test_expiry_restart_resumes_checkpoint_without_full_scan(
 async def test_initial_discovers_roots_then_resumes_without_listing(engine, peer_days):
     e = engine
     explicit = "viking://user/other/peers/special/memories/events"
-    e.pair = (TTLConfig(sessions=7, peer_events=peer_days, roots={explicit: 7}), None)
+    e.pair = (TTLConfig(sessions=7, peer_events=peer_days), None)
+    e._cache_user_policy(("a", "other"), UserTTLConfig(peers={"special": 7}))
     tree = {
-        "viking://user": ["viking://user/u"],
+        "viking://user": ["viking://user/u", "viking://user/other"],
         "viking://user/u/peers": ["viking://user/u/peers/p"],
     }
     e.fs.ls.side_effect = lambda uri, **kw: [{"uri": u, "isDir": True} for u in tree.get(uri, [])]
@@ -179,7 +180,7 @@ async def test_initial_discovers_roots_then_resumes_without_listing(engine, peer
     roots = json.loads(state["roots"])
     assert explicit in roots and "viking://user/u/sessions" in roots
     assert ("viking://user/u/peers/p/memories/events" in roots) == (peer_days == 7)
-    assert e.fs.ls.await_count == (2 if peer_days == 7 else 1)
+    assert e.fs.ls.await_count == (3 if peer_days == 7 else 1)
     assert all(call.kwargs["node_limit"] is None for call in e.fs.ls.call_args_list)
     e.fs.ls.reset_mock()
     await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
@@ -243,21 +244,15 @@ async def test_write_scores_retry_and_expiry(engine):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("root_count", [0, 1000])
-async def test_disabled_account_no_io(engine, root_count):
+async def test_disabled_account_cached_policy_no_business_io(engine):
     e = engine
-    roots = {f"viking://user/u{i}/sessions": 7 for i in range(root_count)}
-    e.pair = (
-        TTLConfig(sessions=7, roots=roots),
-        TTLConfig(sessions="disabled", roots=dict.fromkeys(roots, "disabled")),
-    )
-    e.client = AsyncMock(side_effect=AssertionError("off path touched Redis"))
-    e._dispatcher.run = AsyncMock(side_effect=AssertionError("off path dispatched TTL work"))
+    e.pair = (TTLConfig(sessions=7), TTLConfig(sessions="disabled"))
+    e._cache_user_policy(("a", "u"), None)
+    e.client = AsyncMock(side_effect=AssertionError("off write path touched Redis"))
+    e._dispatcher.run = AsyncMock(side_effect=AssertionError("cached off path dispatched work"))
     uri = "viking://user/u/sessions/s"
     await e.on_post_write(uri + "/messages.jsonl", e.context("a"), 1)
     assert await e.resolve_expires_at([uri], e.context("a")) == {uri: None}
-    assert not e.enabled(e.pair)
-    await e.recycle_due(TTLRecycleRequest("r", "a", 999))
     async with e.write_guard(uri + "/messages.jsonl", e.context("a")):
         pass
     e.client.assert_not_called()
@@ -732,7 +727,7 @@ async def test_initial_event_parent_listed_once(engine, root):
     from collections import Counter
 
     e = engine
-    e.pair = (TTLConfig(roots={root: 7}), None)
+    e.pair = (TTLConfig(user_events=7, peer_events=7), None)
     tree = {root: [root + "/2020"]}
     year = root + "/2020"
     tree[year] = [year + f"/{m:02d}" for m in range(1, 13)]
@@ -745,3 +740,72 @@ async def test_initial_event_parent_listed_once(engine, root):
     kind = "peer_events" if "/peers/" in root else "user_events"
     assert await e.redis.zcard(e.prefix("a") + kind) == 12
     assert await e.redis.get(e.prefix("a") + "backfill:initial:done") == "1"
+
+
+@pytest.mark.asyncio
+async def test_user_policy_cache_coalesces_refresh_and_preserves_new_save(engine, monkeypatch):
+    from openviking.server.config import UserConfig
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    e = engine
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def read(*args):
+        entered.set()
+        await release.wait()
+        return UserConfig(ttl=UserTTLConfig(sessions=1))
+
+    reader = AsyncMock(side_effect=read)
+    monkeypatch.setattr("openviking.server.user_config.read_user_config", reader)
+    reads = [asyncio.create_task(e.user_policy("a", "u")) for _ in range(8)]
+    await entered.wait()
+    await e.publish_user_configuration(
+        RequestContext(user=UserIdentifier("a", "u"), role=Role.ROOT),
+        UserTTLConfig(sessions=7),
+    )
+    release.set()
+    assert all(c.sessions == 7 for c in await asyncio.gather(*reads))
+    reader.assert_awaited_once()
+    for _ in range(100):
+        assert (await e.user_policy("a", "u")).sessions == 7
+    reader.assert_awaited_once()
+    e._user_policies[("a", "u")] = (0, UserTTLConfig(sessions=7))
+    assert (await e.user_policy("a", "u")).sessions == 1
+    assert reader.await_count == 2
+    assert (await e.user_policy("b", "u")).sessions == 1
+    assert reader.await_count == 3  # Account is part of the cache key.
+
+
+@pytest.mark.asyncio
+async def test_user_only_ttl_reset_and_restart_reuse_saved_roots(engine, scheduler):
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    e = engine
+    e.pair = (None, None)
+    ctx = RequestContext(user=UserIdentifier("a", "u"), role=Role.ROOT)
+    config = UserTTLConfig(sessions=7, peers={"one": 2, "two": "disabled"})
+    await e.prepare_user_configuration(ctx, None, config)
+    state = await e.read_initial("a")
+    assert state["reset_required"] and scheduler.report.await_count == 1
+    e._cache_user_policy(("a", "u"), config)
+    e.fs.ls.return_value = [{"uri": "viking://user/u", "isDir": True}]
+    await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
+    state = await e.read_initial("a")
+    assert json.loads(state["roots"]) == [
+        "viking://user/u/peers/one/memories/events",
+        "viking://user/u/sessions",
+    ]
+    await e.redis.set(e.prefix("a") + "backfill:initial:done", "1")
+    e._user_policies.clear()
+    e._recovered.clear()
+    e.fs.ls.reset_mock()
+    e.fs.read_file = AsyncMock(
+        return_value=json.dumps({"ttl": config.model_dump(exclude_none=True)})
+    )
+    await e.register_initial_backfill(TTLBackfillRequest("r", "a"))
+    e.fs.ls.assert_not_called()
+    e.fs.stat.assert_not_called()
+    e.fs.read_file.assert_awaited_once()
+    assert e.fs.read_file.call_args.args[0].endswith("/u/settings/user_config.json")

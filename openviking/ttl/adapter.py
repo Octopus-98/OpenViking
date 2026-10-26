@@ -78,7 +78,13 @@ class TTLAdapter(Protocol):
         """Register maintenance on the existing Redis scheduler before roles start."""
 
     def write_guard(
-        self, uri: str, ctx: Any, lease_ref: Any = None, *, require_exists: bool = False
+        self,
+        uri: str,
+        ctx: Any,
+        lease_ref: Any = None,
+        *,
+        require_exists: bool = False,
+        recover_owner: bool = False,
     ) -> AsyncContextManager:
         """Protect the final file/vector commit with the existing path lock."""
 
@@ -90,9 +96,6 @@ class TTLAdapter(Protocol):
     async def requires_existing_session(self, uri: str, ctx: Any) -> bool:
         """Whether an append must reject a missing live-message file."""
 
-    async def event_filter(self, ctx: Any) -> Any:
-        """Optional predicate composed before vector ranking and limits."""
-
     def supports_config(self) -> bool:
         """Return True when explicit TTL configuration writes are allowed.
 
@@ -102,6 +105,12 @@ class TTLAdapter(Protocol):
 
     async def patch_configuration(self, settings: dict, account_id: Optional[str] = None) -> None:
         """Persist reset intent before publishing a TTL configuration change."""
+
+    async def prepare_user_configuration(self, ctx: Any, before: Any, after: Any) -> None:
+        """Confirm durable reset intent before a UserConfig TTL save."""
+
+    async def publish_user_configuration(self, ctx: Any, config: Any) -> None:
+        """Refresh the user's in-process policy after a confirmed save."""
 
     async def read_initial(self, account_id: str) -> dict:
         """Read the fixed initial state for internal diagnostics."""

@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Merge policy sources per node, then select root > type > global > disabled.
+"""Resolve TTL per field: User > Account > global, then fall back to global TTL.
 
-Cluster already includes the startup/runtime merge. Account.global only replaces
-Cluster.global; it never overrides a more specific Cluster type or root policy.
+A concrete Peer override precedes peer_events. Unset fields inherit; disabled
+stops fallback. Configuration sources are already loaded, so resolution has no I/O.
 """
 
 from dataclasses import dataclass
@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Optional
 
 from openviking.core.namespace import uri_parts
-from openviking_cli.utils.config.ttl_config import TTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig, UserTTLConfig
 
 
 class TTLIndexType(str, Enum):
@@ -59,28 +59,44 @@ def classify_ttl_uri(uri: str) -> Optional[TTLIndexType]:
 
 
 def resolve_effective_ttl(
-    cluster_ttl: Optional[TTLConfig], account_ttl: Optional[TTLConfig], uri: str
+    cluster_ttl: Optional[TTLConfig],
+    account_ttl: Optional[TTLConfig],
+    uri: str,
+    user_ttl: Optional[UserTTLConfig] = None,
 ) -> EffectiveTTL:
     """Resolve one URI using the already-loaded configuration pair; no I/O."""
     kind = classify_ttl_uri(uri)
     if kind is None:
         return EffectiveTTL.off(None)
-    # TTLConfig permits only these fixed roots, so no longest-prefix scan is needed.
-    root = "viking://" + "/".join(uri_parts(uri)[: _ROOT_DEPTH[kind]])
-    for config in (account_ttl, cluster_ttl):
-        root_policy = config.roots.get(root) if config is not None and config.roots else None
-        if root_policy is not None:
-            return (
-                EffectiveTTL.off(kind)
-                if root_policy == "disabled"
-                else EffectiveTTL(kind, True, root_policy)
-            )
-    for node in (kind.value, "global_"):
-        value = getattr(account_ttl, node, None)
-        if value is None:
-            value = getattr(cluster_ttl, node, None)
+    if kind == TTLIndexType.PEER_EVENTS and user_ttl is not None:
+        value = (user_ttl.peers or {}).get(uri_parts(uri)[3])
         if value is not None:
             return (
                 EffectiveTTL.off(kind) if value == "disabled" else EffectiveTTL(kind, True, value)
             )
+    for node in (kind.value, "global_"):
+        for config in (user_ttl, account_ttl, cluster_ttl):
+            value = getattr(config, node, None)
+            if value is not None:
+                return (
+                    EffectiveTTL.off(kind)
+                    if value == "disabled"
+                    else EffectiveTTL(kind, True, value)
+                )
     return EffectiveTTL.off(kind)
+
+
+def validate_ttl_root(uri: str) -> None:
+    """Validate a management/backfill target, not a configuration map."""
+    from openviking.core.identifiers import validate_identifier_part
+
+    kind = classify_ttl_uri(uri)
+    parts = uri_parts(uri)
+    if (
+        kind is None
+        or len(parts) != _ROOT_DEPTH[kind]
+        or uri != "viking://" + "/".join(parts)
+        or validate_identifier_part(parts[1], "user_id")
+        or (kind == TTLIndexType.PEER_EVENTS and validate_identifier_part(parts[3], "peer_id"))
+    ):
+        raise ValueError("TTL target must be a canonical Events or Sessions root")

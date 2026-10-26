@@ -345,28 +345,16 @@ async def test_commit_writes_and_stale_file_vector_delivery(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not os.environ.get("TTL_TEST_REDIS"), reason="requires native vector engine")
-async def test_event_filter_real_vector_ranking(tmp_path):
-    from datetime import datetime, timedelta, timezone
+async def test_directory_delete_removes_only_matching_vectors(tmp_path):
+    from datetime import datetime, timezone
 
     from openviking.storage.vectordb.collection.local_collection import (
         get_or_create_local_collection,
     )
-    from openviking.storage.vectordb_adapters.local_adapter import (
-        LocalCollectionAdapter,
-    )
+    from openviking.storage.vectordb_adapters.local_adapter import LocalCollectionAdapter
 
-    e = DirectoryTTL(resource_id="filter-test")
-
-    async def policies(_):
-        return TTLConfig(
-            user_events=7,
-            peer_events=7,
-            roots={"viking://user/u/peers/long/memories/events": 30},
-        ), None
-
-    e.policies = policies
+    e = DirectoryTTL(resource_id="delete-vectors-test")
     now = datetime.now(timezone.utc)
-    stale = (now - timedelta(days=10)).isoformat()
     fresh = now.isoformat()
     meta = {
         "CollectionName": "ttl",
@@ -380,40 +368,6 @@ async def test_event_filter_real_vector_ranking(tmp_path):
         ],
     }
     collection = get_or_create_local_collection(meta_data=meta, path=str(tmp_path))
-    collection.upsert_data(
-        [
-            {
-                "id": 1,
-                "uri": "/user/u/memories/events/2020/01/01/e.md",
-                "created_at": stale,
-                "vector": [1.0, 0.0, 0.0, 0.0],
-            },
-            {
-                "id": 2,
-                "uri": "/user/u/memories/events/2026/10/20/e.md",
-                "created_at": fresh,
-                "vector": [0.9, 0.1, 0.0, 0.0],
-            },
-            {
-                "id": 3,
-                "uri": "/user/u/peers/p/memories/events/2020/01/01/e.md",
-                "created_at": stale,
-                "vector": [1.0, 0.0, 0.0, 0.0],
-            },
-            {
-                "id": 4,
-                "uri": "/user/u/peers/long/memories/events/2020/01/01/e.md",
-                "created_at": stale,
-                "vector": [0.8, 0.2, 0.0, 0.0],
-            },
-            {
-                "id": 5,
-                "uri": "/resources/a.md",
-                "created_at": stale,
-                "vector": [0.7, 0.3, 0.0, 0.0],
-            },
-        ]
-    )
     collection.create_index(
         "ttl",
         {
@@ -424,19 +378,6 @@ async def test_event_filter_real_vector_ranking(tmp_path):
     )
     adapter = LocalCollectionAdapter("ttl", str(tmp_path), "ttl")
     adapter._collection = collection
-    query_filter = adapter._compile_filter(await e.event_filter(e.context("a")))
-    result = collection.search_by_vector(
-        "ttl", dense_vector=[1.0, 0.0, 0.0, 0.0], limit=1, filters=query_filter
-    )
-    assert [row.id for row in result.data] == [2]  # Highest stale result is excluded before limit.
-    result = collection.search_by_vector(
-        "ttl", dense_vector=[1.0, 0.0, 0.0, 0.0], limit=10, filters=query_filter
-    )
-    assert {row.id for row in result.data} == {
-        2,
-        4,
-        5,
-    }  # No memory_type labels are present.
     # Missing AGFS directories still remove every descendant vector, while
     # preserving another account and sibling URIs in the same collection.
     from unittest.mock import AsyncMock
@@ -875,3 +816,121 @@ async def test_disabled_ttl_reuses_existing_acl_configuration(
         reads.append(sum(call.args[0] == config_path for call in read.await_args_list))
     assert reads == [1, 1]  # ACL already loads the cold setting; TTL adds no read.
     engine.client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("as_directory", [False, True])
+async def test_reindex_vector_queue_reuses_native_owner(
+    tmp_path, monkeypatch, enabled, as_directory
+):
+    """Embedding runs on the real queue thread while reindex still owns its lease."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
+    from openviking.service import reindex_executor as reindex_module
+    from openviking.storage.collection_schemas import TextEmbeddingHandler
+    from openviking.storage.queuefs.process_result import ProcessOutcome
+    from openviking.storage.queuefs.queue_manager import QueueManager
+    from openviking.ttl import wiring
+
+    agfs = create_agfs_client(
+        RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="local"))
+    )
+    fs = VikingFS(agfs=agfs)
+    engine = DirectoryTTL(resource_id="reindex-lock")
+    pair = (TTLConfig(user_events=7), None)
+    engine.bind_runtime(
+        SimpleNamespace(
+            viking_fs=fs,
+            runtime_config_manager=SimpleNamespace(resolve_account=AsyncMock(return_value=pair)),
+        ),
+        None,
+    )
+    ctx = engine.context("a")
+    uri = "viking://user/u/memories/events/2020/01/01/event.md"
+    await fs.write_file(uri, "Historical event", ctx=ctx)
+    if enabled:
+        install_ttl_hook(fs, engine)
+    monkeypatch.setattr(wiring, "_adapter", engine if enabled else None)
+    results, loops, messages = [], [], []
+
+    class Embedder(DenseEmbedderBase):
+        def __init__(self):
+            super().__init__(model_name="ttl-test")
+
+        def embed(self, text, is_query=False):
+            return EmbedResult(dense_vector=[1.0, 0.0, 0.0, 0.0])
+
+        def get_dimension(self):
+            return 4
+
+    db = SimpleNamespace(
+        has_queue_manager=True,
+        is_closing=False,
+        account_uses_content_field=AsyncMock(return_value=False),
+        get_strict=AsyncMock(return_value=[]),
+        upsert=AsyncMock(return_value="vector"),
+    )
+
+    class Handler(TextEmbeddingHandler):
+        async def on_dequeue(self, data):
+            loops.append(asyncio.get_running_loop())
+            result = await super().on_dequeue(data)
+            results.append(result)
+            return result
+
+    queues = QueueManager(agfs)
+    queues._REQUEUE_POLL_INTERVAL = 0.01
+    queue = queues.get_queue(
+        queues.EMBEDDING,
+        dequeue_handler=Handler(db, SimpleNamespace(bind=lambda _: Embedder())),
+        allow_create=True,
+    )
+
+    async def enqueue(msg):
+        messages.append(msg)
+        n = len(results)
+        await queue.enqueue(msg)
+        async with asyncio.timeout(5):
+            while len(results) == n:
+                await asyncio.sleep(0.01)
+        return True
+
+    db.enqueue_embedding_msg = enqueue
+    service = SimpleNamespace(viking_fs=fs, vikingdb_manager=db)
+    monkeypatch.setattr(reindex_module, "get_service", lambda: service)
+    monkeypatch.setattr(reindex_module, "get_viking_fs", lambda: fs)
+    executor = reindex_module.ReindexExecutor()
+    executor._fetch_existing_record = AsyncMock(return_value=None)
+    executor._best_file_summary = AsyncMock(return_value="event")
+    queues.start()
+    try:
+        outcome = await executor._run(
+            uri=uri.rsplit("/", 1)[0] if as_directory else uri,
+            object_type="memory",
+            mode="vectors_only",
+            ctx=ctx,
+        )
+        assert results and all(r.outcome is ProcessOutcome.SUCCESS for r in results), outcome[
+            "warnings"
+        ]
+        assert loops[0] is not asyncio.get_running_loop()
+        assert db.upsert.await_count == len(results)
+        assert "_write_lease" not in db.upsert.call_args.args[0]
+        if enabled:
+            # Replayed after the reindex lease is released: take fresh native
+            # locks and still require the source to exist before vector writes.
+            await enqueue(messages[0])
+            assert results[-1].outcome is ProcessOutcome.SUCCESS
+            await fs.write_file(uri, "Historical Event writes remain allowed", ctx=ctx)
+            assert ("a", "user_events", uri.rsplit("/", 1)[0]) in engine._retry
+            fs._get_vector_store = lambda: None
+            await fs.rm(uri, ctx=ctx)
+            written = db.upsert.await_count
+            await enqueue(messages[0])
+            assert results[-1].outcome is ProcessOutcome.FAILED
+            assert db.upsert.await_count == written
+    finally:
+        await asyncio.to_thread(queues.stop)

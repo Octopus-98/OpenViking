@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from bisect import bisect_right
+from collections import OrderedDict
 from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from itertools import islice
@@ -18,7 +19,12 @@ from urllib.parse import quote
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from openviking.config.ttl import TTLIndexType, classify_ttl_uri, resolve_effective_ttl
+from openviking.config.ttl import (
+    TTLIndexType,
+    classify_ttl_uri,
+    resolve_effective_ttl,
+    validate_ttl_root,
+)
 from openviking.core.namespace import uri_parts
 from openviking.scheduling.expiry.api import (
     TTL_ITEM_TYPE,
@@ -44,7 +50,7 @@ from openviking_cli.exceptions import (
     UnavailableError,
 )
 from openviking_cli.session.user_id import UserIdentifier
-from openviking_cli.utils.config.ttl_config import TTLConfig
+from openviking_cli.utils.config.ttl_config import TTLConfig, UserTTLConfig
 
 if TYPE_CHECKING:
     from openviking.server.api_keys import APIKeyManager
@@ -180,6 +186,8 @@ class DirectoryTTL:
         self._recycle: set[str] = set()
         self._recycle_after_ms = 0
         self._dispatcher = OwnerLoopDispatcher()
+        self._user_policies = OrderedDict()
+        self._user_loads = {}
 
     def bind_runtime(self, service: OpenVikingService, account_manager: APIKeyManager) -> None:
         # Bind before queue workers can invoke the write hooks.
@@ -224,8 +232,8 @@ class DirectoryTTL:
         # Confirm the next durable wake-up before acknowledging this one.
         # Long-running filesystem work stays outside the short expiry callback.
         await self._schedule(account, force=True)
-        if time.time_ns() // 1_000_000 >= self._recycle_after_ms and self.enabled(
-            await self.policies(account)
+        if time.time_ns() // 1_000_000 >= self._recycle_after_ms and await self.active_policies(
+            account
         ):
             self._recycle.add(account)
             self._wake_worker()
@@ -282,9 +290,7 @@ class DirectoryTTL:
             for account in accounts:
                 account = account["account_id"]
                 pair = await self.policies(account)
-                roots = set(self.policy_roots(pair))
-                if isinstance(patch, dict):
-                    roots.update(patch.get("roots") or {})
+                roots = set(self.policy_roots())
                 scopes = [root for root in roots if not resolve_effective_ttl(*pair, root).enabled]
                 try:
                     if scopes:
@@ -332,25 +338,21 @@ class DirectoryTTL:
     async def _initial_roots(self, account: str, pair) -> list[str]:
         ctx = self.context(account)
         roots = set()
-        peer_enabled = resolve_effective_ttl(
-            *pair, "viking://user/_ttl_/peers/_ttl_/memories/events"
-        ).enabled
         for user in await self._children("viking://user", ctx):
+            config = await self.user_policy(account, uri_parts(user)[1])
             for root in (user + "/memories/events", user + "/sessions"):
-                if resolve_effective_ttl(*pair, root).enabled:
+                if resolve_effective_ttl(*pair, root, config).enabled:
                     roots.add(root)
-            if peer_enabled:
+            probe = user + "/peers/*/memories/events"
+            if resolve_effective_ttl(*pair, probe, config).enabled:
                 for peer in await self._children(user + "/peers", ctx):
                     root = peer + "/memories/events"
-                    if resolve_effective_ttl(*pair, root).enabled:
+                    if resolve_effective_ttl(*pair, root, config).enabled:
                         roots.add(root)
-        for config in pair:
-            if config is not None:
-                roots.update(
-                    root
-                    for root in config.roots or {}
-                    if resolve_effective_ttl(*pair, root).enabled
-                )
+            for peer in (config.peers or {}) if config else ():
+                root = user + f"/peers/{peer}/memories/events"
+                if resolve_effective_ttl(*pair, root, config).enabled:
+                    roots.add(root)
         return sorted(roots)
 
     def prefix(self, account_id: str) -> str:
@@ -359,6 +361,122 @@ class DirectoryTTL:
 
     def context(self, account_id: str) -> RequestContext:
         return RequestContext(user=UserIdentifier(account_id, "ttl-internal"), role=Role.ROOT)
+
+    @staticmethod
+    def user_roots(user: str, config: UserTTLConfig | None = None) -> list[str]:
+        base = f"viking://user/{user}"
+        roots = [
+            base + "/sessions",
+            base + "/memories/events",
+            base + "/peers/*/memories/events",
+        ]
+        if config is not None:
+            roots.extend(base + f"/peers/{peer}/memories/events" for peer in config.peers or {})
+        return roots
+
+    def _cache_user_policy(self, key, config) -> None:
+        self._user_policies[key] = (time.monotonic(), config)
+        self._user_policies.move_to_end(key)
+        while len(self._user_policies) > 1024:
+            self._user_policies.popitem(last=False)
+
+    async def user_policy(self, account: str, user: str) -> UserTTLConfig | None:
+        """Share one snapshot per user; refresh on demand, not once per directory."""
+        key = (account, user)
+        cached = self._user_policies.get(key)
+        if cached is not None and time.monotonic() - cached[0] < 30:
+            return cached[1]
+
+        async def load():
+            cached = self._user_policies.get(key)
+            if cached is not None and time.monotonic() - cached[0] < 30:
+                return cached[1]
+            task = self._user_loads.get(key)
+            if task is None:
+                from openviking.server.user_config import read_user_config
+
+                async def read():
+                    try:
+                        ctx = RequestContext(user=UserIdentifier(account, user), role=Role.ROOT)
+                        value = (await read_user_config(self.fs, ctx)).ttl
+                        if self._user_loads.get(key) is not asyncio.current_task():
+                            return await self.user_policy(account, user)
+                        # A PATCH published while this read was in flight wins.
+                        if self._user_policies.get(key) is cached:
+                            self._cache_user_policy(key, value)
+                        return self._user_policies.get(key, (0, value))[1]
+                    finally:
+                        if self._user_loads.get(key) is asyncio.current_task():
+                            self._user_loads.pop(key, None)
+
+                task = asyncio.create_task(read())
+                self._user_loads[key] = task
+            return await asyncio.shield(task)
+
+        return await self._dispatcher.run(load)
+
+    async def policy(self, account: str, uri: str, pair=None):
+        pair = pair if pair is not None else await self.policies(account)
+        parts = uri_parts(uri)
+        user = (
+            await self.user_policy(account, parts[1]) if classify_ttl_uri(uri) is not None else None
+        )
+        policy = resolve_effective_ttl(*pair, uri, user)
+        if policy.enabled and self.writer and account not in self._recovered:
+            await self._dispatcher.run(lambda: self._recover(account))
+        return policy
+
+    async def active_policies(self, account: str, pair=None, state=None):
+        pair = pair if pair is not None else await self.policies(account)
+        state = state if state is not None else await self.read_initial(account)
+        policies = [resolve_effective_ttl(*pair, root) for root in self.policy_roots()]
+        roots = set(json.loads(state["roots"]) if state["roots"] else [])
+        roots.update(state["reset_required"])
+        for (scope, user), (_, config) in list(self._user_policies.items()):
+            if scope == account and config is not None:
+                roots.update(self.user_roots(user, config))
+        policies.extend([await self.policy(account, root, pair) for root in sorted(roots)])
+        return [policy for policy in policies if policy.enabled]
+
+    async def prepare_user_configuration(self, ctx, before, after) -> None:
+        pair = await self.policies(ctx.account_id)
+        roots = set(self.user_roots(ctx.user.user_id, before)) | set(
+            self.user_roots(ctx.user.user_id, after)
+        )
+        opening = [
+            root
+            for root in roots
+            if resolve_effective_ttl(*pair, root, after).enabled
+            and not resolve_effective_ttl(*pair, root, before).enabled
+        ]
+        if not opening:
+            return
+        try:
+            redis = await self.client()
+            pipe = redis.pipeline(transaction=False)
+            token = uuid4().hex
+            for root in opening:
+                pipe.hsetnx(self.prefix(ctx.account_id) + "backfill:reset_required", root, token)
+            await pipe.execute()
+            await self._schedule(ctx.account_id)
+        except Exception as exc:
+            raise UnavailableError("TTL reset intent registration unavailable") from exc
+
+    async def publish_user_configuration(self, ctx, config) -> None:
+        async def publish():
+            key = (ctx.account_id, ctx.user.user_id)
+            self._user_loads.pop(key, None)
+            self._cache_user_policy(key, config)
+            if self.writer:
+                pair = await self.policies(ctx.account_id)
+                if any(
+                    resolve_effective_ttl(*pair, root, config).enabled
+                    for root in self.user_roots(ctx.user.user_id, config)
+                ):
+                    self._initial_requests.add(ctx.account_id)
+                    self._wake_worker()
+
+        await self._dispatcher.run(publish)
 
     async def policies(self, account_id: str) -> tuple[TTLConfig | None, TTLConfig | None]:
         pair = await self.manager.resolve_account(
@@ -376,20 +494,16 @@ class DirectoryTTL:
             self._wake_worker()
 
     @staticmethod
-    def policy_roots(pair: tuple[TTLConfig | None, TTLConfig | None]) -> list[str]:
-        probes = [
+    def policy_roots() -> list[str]:
+        return [
             "viking://user/_ttl_/sessions",
             "viking://user/_ttl_/memories/events",
-            "viking://user/_ttl_/peers/_ttl_/memories/events",
+            "viking://user/_ttl_/peers/*/memories/events",
         ]
-        for config in pair:
-            if config is not None:
-                probes.extend(config.roots or {})
-        return probes
 
     @classmethod
     def enabled(cls, pair: tuple[TTLConfig | None, TTLConfig | None]) -> bool:
-        return any(resolve_effective_ttl(*pair, uri).enabled for uri in cls.policy_roots(pair))
+        return any(resolve_effective_ttl(*pair, uri).enabled for uri in cls.policy_roots())
 
     def expiry(self, item: TTLDirectory, base: float, days: int) -> float:
         if item[0] == "sessions":
@@ -449,23 +563,20 @@ class DirectoryTTL:
                 self.redis = None
 
     async def requires_existing_session(self, uri: str, ctx: RequestContext) -> bool:
-        return resolve_effective_ttl(*await self.policies(ctx.account_id), uri).enabled
+        return (await self.policy(ctx.account_id, uri)).enabled
 
     @asynccontextmanager
-    async def write_guard(self, uri, ctx, lease_ref=None, *, require_exists=False):
+    async def write_guard(
+        self, uri, ctx, lease_ref=None, *, require_exists=False, recover_owner=False
+    ):
         item = directory(uri)
         if ctx is None or item is None or not self.writer:
             yield lease_ref
             return
-        policy = resolve_effective_ttl(*await self.policies(ctx.account_id), item[1])
+        policy = await self.policy(ctx.account_id, item[1])
         if not policy.enabled:
             yield lease_ref
             return
-        if (
-            item[0] != "sessions"
-            and self.expiry(item, self.base(item), policy.days) <= time.time_ns() // 1_000_000
-        ):
-            raise NotFoundError(item[2], "expired directory")
         agfs = self.fs._async_agfs
         path = self.fs._uri_to_path(uri, ctx=ctx)
         from openviking.ttl.wiring import get_write_owner
@@ -475,9 +586,20 @@ class DirectoryTTL:
         # lock cannot recreate a deleted Session/date through lock sidecars.
         unit = held
         if unit is None:
-            unit = await agfs.pathlock_acquire_exact(
-                self.fs._uri_to_path(item[2], ctx=ctx), owner_lease_ref=lease_ref
-            )
+            unit_path = self.fs._uri_to_path(item[2], ctx=ctx)
+            try:
+                unit = await agfs.pathlock_acquire_exact(unit_path, owner_lease_ref=lease_ref)
+            except ValueError as exc:
+                # A durable embedding can outlive its reindex owner (e.g. restart).
+                # Reacquire normally only for the native stale-capability error;
+                # lock conflicts and I/O failures must retain their error semantics.
+                if (
+                    not recover_owner
+                    or lease_ref is None
+                    or "owned lease capability does not match ref" not in str(exc)
+                ):
+                    raise
+                unit = await agfs.pathlock_acquire_exact(unit_path)
         try:
             if require_exists:
                 await self.fs.stat(uri, ctx=ctx, skip_count=True)
@@ -518,7 +640,7 @@ class DirectoryTTL:
         if item is None or (item[0] == "sessions" and uri != item[2] + "/messages.jsonl"):
             return
         pair = await self.policies(ctx.account_id)
-        if not resolve_effective_ttl(*pair, item[1]).enabled:
+        if not (await self.policy(ctx.account_id, item[1], pair)).enabled:
             return
         base = written_at_ms if item[0] == "sessions" else self.base(item)
         await self._dispatcher.run(
@@ -566,7 +688,7 @@ class DirectoryTTL:
                 active = {
                     uri: base
                     for uri, base in entries.items()
-                    if resolve_effective_ttl(*pair, uri).enabled
+                    if (await self.policy(account, uri, pair)).enabled
                 }
                 if active:
                     redis = await self.client()
@@ -598,14 +720,14 @@ class DirectoryTTL:
             raise FailedPreconditionError("TTL request must target this writer")
         account = request.account_id
         pair = await self.policies(account)
-        if not self.enabled(pair):
+        state = await self.read_initial(account)
+        if not await self.active_policies(account, pair, state):
             raise FailedPreconditionError("TTL is disabled")
         await self._schedule(account)
-        state = await self.read_initial(account)
         intents = request.reset_intents or {
             root: token
             for root, token in state["reset_required"].items()
-            if resolve_effective_ttl(*pair, root).enabled
+            if (await self.policy(account, root, pair)).enabled
         }
         reset = request.reset or bool(intents)
         roots = request.roots
@@ -623,7 +745,8 @@ class DirectoryTTL:
                 roots = await self._initial_roots(account, pair)
         roots = sorted(set(roots))
         try:
-            TTLConfig(roots=dict.fromkeys(roots, "disabled"))
+            for root in roots:
+                validate_ttl_root(root)
         except ValueError as exc:
             raise InvalidArgumentError(
                 "initial roots must be canonical Events or Sessions roots"
@@ -635,7 +758,7 @@ class DirectoryTTL:
         active_intents = {
             root: token
             for root, token in intents.items()
-            if resolve_effective_ttl(*pair, root).enabled
+            if (await self.policy(account, root, pair)).enabled
         }
         if intents and not active_intents:
             return
@@ -688,7 +811,7 @@ class DirectoryTTL:
                 for account in self._initial_requests | self._recycle:
                     if self._closed:
                         break
-                    if not self.enabled(await self.policies(account)):
+                    if not await self.active_policies(account):
                         # Keep the durable wake-up across disable/re-enable races.
                         self._recovered.discard(account)
                         self._initial_requests.discard(account)
@@ -702,7 +825,7 @@ class DirectoryTTL:
                 for account in list(self._pending):
                     if self._closed:
                         break
-                    if not self.enabled(await self.policies(account)):
+                    if not await self.active_policies(account):
                         self._pending.discard(account)
                         continue
                     async with self._locks.setdefault(account, asyncio.Lock()):
@@ -770,9 +893,7 @@ class DirectoryTTL:
                 return
             root = roots[checkpoint["root"]]
             pair = await self.policies(account)
-            if not resolve_effective_ttl(*pair, root).enabled:
-                if not self.enabled(pair):
-                    return
+            if not (await self.policy(account, root, pair)).enabled:
                 # A disabled root does not block other enabled roots in the account.
                 # Reopening this root requires the persisted initial reset.
                 checkpoint["root"] += 1
@@ -867,7 +988,7 @@ class DirectoryTTL:
             item = directory(uri)
             if item is None:
                 continue
-            policy = resolve_effective_ttl(*pair, item[1])
+            policy = await self.policy(ctx.account_id, item[1], pair)
             if not policy.enabled:
                 continue
             if item[0] == "sessions":
@@ -901,7 +1022,8 @@ class DirectoryTTL:
         if not self.writer or request.resource_id != self.resource_id:
             raise FailedPreconditionError("TTL request must target this writer")
         pair = await self.policies(request.account_id)
-        if not self.enabled(pair):
+        policies = await self.active_policies(request.account_id, pair)
+        if not policies:
             return TTLRecycleResult()
         if request.max_base_time_ms is None:
             # Hourly orchestration supplies only identity. Redis and policy
@@ -909,8 +1031,7 @@ class DirectoryTTL:
             await self.register_initial_backfill(
                 TTLBackfillRequest(self.resource_id, request.account_id)
             )
-            policies = [resolve_effective_ttl(*pair, root) for root in self.policy_roots(pair)]
-            days = min(policy.days for policy in policies if policy.enabled)
+            days = min(policy.days for policy in policies)
             cutoff = time.time_ns() // 1_000_000 - (days - 1) * DAY_MS
         else:
             cutoff = request.max_base_time_ms
@@ -939,11 +1060,7 @@ class DirectoryTTL:
                         break
                     removed = 0
                     for uri, score in candidates:
-                        if (
-                            self._closed
-                            or account in self._stop_scan
-                            or not self.enabled(await self.policies(account))
-                        ):
+                        if self._closed or account in self._stop_scan:
                             return TTLRecycleResult(**counts)
                         if await redis.get(prefix + "backfill:initial:done") != "1":
                             return TTLRecycleResult(**counts)
@@ -963,7 +1080,7 @@ class DirectoryTTL:
         item = directory(uri)
         if item is None or item[2] != uri:
             return False, 0
-        policy = resolve_effective_ttl(*await self.policies(account), item[1])
+        policy = await self.policy(account, item[1])
         if (
             not policy.enabled
             or self.expiry(item, score, policy.days) > time.time_ns() // 1_000_000
@@ -976,7 +1093,7 @@ class DirectoryTTL:
             redis = await self.client()
             if await redis.get(self.prefix(account) + "backfill:initial:done") != "1":
                 return False, 0
-            policy = resolve_effective_ttl(*await self.policies(account), item[1])
+            policy = await self.policy(account, item[1])
             if not policy.enabled:
                 return False, 0
             base = score
@@ -998,79 +1115,6 @@ class DirectoryTTL:
             return True, int(removed)
         finally:
             await agfs.pathlock_release(lease)
-
-    async def event_filter(self, ctx):
-        """Build URI-aware predicates before backend ranking/limit, using one config pair."""
-        from openviking.storage.expr import And, Or, PathScope, Range, RawDSL
-
-        pair = await self.policies(ctx.account_id)
-        if not self.enabled(pair):
-            return None
-        # Both backends accept URI regex. Include unlabeled historical Events;
-        # a missing created_at on an enabled Event cannot pass the time range.
-        patterns = {
-            "user_events": r"^(?:viking://|/)user/[^/]+/memories/events(?:/|$)",
-            "peer_events": r"^(?:viking://|/)user/[^/]+/peers/[^/]+/memories/events(?:/|$)",
-        }
-        roots = {}
-        for config in pair:
-            if config is not None:
-                roots.update(config.roots or {})
-        root_names = [root for root in roots if "/memories/events" in root]
-        probes = [
-            "viking://user/_ttl_/memories/events",
-            "viking://user/_ttl_/peers/_ttl_/memories/events",
-            *root_names,
-        ]
-        if not any(resolve_effective_ttl(*pair, root).enabled for root in probes):
-            return None
-        exclusion = (
-            RawDSL({"op": "must_not", "field": "uri", "conds": root_names, "para": "-d=-1"})
-            if root_names
-            else None
-        )
-        branches = [
-            RawDSL(
-                {
-                    "op": "regex",
-                    "field": "uri",
-                    "pattern": r"^(?!(?:viking://|/)user/[^/]+/(?:memories/events|peers/[^/]+/memories/events)(?:/|$)).*",
-                }
-            )
-        ]
-        now = time.time_ns() // 1_000_000
-        for kind, pattern in patterns.items():
-            probe = "viking://user/_ttl_/" + (
-                "memories/events" if kind == "user_events" else "peers/_ttl_/memories/events"
-            )
-            policy = resolve_effective_ttl(*pair, probe)
-            conditions = [RawDSL({"op": "regex", "field": "uri", "pattern": pattern})]
-            if exclusion:
-                conditions.append(exclusion)
-            if policy.enabled:
-                conditions.append(
-                    Range(
-                        "created_at",
-                        gt=datetime.fromtimestamp(
-                            (now - policy.days * DAY_MS) / 1000, timezone.utc
-                        ).isoformat(),
-                    )
-                )
-            branches.append(And(conditions))
-        for root in root_names:
-            policy = resolve_effective_ttl(*pair, root)
-            conditions = [PathScope("uri", root)]
-            if policy.enabled:
-                conditions.append(
-                    Range(
-                        "created_at",
-                        gt=datetime.fromtimestamp(
-                            (now - policy.days * DAY_MS) / 1000, timezone.utc
-                        ).isoformat(),
-                    )
-                )
-            branches.append(And(conditions))
-        return Or(branches)
 
     @asynccontextmanager
     async def source_guard(self, source_uri, ctx, lease_ref=None, *, task_id=None):

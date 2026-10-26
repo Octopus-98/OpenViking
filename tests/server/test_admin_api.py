@@ -4296,3 +4296,71 @@ async def test_ttl_internal_preserves_error_contract(
     assert response.status_code == status, response.text
     assert response.json()["error"]["details"]["scope"] == "test"
     assert adapter.register_initial_backfill.await_count == 1
+
+
+async def test_user_ttl_reuses_settings_backup_and_sparse_peer_patch(
+    lightweight_admin_client, lightweight_admin_app, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from openviking.ttl import wiring
+
+    adapter = SimpleNamespace(
+        supports_config=lambda: True,
+        prepare_user_configuration=AsyncMock(),
+        publish_user_configuration=AsyncMock(),
+    )
+    monkeypatch.setattr(wiring, "_adapter", adapter)
+    created = await lightweight_admin_client.post(
+        "/api/v1/admin/accounts",
+        json={"account_id": "ttl-user", "admin_user_id": "alice"},
+        headers=root_headers(),
+    )
+    assert created.status_code == 200, created.text
+    url = "/api/v1/admin/accounts/ttl-user/users/alice/settings"
+    response = await lightweight_admin_client.patch(
+        url,
+        json={
+            "memory_policy": {"memory_types": ["profile"]},
+            "ttl": {"sessions": 7, "peers": {"p1": 3, "p2": "disabled"}},
+        },
+        headers=root_headers(),
+    )
+    assert response.status_code == 200, response.text
+    settings = response.json()["result"]
+    assert settings["ttl"] == {"sessions": 7, "peers": {"p1": 3, "p2": "disabled"}}
+    response = await lightweight_admin_client.patch(
+        url, json={"ttl": {"peers": {"p1": None, "p3": 30}}}, headers=root_headers()
+    )
+    assert response.status_code == 200, response.text
+    settings = response.json()["result"]
+    assert settings["ttl"] == {"sessions": 7, "peers": {"p2": "disabled", "p3": 30}}
+    assert settings["memory_policy"]["memory_types"] == ["profile"]
+    user_ctx = RequestContext(user=UserIdentifier("ttl-user", "alice"), role=Role.USER)
+    fs = lightweight_admin_app.state.fake_service.viking_fs
+    backup = json.loads(fs.files[user_config_backup_uri(user_ctx)])
+    assert backup["ttl"]["peers"]["p1"] == 3
+    # Existing memory-policy PATCH still replaces the whole policy; TTL is sparse.
+    for policy in (
+        {"self": {"enabled": False}, "memory_types": ["profile"]},
+        {"memory_types": ["profile"]},
+    ):
+        response = await lightweight_admin_client.patch(
+            url, json={"memory_policy": policy}, headers=root_headers()
+        )
+        assert response.status_code == 200, response.text
+    assert response.json()["result"]["memory_policy"]["self"]["enabled"] is True
+    before = dict(fs.files)
+    from openviking_cli.exceptions import UnavailableError
+
+    adapter.prepare_user_configuration.side_effect = UnavailableError("Redis unavailable")
+    response = await lightweight_admin_client.patch(
+        url, json={"ttl": {"sessions": 1}}, headers=root_headers()
+    )
+    assert response.status_code == 503 and fs.files == before
+    adapter.prepare_user_configuration.side_effect = None
+    assert adapter.publish_user_configuration.await_count == 2
+    monkeypatch.setattr(wiring, "_adapter", None)
+    response = await lightweight_admin_client.patch(url, json={"ttl": None}, headers=root_headers())
+    assert response.status_code == 501 and fs.files == before

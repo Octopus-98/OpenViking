@@ -8,14 +8,13 @@ cluster (库/实例) and account (数据空间) scopes. No Redis-free backend is
 
 A policy value is either a positive integer number of days or the literal
 ``"disabled"``. An absent node means "inherit"; ``"disabled"`` stops the
-fallback at that node. Effective-policy selection (per-node account-over-cluster
-merge, then specific-root > type-default > ``global`` > default-off) lives in
+fallback at that node. Effective-policy selection (User > Account > cluster for
+each node, then type-default > ``global`` > default-off) lives in
 :mod:`openviking.config.ttl` so this module stays a pure data shape.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Annotated, Dict, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -41,21 +40,21 @@ class TTLConfig(BaseModel):
     user_events: Optional[TTLPolicy] = RuntimeField(default=None)
     peer_events: Optional[TTLPolicy] = RuntimeField(default=None)
     sessions: Optional[TTLPolicy] = RuntimeField(default=None)
-    roots: Optional[Dict[str, TTLPolicy]] = RuntimeField(default=None)
+
+
+class UserTTLConfig(TTLConfig):
+    """One user's defaults and independent Peer Events overrides."""
+
+    peers: Optional[Dict[str, TTLPolicy]] = None
 
     @model_validator(mode="after")
-    def _validate_roots(self) -> "TTLConfig":
-        for uri in self.roots or {}:
-            if (
-                not re.fullmatch(
-                    r"viking://user/[^/]+/(?:memories/events|peers/[^/]+/memories/events|sessions)",
-                    uri,
-                )
-                or any(part in {".", ".."} for part in uri.split("/"))
-                or any(char in uri for char in "*?[]")
-            ):
-                raise ValueError("TTL roots must be canonical Events or Sessions roots")
+    def _validate_peers(self) -> "UserTTLConfig":
+        from openviking.core.identifiers import validate_identifier_part
+
+        for peer in self.peers or {}:
+            if error := validate_identifier_part(peer, "peer_id"):
+                raise ValueError(error)
         return self
 
 
-__all__ = ["TTLConfig", "TTLPolicy"]
+__all__ = ["TTLConfig", "TTLPolicy", "UserTTLConfig"]
