@@ -1032,7 +1032,9 @@ class CompileLifecycle:
         """Reject overlapping source and destination directories before updating a target."""
         for source in sources:
             if overlaps(source, to):
-                raise InvalidArgumentError(f"Compile source overlaps target: {source}")
+                raise InvalidArgumentError(
+                    f"Compile 'from' directories must not overlap 'to': {source}"
+                )
 
     @staticmethod
     def apply_sources(record: Dict[str, Any], sources: List[str], skill: str) -> None:

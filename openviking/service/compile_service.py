@@ -426,6 +426,7 @@ class CompileService:
                 ctx=ctx,
             )
         request = self._normalize_request_uris(request, ctx)
+        CompileLifecycle.validate_layout(request.to, request.from_)
         if configures_schedule:
             lifecycle = self._require_lifecycle()
             normalized = await self._normalize_request(request, ctx)
