@@ -243,9 +243,14 @@ async def test_write_scores_retry_and_expiry(engine):
 
 
 @pytest.mark.asyncio
-async def test_disabled_account_no_io(engine):
+@pytest.mark.parametrize("root_count", [0, 1000])
+async def test_disabled_account_no_io(engine, root_count):
     e = engine
-    e.pair = (TTLConfig(sessions=7), TTLConfig(sessions="disabled"))
+    roots = {f"viking://user/u{i}/sessions": 7 for i in range(root_count)}
+    e.pair = (
+        TTLConfig(sessions=7, roots=roots),
+        TTLConfig(sessions="disabled", roots=dict.fromkeys(roots, "disabled")),
+    )
     e.client = AsyncMock(side_effect=AssertionError("off path touched Redis"))
     e._dispatcher.run = AsyncMock(side_effect=AssertionError("off path dispatched TTL work"))
     uri = "viking://user/u/sessions/s"

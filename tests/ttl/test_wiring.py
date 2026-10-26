@@ -18,6 +18,25 @@ def test_disabled_does_not_load_runtime(monkeypatch, config):
     assert build_ttl_adapter(config) is None
 
 
+def test_readme_configuration_includes_writer_and_scheduler(tmp_path):
+    import json
+    from pathlib import Path
+
+    from openviking.server.config import ServerConfig
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
+
+    readme = Path(__file__).parents[2] / "openviking/ttl/README.md"
+    raw = json.loads(readme.read_text().split("```json\n", 1)[1].split("```", 1)[0])
+    config = OpenVikingConfig.from_dict({**raw, "storage": {"workspace": str(tmp_path)}})
+    config.expiry.validate_for_runtime()
+    server = ServerConfig.model_validate(raw["server"])
+    adapter = build_ttl_adapter(server.ttl_adapter)
+    assert server.ttl_adapter.writer_enabled
+    assert adapter.resource_id == config.expiry.service_name
+    assert adapter.redis_config == config.expiry.redis
+    assert not config.expiry.publisher_separate_process
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("writer", [True, False])
 async def test_native_lifecycle_is_lazy_and_reader_has_no_worker(writer):

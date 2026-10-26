@@ -494,8 +494,7 @@ class OpenVikingConfig(BaseModel):
     ttl: TTLConfig = RuntimeField(
         default_factory=TTLConfig,
         description=(
-            "Directory TTL recycling policy (commercial, public-cloud only). "
-            "Default-off; recycling behavior is provided by an optional adapter."
+            "Directory TTL recycling policy. Default-off; requires the enabled Redis TTL runtime."
         ),
     )
 

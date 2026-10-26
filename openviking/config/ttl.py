@@ -20,6 +20,13 @@ class TTLIndexType(str, Enum):
     SESSIONS = "sessions"
 
 
+_ROOT_DEPTH = {
+    TTLIndexType.USER_EVENTS: 4,
+    TTLIndexType.PEER_EVENTS: 6,
+    TTLIndexType.SESSIONS: 3,
+}
+
+
 @dataclass(frozen=True)
 class EffectiveTTL:
     index_type: Optional[TTLIndexType]
@@ -58,22 +65,16 @@ def resolve_effective_ttl(
     kind = classify_ttl_uri(uri)
     if kind is None:
         return EffectiveTTL.off(None)
-    target = uri_parts(uri)
-    roots = {}
-    for config in (cluster_ttl, account_ttl):
-        if config is not None:
-            roots.update(config.roots or {})
-    root_policy, root_depth = None, -1
-    for root, policy in roots.items():
-        parts = uri_parts(root)
-        if len(parts) > root_depth and target[: len(parts)] == parts:
-            root_policy, root_depth = policy, len(parts)
-    if root_policy is not None:
-        return (
-            EffectiveTTL.off(kind)
-            if root_policy == "disabled"
-            else EffectiveTTL(kind, True, root_policy)
-        )
+    # TTLConfig permits only these fixed roots, so no longest-prefix scan is needed.
+    root = "viking://" + "/".join(uri_parts(uri)[: _ROOT_DEPTH[kind]])
+    for config in (account_ttl, cluster_ttl):
+        root_policy = config.roots.get(root) if config is not None and config.roots else None
+        if root_policy is not None:
+            return (
+                EffectiveTTL.off(kind)
+                if root_policy == "disabled"
+                else EffectiveTTL(kind, True, root_policy)
+            )
     for node in (kind.value, "global_"):
         value = getattr(account_ttl, node, None)
         if value is None:
