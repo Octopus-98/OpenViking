@@ -14,7 +14,6 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service.fs_service import FSService, ListingPage
 from openviking.service.task_work_index import bind_task_context
 from openviking.storage.abstract_overview import body_for_preview
-from openviking.storage.acl import AclAction
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import InvalidArgumentError
@@ -74,83 +73,6 @@ class _FakeVikingFS:
             "to": to_uri,
             "recursive": recursive,
         }
-
-
-@pytest.mark.asyncio
-async def test_can_read_many_uses_bulk_read_access(request_context):
-    uris = [
-        "viking://resources/shared.md",
-        "viking://user/alice/resources/private.md",
-    ]
-    expected = {uris[0]: True, uris[1]: False}
-    can_access_many = AsyncMock(return_value=expected)
-    service = FSService(viking_fs=SimpleNamespace(_can_access_many=can_access_many))
-
-    assert await service.can_read_many(uris, request_context) == expected
-    can_access_many.assert_awaited_once_with(uris, request_context, action=AclAction.READ)
-
-
-@pytest.mark.asyncio
-async def test_can_read_many_enforces_user_namespace_visibility(request_context):
-    shared_uri = "viking://resources/shared.md"
-    private_uri = "viking://user/alice/resources/private.md"
-    service = FSService(viking_fs=VikingFS(agfs=SimpleNamespace()))
-
-    assert await service.can_read_many(
-        [shared_uri, private_uri],
-        request_context,
-    ) == {
-        shared_uri: True,
-        private_uri: False,
-    }
-
-
-@pytest.mark.asyncio
-async def test_get_tags_many_returns_vector_backed_tags(request_context, monkeypatch):
-    can_access_many = AsyncMock(
-        return_value={
-            "viking://resources/a.md": True,
-            "viking://resources/b.md": True,
-        }
-    )
-    service = FSService(
-        viking_fs=SimpleNamespace(_can_access_many=can_access_many)
-    )
-    attach_tags = AsyncMock(
-        return_value=[
-            {"uri": "viking://resources/a.md", "isDir": False, "tags": ["env=prod"]},
-            {"uri": "viking://resources/b.md", "isDir": False, "tags": []},
-        ]
-    )
-    monkeypatch.setattr(service, "_attach_and_filter_tags", attach_tags)
-
-    result = await service.get_tags_many(
-        [
-            "viking://resources/a.md",
-            "viking://resources/b.md",
-            "viking://resources/a.md",
-        ],
-        request_context,
-    )
-
-    assert result == {
-        "viking://resources/a.md": ["env=prod"],
-        "viking://resources/b.md": [],
-    }
-    can_access_many.assert_awaited_once_with(
-        ["viking://resources/a.md", "viking://resources/b.md"],
-        request_context,
-        action=AclAction.READ,
-    )
-    attach_tags.assert_awaited_once_with(
-        [
-            {"uri": "viking://resources/a.md", "isDir": False},
-            {"uri": "viking://resources/b.md", "isDir": False},
-        ],
-        request_context,
-        tags=None,
-        include_tags=True,
-    )
 
 
 @pytest.mark.asyncio

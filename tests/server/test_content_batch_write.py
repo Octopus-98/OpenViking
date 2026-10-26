@@ -25,6 +25,7 @@ from openviking.telemetry.context import bind_telemetry
 from openviking.telemetry.operation import OperationTelemetry
 from openviking.utils.content_hash import content_md5
 from openviking_cli.exceptions import (
+    ConflictError,
     InvalidArgumentError,
     NotFoundError,
 )
@@ -423,7 +424,7 @@ async def test_batch_create_replace_and_upsert_overwrite_or_create(monkeypatch):
         root_uri=root,
         operations=[
             {"uri": existing, "content": "replacement", "mode": "create"},
-            {"uri": created_by_replace, "content": "created", "mode": "replace"},
+            {"uri": created_by_replace, "content": "created", "mode": "replace", "if_absent": True},
             {"uri": created_by_upsert, "content": "upsert", "mode": "upsert"},
         ],
         ctx=ctx,
@@ -437,6 +438,19 @@ async def test_batch_create_replace_and_upsert_overwrite_or_create(monkeypatch):
         created_by_replace: "created",
         created_by_upsert: "upsert",
     }
+
+    with pytest.raises(ConflictError, match="Target already exists"):
+        await coordinator.batch_write(
+            root_uri=root,
+            operations=[
+                {"uri": existing, "content": "must not be written"},
+                {"uri": created_by_replace, "content": "overwrite", "if_absent": True},
+            ],
+            ctx=ctx,
+            wait=False,
+        )
+    assert vfs.files[existing] == "replacement"
+    assert vfs.files[created_by_replace] == "created"
 
 
 @pytest.mark.asyncio
@@ -1414,83 +1428,6 @@ async def test_batch_write_api_create_overwrites_and_batch_continues(client_with
     created_body = await client.get("/api/v1/content/read", params={"uri": created, "raw": True})
     assert created_body.status_code == 200
     assert created_body.json()["result"] == "created by upsert"
-
-
-@pytest.mark.asyncio
-async def test_batch_write_api_if_absent_creates_without_overwriting(client_with_resource):
-    client, root = client_with_resource
-    target = f"{root}/create-only.md"
-
-    created = await client.post(
-        "/api/v1/content/batch-write",
-        json={
-            "root_uri": root,
-            "wait": False,
-            "operations": [
-                {
-                    "uri": target,
-                    "content": "first",
-                    "mode": "create",
-                    "if_absent": True,
-                }
-            ],
-        },
-    )
-    assert created.status_code == 200
-    assert created.json()["result"]["created"] == [target]
-
-    conflict = await client.post(
-        "/api/v1/content/batch-write",
-        json={
-            "root_uri": root,
-            "wait": False,
-            "operations": [
-                {
-                    "uri": target,
-                    "content": "second",
-                    "mode": "create",
-                    "if_absent": True,
-                }
-            ],
-        },
-    )
-    assert conflict.status_code == 409
-
-    body = await client.get("/api/v1/content/read", params={"uri": target, "raw": True})
-    assert body.status_code == 200
-    assert body.json()["result"] == "first"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "operation",
-    [
-        {
-            "content": "body",
-            "mode": "append",
-            "if_absent": True,
-        },
-        {
-            "content": "body",
-            "mode": "replace",
-            "if_absent": True,
-            "expected_sha256": "0" * 64,
-        },
-    ],
-)
-async def test_batch_write_api_rejects_incompatible_if_absent(
-    client_with_resource, operation
-):
-    client, root = client_with_resource
-    response = await client.post(
-        "/api/v1/content/batch-write",
-        json={
-            "root_uri": root,
-            "wait": False,
-            "operations": [{"uri": f"{root}/invalid-create.md", **operation}],
-        },
-    )
-    assert response.status_code == 400
 
 
 @pytest.mark.asyncio

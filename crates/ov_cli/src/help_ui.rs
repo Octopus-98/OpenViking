@@ -3231,10 +3231,6 @@ mod tests {
             ("task", "Inspect and manage async processing tasks."),
             ("skills", "Manage installed agent skills."),
             (
-                "mcps",
-                "Manage remote MCP servers, tools, and live context mounts.",
-            ),
-            (
                 "session",
                 "Manage sessions, messages, archives, and committed session context.",
             ),

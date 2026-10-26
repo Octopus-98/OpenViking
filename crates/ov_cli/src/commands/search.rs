@@ -1495,33 +1495,6 @@ mod tests {
         assert!(render_grep_output_for_table(&result, OutputFormat::Json).is_none());
     }
 
-    #[test]
-    fn mcp_find_renders_like_other_ranked_results() {
-        let result = json!({
-            "tools": [{
-                "uri": "viking://agent/tools/demo/echo.json",
-                "server": "demo",
-                "name": "echo",
-                "description": "Echoes back the input string",
-                "score": 1.0
-            }],
-            "total": 1
-        });
-
-        let rendered = strip_ansi(
-            &render_search_results_for_table_with_context(
-                &result,
-                Some(SearchRenderContext::mcp_find(10)),
-            )
-            .expect("MCP find output"),
-        );
-        assert!(rendered.starts_with("1 tool\nRanked by relevance · limit 10 final tools"));
-        assert!(rendered.contains("1. tool"));
-        assert!(rendered.contains("viking://agent/tools/demo/echo.json"));
-        assert!(rendered.contains("name: echo"));
-        assert!(rendered.contains("description: Echoes back the input string"));
-    }
-
     fn strip_ansi(input: &str) -> String {
         let mut output = String::with_capacity(input.len());
         let mut chars = input.chars().peekable();

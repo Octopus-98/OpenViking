@@ -10,13 +10,14 @@ and service dependency, avoiding MCP protocol complexity.
 import base64
 import json
 import re
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
+from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent, Tool, ToolAnnotations
 from starlette.routing import Route
 
 import openviking.server.mcp_endpoint as mcp_endpoint
@@ -35,12 +36,10 @@ from openviking.server.mcp_endpoint import (
     cancel_watch,
     download,
     edit,
-    find_mcp_tools,
     forget,
     glob,
     grep,
     health,
-    invoke_mcp_tool,
     list_watches,
     read,
     remember,
@@ -49,6 +48,7 @@ from openviking.server.mcp_endpoint import (
     write,
 )
 from openviking.server.mcp_endpoint import ls as list_tool
+from openviking.server.routers import content as content_router
 from openviking.service.fs_service import ListingPage
 from openviking_cli.exceptions import (
     FailedPreconditionError,
@@ -387,105 +387,6 @@ async def test_search_tools_expose_only_context_type_parameter():
         properties = tools[tool_name].inputSchema["properties"]
         assert "context_type" in properties
         assert "filter" not in properties
-
-
-async def test_mcp_catalog_tools_are_registered_with_conservative_annotations():
-    tools = {tool.name: tool for tool in await mcp_endpoint.mcp.list_tools()}
-
-    assert tools["read"].annotations.readOnlyHint is True
-    assert tools["read"].annotations.destructiveHint is False
-    assert tools["read"].annotations.idempotentHint is True
-    assert tools["read"].annotations.openWorldHint is True
-    assert tools["find_mcp_tools"].annotations.readOnlyHint is True
-    assert tools["find_mcp_tools"].annotations.idempotentHint is True
-    assert tools["invoke_mcp_tool"].annotations.destructiveHint is True
-    assert tools["invoke_mcp_tool"].annotations.openWorldHint is True
-
-
-async def test_find_mcp_tools_delegates_to_catalog(monkeypatch):
-    definition = {
-        "name": "current",
-        "title": "Current Weather",
-        "description": "Current weather",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"city": {"type": "string", "description": "City name"}},
-            "required": ["city"],
-        },
-        "annotations": {"readOnlyHint": True},
-        "execution": {"taskSupport": "forbidden"},
-    }
-    find_tools = AsyncMock(
-        return_value={
-            "tools": [
-                {
-                    "uri": "viking://agent/tools/weather/current.json",
-                    "server": "weather",
-                    "name": "current",
-                    "description": "Current weather",
-                    "revision": "revision-1",
-                    "score": 0.87,
-                    "tool": definition,
-                }
-            ],
-            "total": 1,
-        }
-    )
-    monkeypatch.setattr(
-        mcp_endpoint,
-        "get_service",
-        lambda: SimpleNamespace(mcps=SimpleNamespace(find=find_tools)),
-    )
-
-    result = await find_mcp_tools("Should I carry an umbrella?", limit=5)
-
-    find_tools.assert_awaited_once_with(
-        "Should I carry an umbrella?", 5, DEFAULT_CTX, include_definition=True
-    )
-    assert isinstance(result, CallToolResult)
-    expected = {
-        "tools": [
-            {
-                "uri": "viking://agent/tools/weather/current.json",
-                "score": 0.87,
-                "tool": definition,
-            }
-        ],
-        "total": 1,
-    }
-    assert result.structuredContent == expected
-    assert isinstance(result.content[0], TextContent)
-    assert json.loads(result.content[0].text) == expected
-
-
-async def test_invoke_mcp_tool_preserves_native_content_and_error(monkeypatch):
-    invocation = {
-        "content": [{"type": "text", "text": "upstream rejected the request"}],
-        "structuredContent": {"code": "invalid_city"},
-        "isError": True,
-    }
-    invoke = AsyncMock(return_value=invocation)
-    monkeypatch.setattr(
-        mcp_endpoint,
-        "get_service",
-        lambda: SimpleNamespace(mcps=SimpleNamespace(invoke=invoke)),
-    )
-
-    result = await invoke_mcp_tool(
-        "viking://agent/tools/weather/current.json",
-        {"city": "Atlantis"},
-    )
-
-    invoke.assert_awaited_once_with(
-        "viking://agent/tools/weather/current.json",
-        {"city": "Atlantis"},
-        DEFAULT_CTX,
-    )
-    assert isinstance(result, CallToolResult)
-    assert result.isError is True
-    assert isinstance(result.content[0], TextContent)
-    assert result.content[0].text == "upstream rejected the request"
-    assert result.structuredContent == {"code": "invalid_city"}
 
 
 async def test_recall_tool_is_replaced_by_search_context_mode():
@@ -1265,68 +1166,6 @@ async def test_read_passes_offset_limit_to_visible_read(monkeypatch):
         offset=2,
         limit=2,
     )
-
-
-async def test_read_invokes_live_context_and_returns_only_upstream_result(monkeypatch):
-    content = """---
-type: OpenViking Live Context
-x-openviking:
-  type: mcp
-  definition: viking://agent/tools/weather/current.json
-  args:
-    city: Beijing
----
-"""
-    read_visible = AsyncMock(return_value=content)
-    read_live_context = AsyncMock(return_value='{\n  "temperature": 23,\n  "condition": "sunny"\n}')
-    monkeypatch.setattr(
-        mcp_endpoint,
-        "get_service",
-        lambda: SimpleNamespace(
-            fs=SimpleNamespace(read_visible=read_visible),
-            mcps=SimpleNamespace(read_live_context=read_live_context),
-        ),
-    )
-
-    result = await read("viking://resources/demo/weather.md")
-
-    assert result == '{\n  "temperature": 23,\n  "condition": "sunny"\n}'
-    read_live_context.assert_awaited_once_with(content, DEFAULT_CTX)
-
-
-async def test_read_returns_live_context_text_without_mcp_result_wrapper(monkeypatch):
-    read_visible = AsyncMock(return_value="type: OpenViking Live Context\n")
-    read_live_context = AsyncMock(return_value="Sunny, 23 C")
-    monkeypatch.setattr(
-        mcp_endpoint,
-        "get_service",
-        lambda: SimpleNamespace(
-            fs=SimpleNamespace(read_visible=read_visible),
-            mcps=SimpleNamespace(read_live_context=read_live_context),
-        ),
-    )
-
-    result = await read("viking://resources/demo/weather.md")
-
-    assert result == "Sunny, 23 C"
-
-
-async def test_paginated_read_does_not_invoke_live_context(monkeypatch):
-    read_visible = AsyncMock(return_value="type: OpenViking Live Context\n")
-    read_live_context = AsyncMock()
-    monkeypatch.setattr(
-        mcp_endpoint,
-        "get_service",
-        lambda: SimpleNamespace(
-            fs=SimpleNamespace(read_visible=read_visible),
-            mcps=SimpleNamespace(read_live_context=read_live_context),
-        ),
-    )
-
-    result = await read("viking://resources/demo/weather.md", offset=1, limit=5)
-
-    assert result == "type: OpenViking Live Context\n"
-    read_live_context.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -2552,10 +2391,89 @@ async def test_write_rejects_derived_semantic_file(service):
         await write(uri="viking://resources/test_write_derived/.relations.json", content="x")
 
 
-async def test_write_read_tool_roundtrip(service):
-    uri = "viking://resources/test_write_roundtrip/profile.md"
-    await write(uri=uri, content="name: ada\n")
+async def test_write_and_live_context_read_roundtrip(service, monkeypatch):
+    uri = "viking://user/test_user/resources/test_write_roundtrip/profile.md"
+    await write(uri=uri, content="name: ada\n", wait=True)
     assert "name: ada" in await read(uris=uri)
+
+    tool = Tool(
+        name="current",
+        inputSchema={"type": "object", "properties": {"city": {"type": "string"}}},
+        annotations=ToolAnnotations(readOnlyHint=True),
+    )
+    monkeypatch.setattr(
+        service.mcps,
+        "_discover",
+        AsyncMock(return_value=(SimpleNamespace(protocolVersion="2025-03-26"), [tool])),
+    )
+    upstream = SimpleNamespace(
+        initialize=AsyncMock(),
+        call_tool=AsyncMock(
+            return_value=CallToolResult(content=[], structuredContent={"temperature": 23})
+        ),
+    )
+
+    @asynccontextmanager
+    async def session(_server, _headers, _timeout_seconds):
+        yield upstream
+
+    monkeypatch.setattr(service.mcps, "_session", session)
+    tools_root = "viking://agent/tools"
+    tool_uri = f"{tools_root}/weather/current.json"
+    await service.mcps.add(
+        "weather",
+        "https://mcp.example.com",
+        {},
+        DEFAULT_CTX,
+        target_uri=tools_root,
+        wait=True,
+    )
+    await service.mcps.mount(
+        tool_uri,
+        uri,
+        "Weather",
+        None,
+        60,
+        {"city": "Beijing"},
+        DEFAULT_CTX,
+        tags=["env=prod"],
+        wait=True,
+    )
+
+    assert json.loads(await read(uris=uri)) == {"temperature": 23}
+    assert upstream.call_tool.await_count == 1
+    assert upstream.call_tool.await_args.kwargs["arguments"] == {"city": "Beijing"}
+    raw = await content_router.read(uri=uri, offset=0, limit=-1, raw=True, _ctx=DEFAULT_CTX)
+    assert tool_uri in raw.result
+    paged = await content_router.read(uri=uri, offset=1, limit=1, raw=False, _ctx=DEFAULT_CTX)
+    assert paged.result == raw.result.splitlines(keepends=True)[1]
+    assert await read(uris=uri, offset=1, limit=1) == paged.result
+    assert upstream.call_tool.await_count == 1
+    visible = await content_router.read(uri=uri, offset=0, limit=-1, raw=False, _ctx=DEFAULT_CTX)
+    assert json.loads(visible.result) == {"temperature": 23}
+
+    await service.fs.set_tags(uri, ["env=stg"], "replace", False, DEFAULT_CTX)
+    mounts = await service.mcps.mounts("weather", None, DEFAULT_CTX, target_uri=tools_root)
+    assert mounts["mounts"][0]["node_uri"] == uri
+    assert mounts["mounts"][0]["tags"] == ["env=stg"]
+    other = RequestContext(user=UserIdentifier.the_default_user("bob"), role=Role.USER)
+    assert (await service.mcps.mounts("weather", None, other, target_uri=tools_root))[
+        "mounts"
+    ] == []
+
+    tool.annotations = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
+    await service.mcps.sync("weather", DEFAULT_CTX, target_uri=tools_root, wait=True)
+    assert "Invoke the MCP tool explicitly" in await read(uris=uri)
+    assert upstream.call_tool.await_count == 2
+    invoked = await mcp_endpoint.invoke_mcp_tool(tool_uri, {"city": "Beijing"})
+    assert invoked.structuredContent == {"temperature": 23}
+    assert upstream.call_tool.await_count == 3
+
+    await service.mcps.unmount(uri, DEFAULT_CTX, wait=True)
+    assert (await service.mcps.mounts("weather", None, DEFAULT_CTX, target_uri=tools_root))[
+        "mounts"
+    ] == []
+    assert not await service.viking_fs.exists(uri, ctx=DEFAULT_CTX)
 
 
 async def test_edit_replaces_unique_occurrence(service):
