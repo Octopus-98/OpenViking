@@ -1389,7 +1389,9 @@ class CompileLifecycle:
                         error_message="Compile target was deleted",
                     )
                 elif run["started_at"] is None or run["status"] == "completed":
-                    pass  # Unstarted and unchanged runs have no output to publish.
+                    # Unstarted and unchanged runs have no output to publish.
+                    if snapshot.status == "failed":
+                        run["error"] = snapshot.error_message or snapshot.status
                 elif snapshot.status == "completed":
                     from openviking.server.dependencies import get_service
                     from openviking.service.reindex_executor import REINDEX_ENQUEUE_ERROR
