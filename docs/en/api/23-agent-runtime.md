@@ -18,9 +18,7 @@ Agent Runtime Server executes Agent tasks and currently supports Compile. Applic
 | `to` | string | Yes | - | Target Resource or Memory directory, or a supported Skill namespace |
 | `skill` | string | Yes | - | Skill directory or its `SKILL.md` URI |
 | `instruction` | string | No | Skill-driven default | Additional instructions for this Compile run |
-| `args` | object | No | - | Execution backend extensions and Compile scheduling controls; `model_name` accepts a model endpoint ID |
-
-The entire `args` object is optional, and the model endpoint ID is not a top-level field. Use `args.model_name` to select a model; when omitted, the execution backend uses its default model configuration.
+| `args` | object | No | - | Execution backend extensions and Compile scheduling controls |
 
 The scheduling controls `auto_update` and `update_schedule` are handled by OpenViking. The Python example uses `SyncHTTPClient`; await `compile()` with `AsyncHTTPClient`.
 
@@ -39,8 +37,7 @@ curl -X POST http://localhost:1933/api/v1/compile \
     "from": ["viking://resources/research"],
     "to": "viking://resources/research-wiki",
     "skill": "viking://user/default/skills/research-compiler",
-    "instruction": "Track the historical progress and preserve supporting evidence.",
-    "args": {"model_name": "your-model-endpoint-id"}
+    "instruction": "Track the historical progress and preserve supporting evidence."
   }'
 ```
 
@@ -82,8 +79,7 @@ ov compile \
   --from viking://resources/research \
   --to viking://resources/research-wiki \
   --skill viking://user/default/skills/research-compiler \
-  --instruction "Track the historical progress and preserve supporting evidence." \
-  --args '{"model_name":"your-model-endpoint-id"}'
+  --instruction "Track the historical progress and preserve supporting evidence."
 ```
 
 `--args` must be a JSON object. Immediate submissions return a task ID; schedule saves return the next run time.
@@ -99,7 +95,6 @@ task = client.compile(
     ["viking://resources/research"],
     "viking://resources/research-wiki",
     "viking://user/default/skills/research-compiler",
-    {"args": {"model_name": "your-model-endpoint-id"}},
 )
 ```
 
@@ -108,7 +103,6 @@ const task = await client.compile(
   ["viking://resources/research"],
   "viking://resources/research-wiki",
   "viking://user/default/skills/research-compiler",
-  { args: { model_name: "your-model-endpoint-id" } },
 );
 ```
 
@@ -118,9 +112,7 @@ task, err := client.Compile(
     []string{"viking://resources/research"},
     "viking://resources/research-wiki",
     "viking://user/default/skills/research-compiler",
-    &openviking.CompileOptions{
-        Args: map[string]any{"model_name": "your-model-endpoint-id"},
-    },
+    nil,
 )
 ```
 
@@ -269,8 +261,7 @@ Idempotency-Key: <OV task_id>
     "from": ["viking://resources/research"],
     "to": "viking://resources/research-wiki",
     "skill": "viking://agent/skills/wiki",
-    "instruction": "Organize the sources into a knowledge base.",
-    "args": {"model_name": "your-model-endpoint-id"}
+    "instruction": "Organize the sources into a knowledge base."
   }
 }
 ```
