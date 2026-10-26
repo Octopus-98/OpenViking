@@ -266,6 +266,56 @@ async def test_disabled_account_cached_policy_no_business_io(engine):
     e.fs._async_agfs.pathlock_acquire_tree.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_expiry_echo_tracks_shared_peer_policy_without_filesystem_io(engine, monkeypatch):
+    from openviking.server.identity import RequestContext, Role
+    from openviking.ttl import wiring
+    from openviking_cli.session.user_id import UserIdentifier
+
+    e = engine
+    e.writer = False  # Reader echoes policies without starting maintenance work.
+    e.pair = (TTLConfig(sessions=30, peer_events=30), TTLConfig(sessions=14, peer_events=14))
+    ctx = RequestContext(user=UserIdentifier("a", "u"), role=Role.ROOT)
+    monkeypatch.setattr(wiring, "_adapter", e)
+    session = "viking://user/u/sessions/one"
+    peers = [f"viking://user/u/peers/{p}/memories/events/2026/01/01" for p in ("p1", "p2")]
+    user_event = "viking://user/u/memories/events/2026/01/01"
+    missing = "viking://user/u/sessions/unregistered"
+    await e.redis.zadd(e.prefix("a") + "sessions", {session: 1767225600000})
+    e.redis.zmscore = Mock(wraps=e.redis.zmscore)
+    e.fs.read_file = AsyncMock(side_effect=AssertionError("echo read a cached UserConfig"))
+    for policy, session_date, peer_date in (
+        (TTLConfig(sessions=3, peer_events=7, user_events=60), "01-04", "01-08"),
+        (TTLConfig(sessions=5, peer_events=2, user_events=60), "01-06", "01-03"),
+        (TTLConfig(sessions="disabled", peer_events="disabled", user_events=60), None, None),
+        (TTLConfig(user_events=60), "01-15", "01-15"),  # Removed overrides inherit Account.
+    ):
+        await e.publish_user_configuration(ctx, policy)
+        e.redis.zmscore.reset_mock()
+        entries = [
+            {"uri": uri}
+            for uri in [session, session + "/messages.jsonl", *peers, user_event, missing]
+        ]
+        await wiring.attach_expires_at(entries, ctx)
+        expected = [
+            f"2026-{session_date}T00:00:00Z" if session_date else None,
+            f"2026-{session_date}T00:00:00Z" if session_date else None,
+            f"2026-{peer_date}T00:00:00Z" if peer_date else None,
+            f"2026-{peer_date}T00:00:00Z" if peer_date else None,
+            "2026-03-02T00:00:00Z",
+            None,
+        ]
+        assert [entry["expires_at"] for entry in entries] == expected
+        if session_date:
+            e.redis.zmscore.assert_called_once_with(e.prefix("a") + "sessions", [session, missing])
+        else:
+            e.redis.zmscore.assert_not_called()
+    e.fs.stat.assert_not_called()
+    e.fs.ls.assert_not_called()
+    e.fs.read_file.assert_not_called()
+    assert e._task is None and not e._retry
+
+
 def test_event_dates_follow_writer_timezone(monkeypatch):
     import time
 

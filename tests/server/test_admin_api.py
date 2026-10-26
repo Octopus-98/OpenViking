@@ -4318,6 +4318,9 @@ async def test_user_ttl_reuses_settings_backup_and_sparse_type_patch(
         headers=root_headers(),
     )
     assert created.status_code == 200, created.text
+    await lightweight_admin_app.state.fake_service.runtime_config_manager.patch_account(
+        "ttl-user", {"ttl": {"peer_events": 14}}
+    )
     url = "/api/v1/admin/accounts/ttl-user/users/alice/settings"
     response = await lightweight_admin_client.patch(
         url,
@@ -4358,6 +4361,19 @@ async def test_user_ttl_reuses_settings_backup_and_sparse_type_patch(
     fs = lightweight_admin_app.state.fake_service.viking_fs
     backup = json.loads(fs.files[user_config_backup_uri(user_ctx)])
     assert backup["ttl"]["peer_events"] == 3
+    for policy, expected in (("disabled", "disabled"), (None, 14)):
+        changed = await lightweight_admin_client.patch(
+            url, json={"ttl": {"peer_events": policy}}, headers=root_headers()
+        )
+        assert changed.status_code == 200, changed.text
+        for path in ("viking://user/alice/peers", "viking://user/alice/peers/p2/memories/events"):
+            queried = await lightweight_admin_client.get(
+                "/api/v1/admin/accounts/ttl-user/configuration",
+                params={"path": path},
+                headers=root_headers(),
+            )
+            assert queried.status_code == 200, queried.text
+            assert queried.json()["result"]["effective_policy"] == expected
     # Existing memory-policy PATCH still replaces the whole policy; TTL is sparse.
     for policy in (
         {"self": {"enabled": False}, "memory_types": ["profile"]},
@@ -4377,7 +4393,7 @@ async def test_user_ttl_reuses_settings_backup_and_sparse_type_patch(
     )
     assert response.status_code == 503 and fs.files == before
     adapter.prepare_user_configuration.side_effect = None
-    assert adapter.publish_user_configuration.await_count == 2
+    assert adapter.publish_user_configuration.await_count == 4
     monkeypatch.setattr(wiring, "_adapter", None)
     response = await lightweight_admin_client.patch(url, json={"ttl": None}, headers=root_headers())
     assert response.status_code == 501 and fs.files == before
