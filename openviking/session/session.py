@@ -1313,6 +1313,7 @@ class Session:
         record_idle_commit_success: bool = False,
         event_tags: Optional[List[str]] = None,
         reset_context: bool = False,
+        lock_timeout_secs: float = _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
     ) -> Dict[str, Any]:
         """Archive immediately and enqueue restart-safe Phase 2 processing.
 
@@ -1346,6 +1347,7 @@ class Session:
                 to event memories. ``None`` uses the session default
                 (``meta.event_search_tags``); an empty list disables default-tag
                 injection for this commit; a non-empty list overrides it.
+            lock_timeout_secs: Maximum wait to acquire the Phase 1 lock.
 
         Returns a task_id for tracking Phase 2 progress.
         """
@@ -1421,7 +1423,9 @@ class Session:
         # state and archive-number allocation. Child files use their own exact
         # locks, so Phase 2 can keep writing an earlier archive concurrently.
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(session_path)
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
+            session_path, timeout_secs=lock_timeout_secs
+        )
         try:
             self._messages = await self._read_live_messages_strict()
             await self._load_meta()
