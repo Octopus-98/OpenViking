@@ -70,7 +70,7 @@ from openviking_cli.exceptions import (
     NotFoundError,
 )
 from openviking_cli.session.user_id import UserIdentifier
-from openviking_cli.utils import get_logger
+from openviking_cli.utils import VikingURI, get_logger
 
 logger = get_logger(__name__)
 
@@ -1888,13 +1888,16 @@ class CompileVersions:
     async def owning_target(
         self, account_id: str, uri: str, *, metadata_lease: Any = None
     ) -> Optional[Dict[str, Any]]:
-        """Return the active target containing ``uri``, including its first run."""
-        for item in await self._store.list_summaries(account_id, metadata_lease):
-            to = item.get("to") or ""
-            if item.get("status") == "active" and (uri == to or uri.startswith(f"{to}/")):
-                record = await self._store.get(account_id, item["to"])
-                if record is not None:
-                    return record
+        """Find an active target by URI ancestry; return None when none contains ``uri``."""
+        # Mutation hooks strip trailing slashes from the root URI.
+        if not uri.startswith("viking://"):
+            return None
+        candidate: Optional[VikingURI] = VikingURI(uri)
+        while candidate is not None and candidate.scope:
+            record = await self._store.get_by_to(account_id, str(candidate))
+            if record is not None:
+                return record
+            candidate = candidate.parent
         return None
 
     async def record_operation(
@@ -1915,7 +1918,16 @@ class CompileVersions:
         """
         entries = []
         operation_id = f"op_{uuid4().hex}"
-        for target in await self._store.list_summaries(ctx.account_id):
+        if recursive:
+            targets = await self._store.list_summaries(ctx.account_id)
+        else:
+            by_to = {}
+            for uri in dict.fromkeys(uris):
+                record = await self.owning_target(ctx.account_id, uri)
+                if record is not None:
+                    by_to[record["to"]] = summarize(record)
+            targets = list(by_to.values())
+        for target in targets:
             to = target["to"]
             affected = [uri for uri in uris if uri == to or uri.startswith(f"{to}/")]
             if recursive and any(uri == "viking://" or overlaps(uri, to) for uri in uris):

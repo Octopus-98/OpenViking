@@ -18,9 +18,7 @@ Agent Runtime Server 负责执行 Agent 任务，当前支持 Compile。应用�
 | `to` | string | 是 | - | 目标 Resource 或 Memory 目录，或受支持的 Skill namespace |
 | `skill` | string | 是 | - | Skill 目录或其 `SKILL.md` URI |
 | `instruction` | string | 否 | Skill 驱动的默认值 | 本次 Compile 的补充指令 |
-| `args` | object | 否 | - | 执行端扩展参数和 Compile 调度控制字段；`model_name` 可传模型 Endpoint ID |
-
-`args` 整体可省略，模型 Endpoint ID 也不是顶层字段。需要指定模型时使用 `args.model_name`；不传时由执行端使用其默认模型配置。
+| `args` | object | 否 | - | 执行端扩展参数和 Compile 调度控制字段 |
 
 调度控制字段 `auto_update` 和 `update_schedule` 由 OpenViking 处理。Python 示例使用 `SyncHTTPClient`；使用 `AsyncHTTPClient` 时需 `await compile()`。
 
@@ -39,8 +37,7 @@ curl -X POST http://localhost:1933/api/v1/compile \
     "from": ["viking://resources/research"],
     "to": "viking://resources/research-wiki",
     "skill": "viking://user/default/skills/research-compiler",
-    "instruction": "追踪历史进展，并保留支撑证据。",
-    "args": {"model_name": "your-model-endpoint-id"}
+    "instruction": "追踪历史进展，并保留支撑证据。"
   }'
 ```
 
@@ -82,8 +79,7 @@ ov compile \
   --from viking://resources/research \
   --to viking://resources/research-wiki \
   --skill viking://user/default/skills/research-compiler \
-  --instruction "追踪历史进展，并保留支撑证据。" \
-  --args '{"model_name":"your-model-endpoint-id"}'
+  --instruction "追踪历史进展，并保留支撑证据。"
 ```
 
 `--args` 必须是 JSON object。立即编译返回 Task ID；保存计划返回下次执行时间。
@@ -99,7 +95,6 @@ task = client.compile(
     ["viking://resources/research"],
     "viking://resources/research-wiki",
     "viking://user/default/skills/research-compiler",
-    {"args": {"model_name": "your-model-endpoint-id"}},
 )
 ```
 
@@ -108,7 +103,6 @@ const task = await client.compile(
   ["viking://resources/research"],
   "viking://resources/research-wiki",
   "viking://user/default/skills/research-compiler",
-  { args: { model_name: "your-model-endpoint-id" } },
 );
 ```
 
@@ -118,9 +112,7 @@ task, err := client.Compile(
     []string{"viking://resources/research"},
     "viking://resources/research-wiki",
     "viking://user/default/skills/research-compiler",
-    &openviking.CompileOptions{
-        Args: map[string]any{"model_name": "your-model-endpoint-id"},
-    },
+    nil,
 )
 ```
 
@@ -269,8 +261,7 @@ Idempotency-Key: <OV task_id>
     "from": ["viking://resources/research"],
     "to": "viking://resources/research-wiki",
     "skill": "viking://agent/skills/wiki",
-    "instruction": "整理成知识库",
-    "args": {"model_name": "your-model-endpoint-id"}
+    "instruction": "整理成知识库"
   }
 }
 ```

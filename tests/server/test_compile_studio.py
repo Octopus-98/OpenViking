@@ -21,6 +21,40 @@ from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("file_count", [1, 100])
+async def test_ordinary_writes_do_not_scan_compile_targets(monkeypatch, file_count):
+    """Single and batch writes probe related paths without reading unrelated targets."""
+    from openviking.service.compile_targets import CompileVersions, new_record
+
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    agfs = _FakeAgfs()
+    store = CompileStateStore(agfs)
+    for index in range(100):
+        target = f"viking://resources/wiki{index}"
+        agfs.write(store._record_path(ctx.account_id, target), json.dumps(new_record(target)))
+    versions = CompileVersions(store, SimpleNamespace())
+    monkeypatch.setattr(
+        store, "list_summaries", AsyncMock(side_effect=AssertionError("Unexpected target scan"))
+    )
+    reads = AsyncMock(wraps=store.read_json)
+    monkeypatch.setattr(store, "read_json", reads)
+    uris = [f"viking://resources/wiki0_other/page{index}.md" for index in range(file_count)]
+    write = AsyncMock(return_value="written")
+
+    async def operation():
+        return await versions.record_write(uris, ctx, "manual", write=write)
+
+    assert await versions.record_operation(uris, ctx, "manual_revise", {}, operation) == "written"
+    write.assert_awaited_once()
+    assert reads.await_count <= 6 * file_count
+    for uri in ("viking://", "viking:"):
+        assert await versions.owning_target(ctx.account_id, uri) is None
+    assert (await versions.owning_target(ctx.account_id, "viking://resources/wiki0/page.md"))[
+        "to"
+    ] == "viking://resources/wiki0"
+
+
 def test_compile_accepts_builtin_example_skill():
     from openviking.service.compile_service import CompileRequest, CompileService
     from openviking_cli.utils.config.open_viking_config import CompileApiConfig
