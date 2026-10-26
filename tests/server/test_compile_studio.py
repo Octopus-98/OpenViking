@@ -440,6 +440,31 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     initial_history = await service.compile.list_operations(target, ctx, limit=20, cursor=None)
     assert initial_history["operations"][0]["conflicts_num"] == 2
     assert counter.await_count == 1
+    conflict_page = await client.get(
+        "/api/v1/compile/conflicts", params={"uri": target, "offset": 2, "limit": 2}
+    )
+    assert conflict_page.status_code == 200, conflict_page.text
+    assert conflict_page.json()["result"] == {
+        "conflicts_num": 2,
+        "conflicts": [
+            {"state": "unfixed", "uri": retained},
+            {"state": "fixed", "uri": retained},
+        ],
+        "has_more": False,
+    }
+    file_page = await client.get(
+        "/api/v1/compile/files", params={"uri": target, "offset": 0, "limit": 1}
+    )
+    assert file_page.status_code == 200, file_page.text
+    listing = file_page.json()["result"]
+    assert listing["total"] == 6 and listing["has_more"] is True
+    assert len(listing["files"]) == 1
+    assert listing["files"][0]["uri"] == f"{target}/conflicts.md"
+    assert listing["files"][0]["relative_dir"] == "/"
+    index = await service.compile.lifecycle.versions.load(
+        ctx.account_id, target, f"{target}/conflicts.md"
+    )
+    assert listing["files"][0]["current_version"] == index["versions"][-1]["version_id"]
     recovery = await client.get("/api/v1/compile/submissions/compile-initial-key")
     assert recovery.json()["result"]["task_id"] == first
     assert isinstance((await client.get("/api/v1/tasks")).json()["result"], list)
