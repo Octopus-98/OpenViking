@@ -41,6 +41,7 @@ from openviking.scheduling.expiry.redis_store import create_redis_client
 from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
+from openviking.storage.abstract_overview import ABSTRACT_OVERVIEW_FILENAMES
 from openviking.ttl.adapter import TTLBackfillRequest, TTLRecycleRequest, TTLRecycleResult
 from openviking_cli.exceptions import (
     ConflictError,
@@ -121,6 +122,8 @@ def directory(uri: str) -> TTLDirectory | None:
     if len(parts) < root_depth + unit_depth:
         return None
     date_parts = parts[root_depth : root_depth + unit_depth]
+    if kind == "sessions" and date_parts[0] in ABSTRACT_OVERVIEW_FILENAMES:
+        return None
     if kind != "sessions":
         if not re.fullmatch(r"\d{4}/\d{2}/\d{2}", "/".join(date_parts)):
             return None

@@ -16,6 +16,50 @@ from openviking_cli.utils.config.ttl_config import TTLConfig
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
+async def test_user_directory_initialization_skips_ttl_sidecars(tmp_path, monkeypatch, enabled):
+    from unittest.mock import AsyncMock
+
+    from openviking.core.directories import DirectoryInitializer
+    from openviking.ttl import wiring
+    from openviking.ttl.runtime import directory
+
+    fs = VikingFS(
+        agfs=create_agfs_client(
+            RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="local"))
+        )
+    )
+    engine = DirectoryTTL(resource_id="user-initialization")
+    pair = (TTLConfig(sessions=7) if enabled else TTLConfig(), None)
+    engine.bind_runtime(
+        SimpleNamespace(
+            viking_fs=fs,
+            runtime_config_manager=SimpleNamespace(resolve_account=AsyncMock(return_value=pair)),
+        ),
+        None,
+    )
+    engine.client = AsyncMock(side_effect=AssertionError("preset metadata used TTL Redis"))
+    monkeypatch.setattr(wiring, "_adapter", engine)
+    install_ttl_hook(fs, engine)
+    stat = AsyncMock(wraps=fs.stat)
+    monkeypatch.setattr(fs, "stat", stat)
+    db = SimpleNamespace(get=AsyncMock(return_value=[]), enqueue_embedding_msg=AsyncMock())
+    ctx = engine.context("a")
+    root = "viking://user/ttl-internal/sessions"
+    try:
+        assert await DirectoryInitializer(db, fs).initialize_user_directories(ctx) > 0
+        for name in (".abstract.md", ".overview.md"):
+            assert await fs.read_file(root + "/" + name, ctx=ctx)
+            assert directory(root + "/" + name) is None
+            assert directory(root + "/real-session/" + name)[2] == root + "/real-session"
+        assert not any(call.args[0].endswith("/messages.jsonl") for call in stat.await_args_list)
+        engine.client.assert_not_called()
+        assert engine._task is None and not engine._retry
+    finally:
+        await engine.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.skipif(not os.environ.get("TTL_TEST_REDIS"), reason="requires an isolated local Redis")
 async def test_real_queue_writes_keep_ttl_on_service_loop(tmp_path, enabled):
     import asyncio
