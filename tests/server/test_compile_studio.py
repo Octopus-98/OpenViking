@@ -456,17 +456,24 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
             {**summary, "to": f"{target}_{suffix}", "status": "deleted"}
             for suffix in ("-1", "0a", "2")
         )
-        patch.setattr(store, "list_summaries", AsyncMock(return_value=summaries))
+        summaries.sort(key=lambda item: hashlib.sha256(item["to"].encode()).hexdigest())
+
+        async def iter_summaries(_account_id, *, cursor=None):
+            start = next((i + 1 for i, item in enumerate(summaries) if item["to"] == cursor), 0)
+            for item in summaries[start:]:
+                yield item
+
+        patch.setattr(store, "iter_summaries", iter_summaries)
         p = (await client.get("/api/v1/compile/configs?limit=1")).json()["result"]
-        assert [item["to"] for item in p["targets"]] == [f"{target}_0"]
+        assert [item["to"] for item in p["targets"]] == [f"{target}_1"]
         assert "target_id" not in p["targets"][0]
-        assert p["next_cursor"] == f"{target}_0"
+        assert p["next_cursor"] == f"{target}_1"
         p = (
             await client.get(
-                "/api/v1/compile/configs", params={"limit": 1, "cursor": f"{target}_0"}
+                "/api/v1/compile/configs", params={"limit": 1, "cursor": p["next_cursor"]}
             )
         ).json()["result"]
-        assert [item["to"] for item in p["targets"]] == [f"{target}_1"]
+        assert [item["to"] for item in p["targets"]] == [f"{target}_0"]
         assert p["next_cursor"] is None
         summaries[:] = [item for item in summaries if item["status"] == "deleted"]
         p = (await client.get("/api/v1/compile/configs?limit=1")).json()["result"]
