@@ -1739,6 +1739,14 @@ class CompileVersions:
         # Mutation hooks strip trailing slashes from the root URI.
         if not uri.startswith("viking://"):
             return None
+        classification = classify_uri(uri)
+        content_index = classification.content_index
+        # System assets and rule memories are outside Compile target ownership.
+        if classification.is_system or (
+            content_index is not None
+            and classification.parts[content_index : content_index + 2] == ("memories", "rules")
+        ):
+            return None
         candidate: Optional[VikingURI] = VikingURI(uri)
         while candidate is not None and candidate.scope:
             record = await self._store.get_by_to(account_id, str(candidate))
