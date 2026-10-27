@@ -158,7 +158,7 @@ Imports a `.ovpack` file to a specified location for restoring or migrating data
 | on_conflict | string | No | fail | Conflict policy: `fail`, `overwrite`, or `skip` |
 | vector_mode | string | No | auto | Vector handling: `auto`, `recompute`, or `require` |
 
-**Permission Requirements**: ROOT, ADMIN, or USER
+**Permission Requirements**: ROOT, ADMIN, or USER. When ACL is enabled, every shared-resource import requires `manage` on the target; new targets inherit their parent’s permissions.
 
 **Behavior Notes**:
 - The API no longer accepts `vectorize` or `force`.

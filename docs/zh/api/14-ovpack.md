@@ -158,7 +158,7 @@ ov export viking://resources/my-project/ ./exports/my-project.ovpack --include-v
 | on_conflict | string | 否 | fail | 冲突策略：`fail`、`overwrite` 或 `skip` |
 | vector_mode | string | 否 | auto | 向量处理方式：`auto`、`recompute` 或 `require` |
 
-**权限要求**：ROOT、ADMIN 或 USER
+**权限要求**：ROOT、ADMIN 或 USER；开启 ACL 时，所有共享资源导入均要求目标的 `manage` 权限，新建目标按父目录继承权限判断。
 
 **行为说明**：
 - API 已不再接受 `vectorize` 或 `force`。

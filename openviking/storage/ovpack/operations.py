@@ -16,6 +16,7 @@ from openviking.core.namespace import (
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
+from openviking.storage.acl import AclAction
 from openviking.storage.index_consistency import check_index_consistency
 from openviking.storage.ovpack.format import (
     OVPACK_BACKUP_NAME,
@@ -69,7 +70,12 @@ from openviking.storage.ovpack.vectors import (
     restore_vector_snapshot,
 )
 from openviking.utils.embedding_utils import vectorize_directory_meta, vectorize_file
-from openviking_cli.exceptions import ConflictError, InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import (
+    ConflictError,
+    InvalidArgumentError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from openviking_cli.utils.logger import get_logger
 from openviking_cli.utils.uri import VikingURI
 
@@ -309,6 +315,13 @@ async def import_ovpack(
 
         index_records = validate_manifest_content(zf, manifest, infolist, base_name)
         dense_vectors = read_dense_vectors(zf, manifest, base_name, index_records)
+
+        # Check import authority without applying MANAGE's namespace-root deletion guard.
+        access = await viking_fs._can_access_many([root_uri], ctx, action=AclAction.MANAGE)
+        if not access[root_uri]:
+            raise PermissionDeniedError(
+                "OVPack import: manage permission required", resource=root_uri
+            )
 
         existing_roots = [root_uri] if await _root_exists(viking_fs, root_uri, ctx) else []
         if existing_roots:

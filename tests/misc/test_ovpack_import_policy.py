@@ -17,7 +17,7 @@ import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.pack_service import PackService
-from openviking.storage.acl import AclManager, AclMode
+from openviking.storage.acl import AclAction, AclManager, AclMode
 from openviking.storage.index_consistency import IndexConsistencyReport, IndexExpectation
 from openviking.storage.ovpack.operations import (
     backup_ovpack,
@@ -33,6 +33,9 @@ from tests.storage.test_transfer_merge_binding import indexed_fs as indexed_fs
 
 class FakeVikingFS:
     def __init__(self, existing_roots: set[str] | None = None) -> None:
+        self._can_access_many = AsyncMock(
+            side_effect=lambda uris, ctx, **kwargs: dict.fromkeys(uris, True)
+        )
         self.written_files: list[str] = []
         self.created_dirs: list[str] = []
         self.tree_calls: list[str] = []
@@ -945,6 +948,18 @@ async def test_import_ovpack_restores_required_dense_vector_snapshot(
 
     fake_fs = FakeVikingFS()
     vector_store = FakeVectorStore()
+    root_uri = "viking://resources/imported/demo"
+    fake_fs._can_access_many.side_effect = None
+    fake_fs._can_access_many.return_value = {root_uri: False}
+    with pytest.raises(PermissionDeniedError, match="manage permission required"):
+        await import_ovpack(
+            fake_fs, str(temp_ovpack_path), "viking://resources/imported", request_ctx
+        )
+    assert fake_fs.written_files == fake_fs.removed_roots == fake_fs.created_dirs == []
+    fake_fs._can_access_many.assert_awaited_once_with(
+        [root_uri], request_ctx, action=AclAction.MANAGE
+    )
+    fake_fs._can_access_many.return_value = {root_uri: True}
     result = await import_ovpack(
         fake_fs,
         str(temp_ovpack_path),
