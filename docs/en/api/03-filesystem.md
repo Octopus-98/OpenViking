@@ -420,6 +420,7 @@ Get logical extended attributes for a file or directory.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | uri | str | Yes | - | Viking URI |
+| include_acl | bool | No | false | HTTP query parameter: include `attrs.acl` for account ADMIN requests to shared resources |
 
 
 **Python SDK (HTTP)**
@@ -451,6 +452,7 @@ fmt.Println(metadata["tags"])
 
 ```
 GET /api/v1/fs/attrs?uri={uri}
+GET /api/v1/fs/attrs?uri={uri}&include_acl=true
 POST /api/v1/fs/attrs/set_tags
 ```
 
@@ -458,11 +460,18 @@ POST /api/v1/fs/attrs/set_tags
 curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/api.md" \
   -H "X-API-Key: your-key"
 
+curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/api.md&include_acl=true" \
+  -H "X-API-Key: your-admin-key"
+
 curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -H "X-API-Key: your-key" \
   -H "Content-Type: application/json" \
   -d '{"uri":"viking://resources/docs","tags":["team=search"],"mode":"append","recursive":true}'
 ```
+
+With `include_acl=true`, an account `ADMIN` querying a shared resource under `viking://resources/...` also receives `result.attrs.acl`. Its value is the same report returned in `result` by [GET /api/v1/acl](12-acl.md): `uri`, `acl_mode`, `direct_entries`, `inherited_entries`, and `effective_entries`.
+
+The `acl` field is omitted when the parameter is absent or false, the caller has any other role (including `ROOT` and ordinary users with `manage` permission), or the URI is outside shared resources. Normal resource access checks still apply.
 
 **CLI**
 

@@ -4,6 +4,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
@@ -20,7 +21,7 @@ from openviking.server.routers import filesystem
 from openviking.service.fs_service import ListingPage
 from openviking.storage.queuefs.queue_manager import get_queue_manager
 from openviking.system_assets import builtin_memory_templates_dir
-from openviking_cli.exceptions import InvalidURIError
+from openviking_cli.exceptions import InvalidURIError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -312,6 +313,153 @@ async def test_system_attrs_returns_empty_tags_without_querying_vector_store(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "include_acl", "is_dir", "expect_acl"),
+    [
+        (Role.ADMIN, "true", False, True),
+        (Role.ADMIN, "true", True, True),
+        (Role.ADMIN, "false", False, False),
+        (Role.ADMIN, None, False, False),
+        (Role.USER, "true", False, False),
+        (Role.ROOT, "true", False, False),
+    ],
+)
+async def test_http_attrs_acl_is_opt_in_and_admin_only(
+    monkeypatch, role, include_acl, is_dir, expect_acl
+):
+    uri = "viking://resources/docs" if is_dir else "viking://resources/docs/api.md"
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=role)
+    acl = {
+        "uri": uri,
+        "acl_mode": "inherit",
+        "direct_entries": [{"principal": "user:bob", "level": "read"}],
+        "inherited_entries": [{"principal": "group:editors", "level": "write"}],
+        "effective_entries": [
+            {"principal": "group:editors", "level": "write"},
+            {"principal": "user:bob", "level": "read"},
+        ],
+    }
+    stat = AsyncMock(return_value={"isDir": is_dir})
+    get_acl = AsyncMock(return_value=acl)
+    vector_filter = AsyncMock(
+        return_value=[{"level": 0 if is_dir else 2, "search_tags": ["team=search"]}]
+    )
+    monkeypatch.setattr(
+        filesystem,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(stat=stat, get_acl=get_acl),
+            vikingdb_manager=SimpleNamespace(filter=vector_filter),
+        ),
+    )
+    app = FastAPI()
+    app.include_router(filesystem.router)
+    app.dependency_overrides[get_request_context] = lambda: ctx
+    params = {"uri": uri}
+    if include_acl is not None:
+        params["include_acl"] = include_acl
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.get("/api/v1/fs/attrs", params=params)
+
+    assert response.status_code == 200, response.text
+    expected_attrs: dict[str, Any] = {"tags": ["team=search"]}
+    if expect_acl:
+        expected_attrs["acl"] = acl
+        get_acl.assert_awaited_once_with(uri, ctx=ctx)
+    else:
+        get_acl.assert_not_awaited()
+    assert response.json()["result"] == {
+        "uri": uri,
+        "context_type": "resource",
+        "attrs": expected_attrs,
+    }
+    stat.assert_awaited_once_with(uri, ctx=ctx, skip_count=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "viking://user/alice/resources/notes.md",
+        "viking://system/memory/memory_templates/custom/demo.md",
+    ],
+)
+async def test_http_attrs_admin_omits_acl_outside_shared_resources(monkeypatch, uri):
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=Role(Role.ADMIN))
+    stat = AsyncMock(return_value={"isDir": False})
+    get_acl = AsyncMock()
+    monkeypatch.setattr(
+        filesystem,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(stat=stat, get_acl=get_acl)),
+    )
+    app = FastAPI()
+    app.include_router(filesystem.router)
+    app.dependency_overrides[get_request_context] = lambda: ctx
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.get("/api/v1/fs/attrs", params={"uri": uri, "include_acl": "true"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == {
+        "uri": uri,
+        "context_type": "resource",
+        "attrs": {"tags": []},
+    }
+    get_acl.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attrs_admin_direct_call_defaults_to_omitting_acl(monkeypatch):
+    get_acl = AsyncMock()
+    monkeypatch.setattr(
+        filesystem,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(stat=AsyncMock(return_value={"isDir": False}), get_acl=get_acl)
+        ),
+    )
+
+    response = await filesystem.attrs(
+        uri="viking://resources/docs/api.md",
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role(Role.ADMIN)),
+    )
+
+    assert response.result["attrs"] == {"tags": []}
+    get_acl.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_http_attrs_include_acl_preserves_access_check(monkeypatch):
+    uri = "viking://resources/docs/api.md"
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=Role(Role.ADMIN))
+    get_acl = AsyncMock()
+    monkeypatch.setattr(
+        filesystem,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(
+                stat=AsyncMock(side_effect=PermissionDeniedError("Access denied", resource=uri)),
+                get_acl=get_acl,
+            )
+        ),
+    )
+    app = FastAPI()
+    app.include_router(filesystem.router)
+    app.dependency_overrides[get_request_context] = lambda: ctx
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        with pytest.raises(PermissionDeniedError, match="Access denied"):
+            await client.get("/api/v1/fs/attrs", params={"uri": uri, "include_acl": "true"})
+
+    get_acl.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("role", [Role.USER, Role.ADMIN, Role.ROOT])
 async def test_mkdir_echoes_canonical_home_alias(monkeypatch, role):
     seen = {}
@@ -504,10 +652,13 @@ async def test_service_startup_syncs_builtin_assets_and_custom_directory(service
     ctx = RequestContext(user=UserIdentifier("default", "default"), role=Role.ROOT)
     profile_uri = f"{SYSTEM_MEMORY_BUILTIN_ROOT}/profile.yaml"
 
-    assert await service.viking_fs.read_file_bytes(
-        profile_uri,
-        ctx=ctx,
-    ) == (builtin_memory_templates_dir() / "profile.yaml").read_bytes()
+    assert (
+        await service.viking_fs.read_file_bytes(
+            profile_uri,
+            ctx=ctx,
+        )
+        == (builtin_memory_templates_dir() / "profile.yaml").read_bytes()
+    )
     assert (
         await service.viking_fs.stat(
             SYSTEM_MEMORY_CUSTOM_ROOT,

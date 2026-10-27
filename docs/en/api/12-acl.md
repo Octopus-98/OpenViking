@@ -2,6 +2,8 @@
 
 ACL is queried and managed through the dedicated `/api/v1/acl` endpoints for shared resources under `viking://resources/...`. See [resource access control](../concepts/15-acl.md) for inheritance rules.
 
+Account `ADMIN` can also query shared-resource ACL alongside other attributes using [`GET /api/v1/fs/attrs?uri={uri}&include_acl=true`](03-filesystem.md#attrs), which adds the same ACL report at `result.attrs.acl`. ACL updates continue to use the dedicated endpoints below.
+
 ## Endpoints
 
 | Method | Path | Behavior |

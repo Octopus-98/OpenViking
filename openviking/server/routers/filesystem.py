@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Filesystem endpoints for OpenViking HTTP Server."""
 
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel
@@ -19,7 +19,7 @@ from openviking.server.identity import RequestContext
 from openviking.server.models import ListingResponse, Response
 from openviking.server.routers.content import SetTagsRequest
 from openviking.server.routers.content import set_tags as content_set_tags
-from openviking.storage.acl import AclSpec
+from openviking.storage.acl import AclSpec, has_implicit_manage
 from openviking.storage.expr import And, Eq, In
 from openviking.storage.vector_ids import is_vector_record_id
 from openviking.storage.vikingdb_manager import VikingDBManagerProxy
@@ -222,6 +222,9 @@ async def stat(
 @router.get("/attrs")
 async def attrs(
     uri: str = Query(..., description="Viking URI"),
+    include_acl: Annotated[
+        bool, Query(description="Include shared-resource ACL details for account admins")
+    ] = False,
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Get logical extended attributes for a URI."""
@@ -235,13 +238,15 @@ async def attrs(
             if namespace_policy.supports_tags
             else []
         )
-        result = {
+        result: dict[str, Any] = {
             "uri": uri,
             "context_type": context_type_for_uri(uri),
             "attrs": {"tags": tags},
         }
         if result["context_type"] == "memory" and not stat_result.get("isDir", False):
             result["attrs"]["memory"] = _clean_memory_attrs(await service.fs.read(uri, ctx=_ctx))
+        if include_acl and has_implicit_manage(_ctx, uri):
+            result["attrs"]["acl"] = await service.fs.get_acl(uri, ctx=_ctx)
         return Response(status="ok", result=result)
     except AGFSNotFoundError:
         raise NotFoundError(uri, "file")

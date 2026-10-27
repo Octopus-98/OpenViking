@@ -458,6 +458,7 @@ ov stat viking://resources/my-project/docs
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | uri | str | 是 | - | Viking URI |
+| include_acl | bool | 否 | false | HTTP 查询参数：账号 ADMIN 查询共享资源时额外返回 `attrs.acl` |
 
 
 **Python SDK (HTTP)**
@@ -489,6 +490,7 @@ fmt.Println(metadata["tags"])
 
 ```
 GET /api/v1/fs/attrs?uri={uri}
+GET /api/v1/fs/attrs?uri={uri}&include_acl=true
 POST /api/v1/fs/attrs/set_tags
 ```
 
@@ -496,11 +498,18 @@ POST /api/v1/fs/attrs/set_tags
 curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/api.md" \
   -H "X-API-Key: your-key"
 
+curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/api.md&include_acl=true" \
+  -H "X-API-Key: your-admin-key"
+
 curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -H "X-API-Key: your-key" \
   -H "Content-Type: application/json" \
   -d '{"uri":"viking://resources/docs","tags":["team=search"],"mode":"append","recursive":true}'
 ```
+
+传入 `include_acl=true` 时，账号 `ADMIN` 查询 `viking://resources/...` 下的共享资源会额外获得 `result.attrs.acl`。其内容与 [GET /api/v1/acl](12-acl.md) 的 `result` 相同，包含 `uri`、`acl_mode`、`direct_entries`（直接授权）、`inherited_entries`（继承授权）和 `effective_entries`（有效授权）。
+
+未传此参数或值为 false、调用者为其他角色（包括 `ROOT` 和具有 `manage` 权限的普通用户）、URI 不属于共享资源时，均省略 `acl` 字段。原有资源访问权限检查仍然生效。
 
 **CLI**
 
