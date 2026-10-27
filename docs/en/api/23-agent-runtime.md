@@ -140,6 +140,52 @@ Scheduled updates require `compile_api.scheduler_enabled=true` (default `false`)
 
 The history and output list endpoints accept optional query parameters `limit` (1–100, default 20) and `cursor`. Pass the returned `next_cursor` unchanged; `null` marks the last page.
 
+### Query directory conflicts and files
+
+Both endpoints recursively read non-hidden files. Required `uri` must identify an existing, readable `viking://` directory. Compile target registration and write access are not required.
+
+Shared pagination: `offset` skips records (default 0, ≥0); `limit` sets the page size (default 20, 1–100). When `has_more=true`, advance `offset` by the number of returned records. Pagination uses no cursor; directory changes can affect subsequent pages.
+
+| HTTP API | Result (`200 OK`) |
+|----------|-------------------|
+| `GET /api/v1/compile/conflicts?uri={uri}` | `conflicts` includes all states, preserving metadata and adding the file `uri`; `conflicts_num` counts only records with `state="unfixed"` across the queried directory |
+| `GET /api/v1/compile/files?uri={uri}` | `total` is the file count and `files` is the current page; `relative_dir` is the relative parent directory (`/` at the root), `current_version` is the latest recorded version (`null` if absent), and `updated_at` is the filesystem modification time, `modTime` |
+
+Results are ordered by file URI; conflicts within a file follow annotation order. Conflicts come from `CONFLICTS_CONTENT` HTML comments. Unreadable files and files with malformed metadata are skipped and excluded from the count.
+
+Example conflict response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "conflicts_num": 1,
+    "conflicts": [{"state": "unfixed", "uri": "viking://resources/wiki/page.md"}],
+    "has_more": false
+  }
+}
+```
+
+Example file response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "total": 1,
+    "files": [{
+      "uri": "viking://resources/wiki/page.md",
+      "relative_dir": "/",
+      "current_version": null,
+      "updated_at": "2026-10-27T08:00:00Z"
+    }],
+    "has_more": false
+  }
+}
+```
+
+A missing or invalid `uri`, a file URI, or out-of-range pagination returns HTTP 400 (`INVALID_ARGUMENT`). Missing or inaccessible directories retain normal filesystem errors.
+
 ### Check Compile availability
 
 ```http

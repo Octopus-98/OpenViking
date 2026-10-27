@@ -140,6 +140,52 @@ task, err := client.Compile(
 
 操作列表和产出列表接口均接受可选查询参数 `limit`（1–100，默认 20）和 `cursor`。翻页时原样传入返回的 `next_cursor`，其为 `null` 时表示最后一页。
 
+### 查询目录冲突与文件
+
+两个接口均只读，递归查询非隐藏文件。`uri` 必填，须为存在且有读取权限的目录 `viking://` URI，无需注册为 Compile 目标或具备写权限。
+
+共用分页参数：`offset` 为跳过的记录数（默认 0，≥0），`limit` 为每页条数（默认 20，1–100）。`has_more=true` 时，将 `offset` 加上本页返回条数继续查询；不使用游标，目录变化可能影响翻页结果。
+
+| HTTP API | 返回结果（`200 OK`） |
+|----------|---------------------|
+| `GET /api/v1/compile/conflicts?uri={uri}` | `conflicts` 包含所有状态的冲突记录，保留元数据并附加文件 `uri`；`conflicts_num` 仅统计整个查询目录中 `state="unfixed"` 的记录数 |
+| `GET /api/v1/compile/files?uri={uri}` | `total` 为文件总数，`files` 为当前页；`relative_dir` 是相对父目录（根目录为 `/`），`current_version` 是最新记录版本（无记录为 `null`），`updated_at` 为文件系统修改时间 `modTime` |
+
+结果按文件 URI 排序；同一文件的冲突按注释顺序排列。冲突取自 `CONFLICTS_CONTENT` HTML 注释，无法读取或元数据损坏的文件会跳过，不计入总数。
+
+冲突响应示例：
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "conflicts_num": 1,
+    "conflicts": [{"state": "unfixed", "uri": "viking://resources/wiki/page.md"}],
+    "has_more": false
+  }
+}
+```
+
+文件响应示例：
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "total": 1,
+    "files": [{
+      "uri": "viking://resources/wiki/page.md",
+      "relative_dir": "/",
+      "current_version": null,
+      "updated_at": "2026-10-27T08:00:00Z"
+    }],
+    "has_more": false
+  }
+}
+```
+
+缺少或无效的 `uri`、文件 URI、分页参数越界均返回 HTTP 400（`INVALID_ARGUMENT`）；目录不存在或无访问权限时沿用文件系统错误。
+
 ### 检查 Compile 可用性
 
 ```http
