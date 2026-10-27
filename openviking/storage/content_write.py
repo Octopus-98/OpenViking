@@ -154,6 +154,8 @@ class _LockedWriteTarget:
 
     preexisting: bool
     formal_snapshot: tuple[dict[str, FormalEntry], bool]
+    # Revision-checked text under the current lease; None means content is not read.
+    existing_raw: str | None = None
 
     @property
     def is_new_file(self) -> bool:
@@ -1917,7 +1919,6 @@ class ContentWriteCoordinator:
                 uri=uri,
             ) from exc
 
-        previous_content: Optional[str] = None
         lock_settled = False
         lock_guard = PathLockGuard(self._viking_fs._async_agfs, lease)
         try:
@@ -1926,7 +1927,8 @@ class ContentWriteCoordinator:
             )
             target_preexisting = target_state.preexisting
             is_new_file = target_state.is_new_file
-            if mode == "append" and target_preexisting:
+            previous_content = target_state.existing_raw
+            if mode == "append" and target_preexisting and previous_content is None:
                 previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
             final_bytes = self._render_final_bytes(
                 uri,
@@ -2147,10 +2149,12 @@ class ContentWriteCoordinator:
         try:
             # Preserve the public invariant that generated sidecars cannot be
             # materialized, while keeping the state check inside the exact lock.
-            await self._classify_locked_write_target(
+            target_state = await self._classify_locked_write_target(
                 uri, ctx=ctx, expected_sha256=expected_sha256, expected_absent=expected_absent
             )
-            previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
+            previous_content = target_state.existing_raw
+            if previous_content is None:
+                previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
             await self._write_in_place(
                 uri, content, mode=mode, ctx=ctx, lease_ref=lease, existing_raw=previous_content
             )
@@ -2324,6 +2328,7 @@ class ContentWriteCoordinator:
                 ctx=ctx,
                 lease_ref=lease,
                 is_new_file=target_state.is_new_file,
+                existing_raw=target_state.existing_raw,
             )
             result = self._build_write_result(
                 uri=uri,
@@ -2388,23 +2393,26 @@ class ContentWriteCoordinator:
         expected_sha256: str | None = None,
         expected_absent: bool = False,
     ) -> _LockedWriteTarget:
-        """Read target state exactly once after its exact write lock is held."""
+        """Classify a locked target and retain checked content for writes under the same lease."""
         stat = await self._safe_stat(uri, ctx=ctx, allow_not_found=True)
         preexisting = not stat.get("not_found")
+        existing_raw = None
         if not stat.get("isDir") or expected_absent:
-            await self._check_write_precondition(
+            checked = await self._check_write_precondition(
                 uri,
                 ctx=ctx,
                 exists=preexisting,
                 expected_sha256=expected_sha256,
                 expected_absent=expected_absent,
             )
+            if checked is not None:
+                existing_raw = self._viking_fs._decode_bytes(checked)
         if preexisting:
             if stat.get("isDir"):
                 raise InvalidArgumentError(
                     f"write only supports existing files, got directory: {uri}"
                 )
-            return _LockedWriteTarget(True, ({"": FormalEntry(is_dir=False)}, True))
+            return _LockedWriteTarget(True, ({"": FormalEntry(is_dir=False)}, True), existing_raw)
         if is_abstract_overview_uri(uri):
             raise InvalidArgumentError(f"cannot create generated abstract overview directly: {uri}")
         self._validate_create_extension(uri)
@@ -2537,6 +2545,7 @@ class ContentWriteCoordinator:
             context_type_for_uri(uri) == "memory"
             and not is_new_file
             and mode in {"replace", "append"}
+            and existing_raw is None
         ):
             existing_raw = await self._viking_fs.read_file(uri, ctx=ctx)
         elif (
@@ -2697,6 +2706,7 @@ class ContentWriteCoordinator:
                 "mode": mode,
                 "ctx": ctx,
                 "lease_ref": lease,
+                "existing_raw": target_state.existing_raw,
             }
             if is_new_file:
                 write_kwargs["is_new_file"] = True

@@ -1434,6 +1434,7 @@ async def write(
         mode=mode,
         wait=wait,
         acl=acl,
+        edit_source="agent",
         expected_sha256=expected_sha256,
         expected_absent=expected_absent,
     )
@@ -1488,7 +1489,13 @@ async def edit(
     if updated == current:
         return f"No changes: {uri} already matches the requested edit."
     result = await service.fs.write(
-        uri=uri, content=updated, ctx=ctx, mode="replace", wait=wait, expected_sha256=revision
+        uri=uri,
+        content=updated,
+        ctx=ctx,
+        mode="replace",
+        wait=wait,
+        edit_source="agent",
+        expected_sha256=revision,
     )
     written = result.get("written_bytes", 0)
     message = f"Edited {result.get('uri', uri)} ({written} bytes written)."
