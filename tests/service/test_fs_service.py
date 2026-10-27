@@ -5,7 +5,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -1092,6 +1092,46 @@ async def test_resource_mv_conflict_fails_before_resource_move(request_context):
 
     assert viking_fs.mv_calls == []
     assert watch_manager.rewrite_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_fails", [False, True])
+async def test_resource_mv_rolls_back_watch_commit_failure_without_compile(
+    request_context, rollback_fails
+):
+    """Watch commit failures retain their error chain while reversing the business move."""
+    source = "viking://resources/codeask/wiki"
+    destination = "viking://resources/codeask/wiki-renamed"
+    commit_error = RuntimeError("watch commit failed")
+    rollback_error = RuntimeError("reverse move failed")
+    viking_fs = _FakeVikingFS()
+    viking_fs.mv = AsyncMock(side_effect=[None, rollback_error if rollback_fails else None])
+    watch_manager = _FakeWatchManager()
+    watch_manager.rewrite_target_prefix_internal = AsyncMock(side_effect=commit_error)
+    service = FSService(
+        viking_fs=viking_fs,
+        watch_scheduler=_FakeWatchScheduler(watch_manager),
+    )
+    service.compile_versions = object()  # Compile callback access fails on this sentinel.
+    service._refresh_move_parents = AsyncMock()
+
+    with pytest.raises(RuntimeError) as caught:
+        await service.mv(source, destination, ctx=request_context)
+
+    viking_fs.mv.assert_has_awaits(
+        [
+            call(source, destination, ctx=request_context),
+            call(destination, source, ctx=request_context),
+        ]
+    )
+    assert viking_fs.mv.await_count == 2
+    watch_manager.rewrite_target_prefix_internal.assert_awaited_once_with(
+        source, destination, account_id=request_context.account_id
+    )
+    service._refresh_move_parents.assert_not_awaited()
+    assert caught.value is (rollback_error if rollback_fails else commit_error)
+    if rollback_fails:
+        assert caught.value.__cause__ is commit_error
 
 
 @pytest.mark.asyncio

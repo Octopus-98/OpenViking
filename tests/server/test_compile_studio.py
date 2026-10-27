@@ -880,14 +880,11 @@ async def _seed_compile_target(service, target, ctx):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("move_parent", [False, True])
-async def test_compile_metadata_follows_moves_and_isolates_reused_paths(
-    service, monkeypatch, move_parent
-):
-    """Target and parent moves retain history and schedule slots while freeing the old URI."""
+async def test_compile_metadata_stays_at_original_uri_after_move(service, monkeypatch, move_parent):
+    """Target and parent moves preserve registered history and schedule slots at the original URI."""
     from datetime import datetime
 
     from openviking.service.compile_scheduler import TZ, CompileScheduler
-    from openviking_cli.exceptions import NotFoundError
 
     ctx = RequestContext(user=service.user, role=Role.ROOT)
     account = ctx.account_id
@@ -923,83 +920,77 @@ async def test_compile_metadata_follows_moves_and_isolates_reused_paths(
     monkeypatch.setattr(service.fs, "_refresh_move_parents", AsyncMock())
     now = datetime(2026, 10, 22, 12, tzinfo=TZ)
     assert await scheduler.trigger_if_due(account, target, now) == "submitted"
+    state = await store.get(account, target)
     await service.fs.mv(source_root, destination_root, ctx)
 
-    assert await store.get(account, target) is None
-    state = await store.get_by_to(account, moved_to)
-    assert state["to"] == moved_to and "id" not in state
+    assert await store.get(account, target) == state
+    assert await store.get_by_to(account, moved_to) is None
+    assert not await service.viking_fs.exists(source_root, ctx=ctx)
     assert await service.fs.read(moved_file, ctx) == "compiled content"
-    assert (await service.compile.get_operation(moved_to, "op_seed", ctx))["params"] == {
+    assert (await service.compile.get_operation(target, "op_seed", ctx))["params"] == {
         "uris": [original_file]
     }
-    assert (
-        await service.compile.operation_outputs(moved_to, "op_seed", ctx, limit=20, cursor=None)
-    )["outputs"] == outputs
-    retained = await service.compile.file_versions(moved_file, ctx, limit=20, before=None)
+    assert (await service.compile.operation_outputs(target, "op_seed", ctx, limit=20, cursor=None))[
+        "outputs"
+    ] == outputs
+    retained = await service.compile.file_versions(original_file, ctx, limit=20, before=None)
     assert retained["versions"] == [version]
     assert version["snapshot_path"] == original_file
     assert (
         await service.viking_fs.show_blob_raw(version["snapshot_id"], path=original_file, ctx=ctx)
     )["oid"]
-    assert await scheduler.trigger_if_due(account, moved_to, now) == "not_due"
+    assert await scheduler.trigger_if_due(account, target, now) == "not_due"
     submissions.create_scheduled.assert_awaited_once()
-    moved_key = hashlib.sha256(moved_to.encode("utf-8")).hexdigest()
     entries = await store._agfs.ls(metadata_root)
-    assert {item["name"] for item in entries if not item["name"].startswith(".")} == {moved_key}
+    assert {item["name"] for item in entries if not item["name"].startswith(".")} == {original_key}
 
     async with store.edit(account, target, create=True) as record:
-        assert record["initialized"] is False
+        assert record["initialized"] is True
     await store.put_operation(
         account, target, new_operation("op_reused", "mkdir", {}, ctx.user.user_id)
     )
-    with pytest.raises(NotFoundError):
-        await service.compile.get_operation(target, "op_seed", ctx)
+    assert await service.compile.get_operation(target, "op_seed", ctx) == operation
     assert await store.get_operation(account, moved_to, "op_reused") is None
-    assert await store.get_outputs(account, target, "op_seed") is None
-    assert await store.list_version_indexes(account, target) == []
-    assert (await store.get_operation(account, moved_to, "op_seed")) == operation
-    assert (await service.compile.file_versions(moved_file, ctx, limit=20, before=None)) == retained
+    assert await store.get_outputs(account, target, "op_seed") == {"outputs": outputs}
+    assert await store.list_version_indexes(account, moved_to) == []
+    assert (
+        await service.compile.file_versions(original_file, ctx, limit=20, before=None)
+    ) == retained
 
 
 @pytest.mark.asyncio
-async def test_parent_move_recovers_all_metadata_after_copy_failure(service, monkeypatch):
-    """Cold reads recover every sibling target after one metadata copy fails following content move."""
+async def test_parent_move_preserves_sibling_compile_metadata(service, monkeypatch):
+    """Moving a parent moves business files without writing either sibling's Compile metadata."""
     ctx = RequestContext(user=service.user, role=Role.ROOT)
     account = ctx.account_id
     store = service.compile.lifecycle.store
     source, destination = "viking://resources/bundle", "viking://resources/relocated"
     targets = [f"{source}/{name}" for name in ("a", "b")]
     seeds = {target: await _seed_compile_target(service, target, ctx) for target in targets}
-    first = (await store.list_summaries(account))[0]["to"]
-    failed_path = store._operation_path(account, destination + first[len(source) :], "op_seed")
-    write_json = store.write_json
-
-    async def fail_first_target_copy(path, value, *args, **kwargs):
-        if path == failed_path:
-            raise OSError("target history copy failed")
-        return await write_json(path, value, *args, **kwargs)
+    states = {target: await store.get(account, target) for target in targets}
 
     monkeypatch.setattr(service.fs, "_refresh_move_parents", AsyncMock())
     with monkeypatch.context() as patch:
-        patch.setattr(store, "write_json", fail_first_target_copy)
-        with pytest.raises(OSError, match="target history copy failed"):
-            await service.fs.mv(source, destination, ctx)
+        patch.setattr(
+            store, "write_json", AsyncMock(side_effect=AssertionError("Compile metadata write"))
+        )
+        await service.fs.mv(source, destination, ctx)
     assert not await service.viking_fs.exists(source, ctx=ctx)
     cold = CompileStateStore(store._agfs)
     for target in targets:
         moved = destination + target[len(source) :]
-        record = await cold.get(account, moved)
-        assert record["to"] == moved and "move" not in record
+        assert await cold.get(account, target) == states[target]
+        assert await cold.get(account, moved) is None
         assert await service.fs.read(f"{moved}/page.md", ctx) == "compiled content"
         operation, outputs, version = seeds[target]
-        assert await cold.get_operation(account, moved, "op_seed") == operation
-        assert await cold.get_outputs(account, moved, "op_seed") == {"outputs": outputs}
-        assert await cold.get_version_index(account, moved, f"{moved}/page.md") == {
-            "uri": f"{moved}/page.md",
+        assert await cold.get_operation(account, target, "op_seed") == operation
+        assert await cold.get_outputs(account, target, "op_seed") == {"outputs": outputs}
+        assert await cold.get_version_index(account, target, f"{target}/page.md") == {
+            "uri": f"{target}/page.md",
             "next": 2,
             "versions": [version],
         }
-        assert await cold.get(account, target) is None
+        assert await cold.get_version_index(account, moved, f"{moved}/page.md") is None
 
 
 @pytest.mark.asyncio
