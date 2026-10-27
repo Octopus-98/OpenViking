@@ -22,11 +22,11 @@ from openviking.service.compile_service import (
 )
 from openviking_cli.exceptions import InvalidArgumentError
 
-router = APIRouter(prefix="/api/v1", tags=["compile"])
+router = APIRouter(prefix="/api/v1/compile", tags=["compile"])
 
 
 @router.post(
-    "/compile",
+    "",
     status_code=status.HTTP_202_ACCEPTED,
     responses={status.HTTP_200_OK: {"description": "Compile update settings saved"}},
 )
@@ -62,7 +62,7 @@ async def create_compile(
 __all__ = ["router"]
 
 
-@router.get("/compile/config")
+@router.get("/config")
 async def get_compile_config(
     to: str = Query(..., min_length=1),
     ctx: RequestContext = Depends(get_request_context),
@@ -70,7 +70,7 @@ async def get_compile_config(
     return Response(status="ok", result=await get_service().compile.get_config(to, ctx))
 
 
-@router.post("/compile/config/update")
+@router.post("/config/update")
 async def update_compile_config(
     body: CompileConfigUpdate,
     ctx: RequestContext = Depends(get_request_context),
@@ -78,7 +78,7 @@ async def update_compile_config(
     return Response(status="ok", result=await get_service().compile.update_config(body, ctx))
 
 
-@router.get("/compile/configs")
+@router.get("/configs")
 async def list_compile_configs(
     limit: int = Query(20, ge=1, le=100),
     cursor: str | None = Query(None),
@@ -90,7 +90,7 @@ async def list_compile_configs(
     )
 
 
-@router.post("/compile/configs/query")
+@router.post("/configs/query")
 async def query_compile_configs(
     body: CompileConfigQuery,
     request: Request,
@@ -102,7 +102,7 @@ async def query_compile_configs(
     return Response(status="ok", result=await get_service().compile.query_configs(body, ctx))
 
 
-@router.get("/compile/conflicts")
+@router.get("/conflicts")
 async def list_compile_conflicts(
     uri: str = Query(..., min_length=1, description="Directory Viking URI"),
     offset: int = Query(0, ge=0, description="Number of conflict records to skip"),
@@ -116,7 +116,7 @@ async def list_compile_conflicts(
     )
 
 
-@router.get("/compile/operations")
+@router.get("/operations")
 async def list_compile_operations(
     to: str = Query(..., min_length=1),
     limit: int = Query(20, ge=1, le=100),
@@ -127,7 +127,7 @@ async def list_compile_operations(
     return Response(status="ok", result=result)
 
 
-@router.get("/compile/operations/{operation_id}")
+@router.get("/operations/{operation_id}")
 async def get_compile_operation(
     operation_id: str = Path(
         ..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9:._-]*$"
@@ -140,7 +140,7 @@ async def get_compile_operation(
     return Response(status="ok", result=result)
 
 
-@router.get("/compile/files")
+@router.get("/files")
 async def list_compile_files(
     uri: str = Query(..., min_length=1, description="Directory Viking URI"),
     offset: int = Query(0, ge=0, description="Number of files to skip"),
@@ -154,7 +154,7 @@ async def list_compile_files(
     )
 
 
-@router.get("/compile/operations/{operation_id}/outputs")
+@router.get("/operations/{operation_id}/outputs")
 async def operation_outputs(
     operation_id: str = Path(
         ..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9:._-]*$"
@@ -173,12 +173,12 @@ async def operation_outputs(
     )
 
 
-@router.get("/compile/capabilities")
+@router.get("/capabilities")
 async def compile_capabilities(ctx: RequestContext = Depends(get_request_context)):
     return Response(status="ok", result=get_service().compile.capabilities(ctx))
 
 
-@router.get("/compile/submissions/{key}")
+@router.get("/submissions/{key}")
 async def get_submission(
     key: str = Path(..., min_length=16, max_length=128, pattern=r"^[A-Za-z0-9:._-]+$"),
     ctx: RequestContext = Depends(get_request_context),
@@ -212,7 +212,7 @@ class CompileEmbeddingRequest(BaseModel):
         return self
 
 
-@router.post("/compile/embeddings")
+@router.post("/embeddings")
 async def compile_embeddings(
     request: CompileEmbeddingRequest,
     _ctx: RequestContext = Depends(get_request_context),
