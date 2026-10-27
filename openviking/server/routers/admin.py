@@ -700,10 +700,8 @@ async def get_account_configuration(
 ):
     """Return this account layer's explicit runtime configuration."""
     _check_account_access(ctx, account_id)
-    await _check_account_exists(request, account_id)
-    settings = await _get_runtime_config_manager().get_settings(
-        ConfigScope.account(account_id)
-    )
+    manager = await _check_account_exists(request, account_id)
+    settings = await _get_runtime_config_manager().get_settings(ConfigScope.account(account_id))
     result = {
         "account_id": account_id,
         "settings": _visible_account_config(ctx, settings),
@@ -716,9 +714,9 @@ async def get_account_configuration(
             validate_ttl_root(path, allow_peer_scope=True)
         except ValueError as exc:
             raise InvalidArgumentError(str(exc)) from exc
-        user_ctx = RequestContext(
-            user=UserIdentifier(account_id, uri_parts(path)[1]), role=Role.USER
-        )
+        user_id = uri_parts(path)[1]
+        await _check_user_exists(request, account_id, user_id, manager)
+        user_ctx = RequestContext(user=UserIdentifier(account_id, user_id), role=Role.USER)
         config = await read_user_config(get_service().viking_fs, user_ctx)
         policy = await _get_runtime_config_manager().resolve_account(
             account_id,

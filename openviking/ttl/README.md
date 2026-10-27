@@ -52,6 +52,16 @@ directories use the directory date (`ZADD NX`). Deletion rechecks current policy
 and Session `messages.jsonl` ModTime under the existing directory lock. Redis
 index removal compares the original score to preserve a concurrent renewal.
 
+Session mutations hold their existing directory mutex and covering root-file
+locks through the full read/modify/write operation. With TTL enabled, check the
+live-message file before acquiring child locks, whose sidecars could recreate
+a deleted root. Nested writes reuse the held owner and covering file lease,
+including when TTL is disabled mid-request. Model calls remain outside these
+short write guards.
+
+Disabling TTL also bypasses guards for earlier background work. Late writes can
+then recreate deleted content; no per-task TTL snapshot is retained.
+
 Vector writes keep the directory lock through the database write, so deletion
 cannot race with a late vector write. On lock contention, the embedding worker
 releases its acquired guards and retries with a five-second wait budget. It reuses
@@ -72,6 +82,8 @@ remain independent. Type defaults precede `global`.
 Missing fields inherit, `disabled` stops fallback, and PATCH `null` removes an
 override. `roots` is no longer part of the cluster/Account configuration schema.
 The existing UserConfig update lock, validation, backup and deletion apply.
+Account configuration path queries also require an existing User; a missing
+User returns 404, matching the User settings endpoint.
 TTL caches at most 1024 user snapshots, keyed by Account and User. A local save
 publishes immediately; other processes refresh on demand after 30 seconds.
 Concurrent misses share one load. This cache adds no periodic filesystem scan.

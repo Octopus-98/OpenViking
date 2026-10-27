@@ -770,20 +770,26 @@ class Session:
                 return
 
             adapter = get_ttl_adapter()
-            if adapter is not None and await adapter.requires_existing_session(
+            requires_existing = adapter is not None and await adapter.requires_existing_session(
                 self._session_uri, self.ctx
-            ):
-                # Commercial writes share this unit lock. Read live messages
-                # before leaf locks, whose sidecars could recreate a deleted root.
-                yield session_lease
-                return
+            )
+            if requires_existing:
+                # Check under the mutex before child-lock sidecars can recreate
+                # a deleted root. Keep file locks across the whole state update.
+                await self._viking_fs.stat(
+                    f"{self._session_uri}/messages.jsonl", ctx=self.ctx, skip_count=True
+                )
             file_lease = await agfs.pathlock_acquire_exact_batch(
                 [f"{session_path}/{name}" for name in filenames],
                 timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
                 owner_lease_ref=session_lease,
             )
             try:
-                yield file_lease
+                if requires_existing:
+                    with bind_write_owner(self._viking_fs, self._session_uri, self.ctx, file_lease):
+                        yield file_lease
+                else:
+                    yield file_lease
             finally:
                 await agfs.pathlock_release(file_lease)
         finally:

@@ -594,7 +594,11 @@ class DirectoryTTL:
         try:
             if require_exists:
                 await self.fs.stat(uri, ctx=ctx, skip_count=True)
-            elif item[0] == "sessions" and uri != item[2] + "/messages.jsonl":
+            elif (
+                item[0] == "sessions"
+                and uri != item[2] + "/messages.jsonl"
+                and (held is None or lease_ref is None)
+            ):
                 await self.fs.stat(item[2] + "/messages.jsonl", ctx=ctx)
             from openviking.service.task_work_index import get_task_context
 
@@ -611,9 +615,9 @@ class DirectoryTTL:
             )
             async with self.source_guard(source, ctx, unit):
                 if held is not None:
-                    # The caller holds the unit mutex; native writes still
-                    # acquire covering leaf locks, independently for each file.
-                    yield None
+                    # State updates already hold a covering root-file lease.
+                    # Phase 1 passes None so native writes lock each child.
+                    yield lease_ref
                     return
                 lease = await agfs.pathlock_acquire_exact(path, owner_lease_ref=unit)
                 try:

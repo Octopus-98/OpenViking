@@ -4318,6 +4318,14 @@ async def test_user_ttl_reuses_settings_backup_and_sparse_type_patch(
         headers=root_headers(),
     )
     assert created.status_code == 200, created.text
+    for suffix in ("memories/events", "peers", "sessions"):
+        missing = await lightweight_admin_client.get(
+            "/api/v1/admin/accounts/ttl-user/configuration",
+            params={"path": f"viking://user/ghost/{suffix}"},
+            headers=root_headers(),
+        )
+        assert missing.status_code == 404, missing.text
+        assert missing.json()["error"]["message"] == "User not found: ghost"
     await lightweight_admin_app.state.fake_service.runtime_config_manager.patch_account(
         "ttl-user", {"ttl": {"peer_events": 14}}
     )

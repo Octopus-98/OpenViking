@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from openviking.message import TextPart
 from openviking.server.auth import get_session_request_context
 from openviking.server.routers import sessions as sessions_router
+from openviking.server.user_config import patch_user_config
 from openviking.service.session_service import SessionService
 from openviking.service.task_work_index import bind_task_context
 from openviking.session.session import Session
@@ -23,6 +24,7 @@ from openviking.storage.viking_fs import VikingFS
 from openviking.ttl import wiring
 from openviking.ttl.runtime import DirectoryTTL
 from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
+from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils.config.agfs_config import AGFSConfig
 from openviking_cli.utils.config.ttl_config import TTLConfig
 
@@ -112,6 +114,62 @@ async def test_commit_metadata_with_native_file_lock(native_session):
     assert meta["commit_count"] == 1
     assert meta["memories_extracted"]["events"] == 1
     assert meta["memories_extracted"]["total"] == 1
+
+
+@pytest.mark.parametrize("native_session", ["enabled"], indirect=True)
+@pytest.mark.parametrize("disable_ttl", [False, True])
+@pytest.mark.parametrize("operation", ["append", "config", "commit_meta"])
+async def test_session_mutation_reuses_owner_across_ttl_change(
+    native_session, monkeypatch, operation, disable_ttl
+):
+    session = native_session
+    fs = session._viking_fs
+    await session.ensure_exists()
+    if operation == "commit_meta":
+        await fs.mkdir(session.uri + "/history/archive_001", ctx=session.ctx)
+
+    read_method = {
+        "append": "_reload",
+        "config": "_load_meta",
+        "commit_meta": "_read_commit_meta",
+    }[operation]
+    read = getattr(session, read_method)
+
+    async def read_then_disable():
+        result = await read()
+        if disable_ttl:
+            await patch_user_config(fs, session.ctx, {"ttl": {"sessions": "disabled"}})
+            if operation == "append":
+                with pytest.raises(OpenVikingError, match="lock acquire timed out"):
+                    await fs.append_file(
+                        session.uri + "/messages.jsonl", "concurrent write\n", ctx=session.ctx
+                    )
+        return result
+
+    monkeypatch.setattr(session, read_method, read_then_disable)
+    unit_path = fs._uri_to_path(session.uri, ctx=session.ctx)
+    acquire = AsyncMock(wraps=fs._async_agfs.pathlock_acquire_exact)
+    monkeypatch.setattr(fs._async_agfs, "pathlock_acquire_exact", acquire)
+    if operation == "append":
+        await session.add_message_async("user", [TextPart(text="written under the held owner")])
+        assert [message.content for message in session.messages] == ["written under the held owner"]
+    elif operation == "config":
+        await session.update_event_search_tags(["source=ttl"])
+    else:
+        saved = await session._merge_and_save_commit_meta(1, {"events": 1}, None)
+        assert saved is not None
+
+    meta = json.loads(await fs.read_file(session.uri + "/.meta.json", ctx=session.ctx))
+    if operation == "append":
+        assert meta["message_count"] == 1
+    elif operation == "config":
+        assert meta["event_search_tags"] == ["source=ttl"]
+    else:
+        assert meta["commit_count"] == 1
+        assert meta["memories_extracted"]["events"] == 1
+    assert [call.args[0] for call in acquire.await_args_list].count(unit_path) == 1
+    assert (await fs._async_agfs.pathlock_observe())["active_locks"] == 0
+    wiring.get_ttl_adapter().client.assert_not_called()
 
 
 @pytest.fixture
@@ -206,7 +264,10 @@ async def test_phase1_recovery_with_native_locks(commit_session, root_applied):
 
 
 @pytest.mark.parametrize("native_session", ["enabled"], indirect=True)
-async def test_commit_owner_does_not_leak_to_other_requests_or_late_children(native_session):
+@pytest.mark.parametrize("filenames", [(), (".meta.json",)])
+async def test_commit_owner_does_not_leak_to_other_requests_or_late_children(
+    native_session, filenames
+):
     session = native_session
     fs = session._viking_fs
     await session.ensure_exists()
@@ -217,14 +278,18 @@ async def test_commit_owner_does_not_leak_to_other_requests_or_late_children(nat
 
     while_held, after_exit = asyncio.Event(), asyncio.Event()
     independent = asyncio.create_task(write_after(while_held))
-    async with session._state_lock():
+    async with session._state_lock(*filenames):
+        with pytest.raises(LockAcquisitionError):
+            await fs._async_agfs.pathlock_acquire_tree(
+                fs._uri_to_path(session.uri, ctx=session.ctx)
+            )
         while_held.set()
         with pytest.raises(LockAcquisitionError):
             await independent
         inherited = asyncio.create_task(write_after(after_exit))
 
     # A child retains its copied Context, but cannot borrow a released lease.
-    async with session._state_lock():
+    async with session._state_lock(*filenames):
         after_exit.set()
         with pytest.raises(LockAcquisitionError):
             await inherited
