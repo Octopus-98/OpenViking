@@ -1001,10 +1001,11 @@ pub async fn attrs(
     client: &HttpClient,
     uri: &str,
     key: Option<&str>,
+    include_acl: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
-    let mut result = client.attrs(uri).await?;
+    let mut result = client.attrs(uri, include_acl).await?;
     if let Some(key) = key {
         result = select_attr_key(&result, key)
             .cloned()

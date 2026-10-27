@@ -2014,12 +2014,18 @@ pub async fn handle_stat(uri: String, ctx: CliContext) -> Result<()> {
     commands::filesystem::stat(&client, &uri, ctx.output_format, ctx.compact).await
 }
 
-pub async fn handle_attrs(uri: String, key: Option<String>, ctx: CliContext) -> Result<()> {
+pub async fn handle_attrs(
+    uri: String,
+    key: Option<String>,
+    include_acl: bool,
+    ctx: CliContext,
+) -> Result<()> {
     let client = ctx.get_client();
     commands::filesystem::attrs(
         &client,
         &uri,
         key.as_deref(),
+        include_acl,
         ctx.output_format,
         ctx.compact,
     )

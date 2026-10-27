@@ -458,7 +458,7 @@ ov stat viking://resources/my-project/docs
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | uri | str | 是 | - | Viking URI |
-| include_acl | bool | 否 | false | HTTP 查询参数：账号 ADMIN 查询共享资源时额外返回 `attrs.acl` |
+| include_acl | bool | 否 | false | 账号 ADMIN 查询共享资源时额外返回 `attrs.acl`；支持 HTTP 查询参数或 CLI `--include-acl` |
 
 
 **Python SDK (HTTP)**
@@ -516,10 +516,14 @@ curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
 ```bash
 ov attrs get viking://resources/docs/api.md
 ov attrs get viking://resources/docs/api.md tags
+ov attrs get viking://resources/docs/api.md --include-acl
+ov attrs get viking://resources/docs/api.md acl --include-acl
 ov attrs get viking://user/alice/memories/experiences/foo.md memory.resource_refs
 ov attrs set-tags viking://resources/docs/api.md --tags team=search,env=prod
 ov attrs set-tags viking://resources/docs --tags team=search --mode append --recursive
 ```
+
+`--include-acl` 会发送 `include_acl=true`，默认关闭。CLI 同样仅向账号 `ADMIN` 返回共享资源的 ACL；可选的 `acl` 键用于只显示返回属性中的该字段。
 
 `set-tags` 的目录目标会更新目录语义记录；`recursive=true` 还会更新已有子文件和子目录语义记录。
 

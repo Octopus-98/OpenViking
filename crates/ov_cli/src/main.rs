@@ -298,9 +298,12 @@ enum AttrsCommands {
         /// Viking URI to get attributes for
         #[arg(value_name = "uri")]
         uri: String,
-        /// Optional attrs key, for example tags, memory, or memory.tags
+        /// Optional attrs key, for example tags, acl, memory, or memory.tags
         #[arg(value_name = "key")]
         key: Option<String>,
+        /// Include shared-resource ACL details for account admins
+        #[arg(long)]
+        include_acl: bool,
     },
     /// Update explicit retrieval tags metadata for a file or directory
     SetTags {
@@ -3791,7 +3794,11 @@ async fn main() {
         Commands::Mv { from_uri, to_uri } => handlers::handle_mv(from_uri, to_uri, ctx).await,
         Commands::Stat { uri } => handlers::handle_stat(uri, ctx).await,
         Commands::Attrs { action } => match action {
-            AttrsCommands::Get { uri, key } => handlers::handle_attrs(uri, key, ctx).await,
+            AttrsCommands::Get {
+                uri,
+                key,
+                include_acl,
+            } => handlers::handle_attrs(uri, key, include_acl, ctx).await,
             AttrsCommands::SetTags {
                 uri,
                 tags,

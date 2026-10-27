@@ -145,7 +145,7 @@ Run `ov --help` and `ov <command> --help` for the exact command surface of your 
 - `cp` - Copy a file, or copy a directory recursively with `-r`.
 - `mv` - Move or rename a resource.
 - `stat` - Show resource metadata.
-- `attrs` - Get logical extended attributes.
+- `attrs` - Get logical extended attributes. Use `attrs get <uri> [key] --include-acl` to include shared-resource ACL for account ADMIN users.
 - `get` - Download a file to a local path.
 
 ```bash

@@ -738,8 +738,11 @@ impl HttpClient {
         self.get("/api/v1/fs/stat", &params).await
     }
 
-    pub async fn attrs(&self, uri: &str) -> Result<serde_json::Value> {
-        let params = vec![("uri".to_string(), uri.to_string())];
+    pub async fn attrs(&self, uri: &str, include_acl: bool) -> Result<serde_json::Value> {
+        let mut params = vec![("uri".to_string(), uri.to_string())];
+        if include_acl {
+            params.push(("include_acl".to_string(), "true".to_string()));
+        }
         self.get("/api/v1/fs/attrs", &params).await
     }
 

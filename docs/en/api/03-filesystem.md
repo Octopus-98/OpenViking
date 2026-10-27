@@ -420,7 +420,7 @@ Get logical extended attributes for a file or directory.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | uri | str | Yes | - | Viking URI |
-| include_acl | bool | No | false | HTTP query parameter: include `attrs.acl` for account ADMIN requests to shared resources |
+| include_acl | bool | No | false | Include `attrs.acl` for account ADMIN requests to shared resources; HTTP query parameter or CLI `--include-acl` |
 
 
 **Python SDK (HTTP)**
@@ -478,10 +478,14 @@ The `acl` field is omitted when the parameter is absent or false, the caller has
 ```bash
 ov attrs get viking://resources/docs/api.md
 ov attrs get viking://resources/docs/api.md tags
+ov attrs get viking://resources/docs/api.md --include-acl
+ov attrs get viking://resources/docs/api.md acl --include-acl
 ov attrs get viking://user/alice/memories/experiences/foo.md memory.resource_refs
 ov attrs set-tags viking://resources/docs/api.md --tags team=search,env=prod
 ov attrs set-tags viking://resources/docs --tags team=search --mode append --recursive
 ```
+
+`--include-acl` sends `include_acl=true` and is disabled by default. The same account `ADMIN` and shared-resource restrictions apply; the optional `acl` key selects only that field from the returned attributes.
 
 For `set-tags`, directory targets update the directory semantic records; `recursive=true` also updates existing descendant files and directory semantic records.
 
