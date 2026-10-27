@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
-    AsyncContextManager,
     Mapping,
     Optional,
     Protocol,
@@ -77,21 +76,10 @@ class TTLAdapter(Protocol):
     def install_expiry(self, scheduler: "ExpiryScheduler") -> None:
         """Register maintenance on the existing Redis scheduler before roles start."""
 
-    def write_guard(
-        self,
-        uri: str,
-        ctx: Any,
-        lease_ref: Any = None,
-        *,
-        require_exists: bool = False,
-        recover_owner: bool = False,
-    ) -> AsyncContextManager:
-        """Protect the final file/vector commit with the existing path lock."""
-
-    def source_guard(
-        self, source_uri: str, ctx: Any, lease_ref: Any = None, *, task_id: Optional[str] = None
-    ) -> AsyncContextManager:
-        """Check a delayed commit's existing source and task owner under its lock."""
+    async def check_source(
+        self, source_uri: str, ctx: Any, *, task_id: Optional[str] = None
+    ) -> None:
+        """Check a delayed write's source and task owner without acquiring locks."""
 
     async def requires_existing_session(self, uri: str, ctx: Any) -> bool:
         """Whether an append must reject a missing live-message file."""

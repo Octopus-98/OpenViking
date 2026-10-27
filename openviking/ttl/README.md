@@ -52,22 +52,17 @@ directories use the directory date (`ZADD NX`). Deletion rechecks current policy
 and Session `messages.jsonl` ModTime under the existing directory lock. Redis
 index removal compares the original score to preserve a concurrent renewal.
 
-Session mutations hold their existing directory mutex and covering root-file
-locks through the full read/modify/write operation. With TTL enabled, check the
-live-message file before acquiring child locks, whose sidecars could recreate
-a deleted root. Nested writes reuse the held owner and covering file lease,
-including when TTL is disabled mid-request. Model calls remain outside these
-short write guards.
+TTL adds no directory locks to Session, Event or vector writes. Session mutations
+and memory updates keep their existing native file/transaction locks. Deletion
+uses the native Tree lock for the policy/ModTime recheck, recursive removal and
+conditional index cleanup; lock conflicts retain the registration for retry.
 
-Disabling TTL also bypasses guards for earlier background work. Late writes can
-then recreate deleted content; no per-task TTL snapshot is retained.
-
-Vector writes keep the directory lock through the database write, so deletion
-cannot race with a late vector write. On lock contention, the embedding worker
-releases its acquired guards and retries with a five-second wait budget. It reuses
-the embedding result and checks that the source still exists after reacquiring
-the locks. Expired wait budgets and other errors still fail the task; disabled TTL
-adds no lock waiting.
+With TTL enabled, an existing Session must still have its live-message file.
+Delayed Event and vector writes check that their source/target exists and that
+the archive task still matches. These checks acquire no locks and do not make
+the check and cross-directory write atomic. Disabling TTL skips these checks,
+including for earlier work; no per-task TTL snapshot is retained. Redis reporting
+remains asynchronous and does not acquire path locks.
 
 User TTL lives in `settings/user_config.json` and uses the existing
 `GET/PATCH /api/v1/admin/accounts/{account_id}/users/{user_id}/settings` API:

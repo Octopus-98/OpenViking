@@ -68,7 +68,6 @@ async def main():
         tracemalloc.start()
         for mode in ("baseline", "off", "mixed", "enabled", "off", "baseline"):
             fs.set_post_write_hook(None)
-            fs._write_guard = None
             if mode != "baseline":
                 install_ttl_hook(fs, e)
             counts.clear()
@@ -104,7 +103,6 @@ async def main():
                 )
         # Known historical directories: scanning only stats missing roots.
         fs.set_post_write_hook(None)
-        fs._write_guard = None
         for i in range(64):
             await fs.write_file(
                 root + f"/history{i}/messages.jsonl",

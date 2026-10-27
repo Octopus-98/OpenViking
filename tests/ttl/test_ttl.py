@@ -257,8 +257,7 @@ async def test_disabled_account_cached_policy_no_business_io(engine):
     uri = "viking://user/u/sessions/s"
     await e.on_post_write(uri + "/messages.jsonl", e.context("a"), 1)
     assert await e.resolve_expires_at([uri], e.context("a")) == {uri: None}
-    async with e.write_guard(uri + "/messages.jsonl", e.context("a")):
-        pass
+    await e.check_source(uri + "/messages.jsonl", e.context("a"))
     e.client.assert_not_called()
     e._dispatcher.run.assert_not_called()
     assert not e._retry and not e._wake.is_set()

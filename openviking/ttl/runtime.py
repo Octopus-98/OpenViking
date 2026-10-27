@@ -11,7 +11,7 @@ import re
 import time
 from bisect import bisect_right
 from collections import OrderedDict
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import TYPE_CHECKING, Any, Sequence
@@ -556,78 +556,6 @@ class DirectoryTTL:
     async def requires_existing_session(self, uri: str, ctx: RequestContext) -> bool:
         return (await self.policy(ctx.account_id, uri)).enabled
 
-    @asynccontextmanager
-    async def write_guard(
-        self, uri, ctx, lease_ref=None, *, require_exists=False, recover_owner=False
-    ):
-        item = directory(uri)
-        if ctx is None or item is None or not self.writer:
-            yield lease_ref
-            return
-        policy = await self.policy(ctx.account_id, item[1])
-        if not policy.enabled:
-            yield lease_ref
-            return
-        agfs = self.fs._async_agfs
-        path = self.fs._uri_to_path(uri, ctx=ctx)
-        from openviking.ttl.wiring import get_write_owner
-
-        held = get_write_owner(self.fs, item[2], ctx, lease_ref)
-        # Unit lock lives beside a missing unit, so checking before the leaf
-        # lock cannot recreate a deleted Session/date through lock sidecars.
-        unit = held
-        if unit is None:
-            unit_path = self.fs._uri_to_path(item[2], ctx=ctx)
-            try:
-                unit = await agfs.pathlock_acquire_exact(unit_path, owner_lease_ref=lease_ref)
-            except ValueError as exc:
-                # A durable embedding can outlive its reindex owner (e.g. restart).
-                # Reacquire normally only for the native stale-capability error;
-                # lock conflicts and I/O failures must retain their error semantics.
-                if (
-                    not recover_owner
-                    or lease_ref is None
-                    or "owned lease capability does not match ref" not in str(exc)
-                ):
-                    raise
-                unit = await agfs.pathlock_acquire_exact(unit_path)
-        try:
-            if require_exists:
-                await self.fs.stat(uri, ctx=ctx, skip_count=True)
-            elif (
-                item[0] == "sessions"
-                and uri != item[2] + "/messages.jsonl"
-                and (held is None or lease_ref is None)
-            ):
-                await self.fs.stat(item[2] + "/messages.jsonl", ctx=ctx)
-            from openviking.service.task_work_index import get_task_context
-
-            task = get_task_context()
-            relative = uri[len(item[2]) + 1 :].split("/")
-            source = (
-                item[2] + "/" + "/".join(relative[:2])
-                if item[0] == "sessions"
-                and task
-                and task.work_id
-                and len(relative) >= 3
-                and relative[0] == "history"
-                else ""
-            )
-            async with self.source_guard(source, ctx, unit):
-                if held is not None:
-                    # State updates already hold a covering root-file lease.
-                    # Phase 1 passes None so native writes lock each child.
-                    yield lease_ref
-                    return
-                lease = await agfs.pathlock_acquire_exact(path, owner_lease_ref=unit)
-                try:
-                    yield lease
-                finally:
-                    await agfs.pathlock_release(lease)
-        finally:
-            if held is None:
-                await agfs.pathlock_release(unit)
-
     async def on_post_write(self, uri: str, ctx: RequestContext | None, written_at_ms: int) -> None:
         if not self.writer or ctx is None:
             return
@@ -1111,34 +1039,21 @@ class DirectoryTTL:
         finally:
             await agfs.pathlock_release(lease)
 
-    @asynccontextmanager
-    async def source_guard(self, source_uri, ctx, lease_ref=None, *, task_id=None):
+    async def check_source(self, source_uri, ctx, *, task_id=None):
+        """Best-effort stale-work check; no lock spans the check and write."""
         item = directory(source_uri) if source_uri else None
-        if item is None or not await self.requires_existing_session(item[1], ctx):
-            yield
+        if ctx is None or item is None or not await self.requires_existing_session(item[1], ctx):
             return
-        agfs = self.fs._async_agfs
-        from openviking.ttl.wiring import get_write_owner
+        await self.fs.stat(source_uri, ctx=ctx, skip_count=True)
+        if item[0] != "sessions" or not source_uri.startswith(item[2] + "/history/"):
+            return
+        if task_id is None:
+            from openviking.service.task_work_index import get_task_context
 
-        held = get_write_owner(self.fs, item[2], ctx, lease_ref)
-        lease = held
-        if lease is None:
-            lease = await agfs.pathlock_acquire_exact(
-                self.fs._uri_to_path(item[2], ctx=ctx), owner_lease_ref=lease_ref
-            )
-        try:
-            await self.fs.stat(source_uri, ctx=ctx, skip_count=True)
-            if task_id is None:
-                from openviking.service.task_work_index import get_task_context
-
-                task = get_task_context()
-                task_id = task.task_id if task else None
-            if task_id:
-                meta = json.loads(await self.fs.read_file(source_uri + "/.meta.json", ctx=ctx))
-                owner = meta.get("phase1", {}).get("queue_message", {}).get("task_id")
-                if owner != task_id:
-                    raise NotFoundError(source_uri, "stale Session commit task")
-            yield
-        finally:
-            if held is None:
-                await agfs.pathlock_release(lease)
+            task = get_task_context()
+            task_id = task.task_id if task else None
+        if task_id:
+            meta = json.loads(await self.fs.read_file(source_uri + "/.meta.json", ctx=ctx))
+            owner = meta.get("phase1", {}).get("queue_message", {}).get("task_id")
+            if owner != task_id:
+                raise NotFoundError(source_uri, "stale Session commit task")

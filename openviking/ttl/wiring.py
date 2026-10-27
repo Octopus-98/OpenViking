@@ -12,10 +12,7 @@ allowed or must be rejected with 501. When no adapter is registered
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 from openviking_cli.utils.logger import get_logger
 
@@ -28,48 +25,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _adapter: Optional["TTLAdapter"] = None
-
-
-@dataclass
-class _WriteOwner:
-    fs: "VikingFS"
-    account_id: str
-    uri: str
-    lease_ref: Any
-
-
-_write_owner: ContextVar[Optional[_WriteOwner]] = ContextVar("ttl_write_owner", default=None)
-
-
-@contextmanager
-def bind_write_owner(
-    fs: "VikingFS", uri: str, ctx: "RequestContext", lease_ref: Any
-) -> Iterator[None]:
-    """Share a held unit lock with nested writes, without granting file coverage."""
-    if getattr(fs, "_write_guard", None) is None:
-        yield
-        return
-    owner = _WriteOwner(fs, ctx.account_id, uri, lease_ref)
-    token = _write_owner.set(owner)
-    try:
-        yield
-    finally:
-        # A child task can retain its Context after the owning scope exits.
-        owner.lease_ref = None
-        _write_owner.reset(token)
-
-
-def get_write_owner(fs: "VikingFS", uri: str, ctx: "RequestContext", lease_ref: Any = None):
-    owner = _write_owner.get()
-    if (
-        owner is not None
-        and owner.fs is fs
-        and owner.account_id == ctx.account_id
-        and owner.uri == uri
-    ):
-        if lease_ref is None or lease_ref is owner.lease_ref:
-            return owner.lease_ref
-    return None
 
 
 def build_ttl_adapter(config: Optional["TTLAdapterConfig"]) -> Optional["TTLAdapter"]:
@@ -111,7 +66,6 @@ def install_ttl_hook(viking_fs: "VikingFS", adapter: Optional["TTLAdapter"]) -> 
     if adapter is None:
         return
     viking_fs.set_post_write_hook(adapter.on_post_write)
-    viking_fs._write_guard = adapter.write_guard
     logger.info("Installed TTL post-write hook")
 
 

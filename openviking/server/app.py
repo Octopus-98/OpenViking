@@ -199,11 +199,11 @@ async def _initialize_runtime_state(
     """Initialize service and auth dependencies before traffic is accepted."""
     if config.ttl_adapter is not None and config.ttl_adapter.enabled:
 
-        async def install_write_guards():
+        async def install_ttl_hooks():
             await _initialize_auth_plugin(app, service, config)
             await _initialize_ttl_adapter(app, service, config)
 
-        await service.initialize(before_background_start=install_write_guards)
+        await service.initialize(before_background_start=install_ttl_hooks)
         await service.apply_agent_evolution_config()
     else:
         await service.initialize()

@@ -3,7 +3,6 @@
 
 """Session file writes must respect native RAGFS lease coverage."""
 
-import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -19,7 +18,6 @@ from openviking.server.user_config import patch_user_config
 from openviking.service.session_service import SessionService
 from openviking.service.task_work_index import bind_task_context
 from openviking.session.session import Session
-from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.viking_fs import VikingFS
 from openviking.ttl import wiring
 from openviking.ttl.runtime import DirectoryTTL
@@ -119,7 +117,7 @@ async def test_commit_metadata_with_native_file_lock(native_session):
 @pytest.mark.parametrize("native_session", ["enabled"], indirect=True)
 @pytest.mark.parametrize("disable_ttl", [False, True])
 @pytest.mark.parametrize("operation", ["append", "config", "commit_meta"])
-async def test_session_mutation_reuses_owner_across_ttl_change(
+async def test_session_mutation_keeps_native_locks_across_ttl_change(
     native_session, monkeypatch, operation, disable_ttl
 ):
     session = native_session
@@ -261,35 +259,3 @@ async def test_phase1_recovery_with_native_locks(commit_session, root_applied):
         failed = json.loads(await fs.read_file(archive + "/.failed.json", ctx=session.ctx))
         assert failed["stage"] == "phase1_recovery"
     await recovering.add_message_async("user", [TextPart(text="after recovery")])
-
-
-@pytest.mark.parametrize("native_session", ["enabled"], indirect=True)
-@pytest.mark.parametrize("filenames", [(), (".meta.json",)])
-async def test_commit_owner_does_not_leak_to_other_requests_or_late_children(
-    native_session, filenames
-):
-    session = native_session
-    fs = session._viking_fs
-    await session.ensure_exists()
-
-    async def write_after(gate):
-        await gate.wait()
-        await fs.write_file(session.uri + "/.meta.json", "{}", ctx=session.ctx)
-
-    while_held, after_exit = asyncio.Event(), asyncio.Event()
-    independent = asyncio.create_task(write_after(while_held))
-    async with session._state_lock(*filenames):
-        with pytest.raises(LockAcquisitionError):
-            await fs._async_agfs.pathlock_acquire_tree(
-                fs._uri_to_path(session.uri, ctx=session.ctx)
-            )
-        while_held.set()
-        with pytest.raises(LockAcquisitionError):
-            await independent
-        inherited = asyncio.create_task(write_after(after_exit))
-
-    # A child retains its copied Context, but cannot borrow a released lease.
-    async with session._state_lock(*filenames):
-        after_exit.set()
-        with pytest.raises(LockAcquisitionError):
-            await inherited

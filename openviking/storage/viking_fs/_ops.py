@@ -9,7 +9,6 @@ import time
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
-from functools import wraps
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union
 
 from openviking.core.context import ContextLevel
@@ -135,25 +134,6 @@ def _rel_path_sort_key(uri: str, root_uri: str) -> List[str]:
     return [part for part in rel_path.split("/") if part and part != "."]
 
 
-def _guard_write(method):
-    """Optional owner-supplied write boundary; absent on the default path."""
-    signature = inspect.signature(method)
-
-    @wraps(method)
-    async def guarded(self, *args, **kwargs):
-        guard = getattr(self, "_write_guard", None)
-        if guard is None:
-            return await method(self, *args, **kwargs)
-        bound = signature.bind(self, *args, **kwargs)
-        async with guard(
-            bound.arguments["uri"], bound.arguments.get("ctx"), bound.arguments.get("lease_ref")
-        ) as lease:
-            bound.arguments["lease_ref"] = lease
-            return await method(*bound.args, **bound.kwargs)
-
-    return guarded
-
-
 class _OpsMixin:
     """Core filesystem operations (read/write/mkdir/rm/mv/stat/glob/tree/ls/temp)."""
 
@@ -198,7 +178,6 @@ class _OpsMixin:
 
         return raw
 
-    @_guard_write
     async def write(
         self,
         uri: str,
@@ -2063,7 +2042,6 @@ class _OpsMixin:
 
     # ========== Other Preserved Methods ==========
 
-    @_guard_write
     async def write_file(
         self,
         uri: str,
@@ -2235,7 +2213,6 @@ class _OpsMixin:
                 raise NotFoundError(uri, "file") from exc
             raise
 
-    @_guard_write
     async def write_file_bytes(
         self,
         uri: str,
@@ -2262,7 +2239,6 @@ class _OpsMixin:
         )
         await self._notify_post_write(uri, ctx)
 
-    @_guard_write
     async def append_file(
         self,
         uri: str,

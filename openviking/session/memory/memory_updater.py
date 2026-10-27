@@ -1573,24 +1573,17 @@ class MemoryUpdater:
                 ),
                 extract_context=extract_context,
             )
-            from contextlib import AsyncExitStack
-
             from openviking.ttl.wiring import get_ttl_adapter
 
             adapter = get_ttl_adapter()
-            async with AsyncExitStack() as guards:
-                if adapter is not None and hasattr(adapter, "source_guard"):
-                    await guards.enter_async_context(
-                        adapter.source_guard(
-                            getattr(extract_context, "source_archive_uri", ""), ctx, lease_ref
-                        )
-                    )
-                await viking_fs.write_file(
-                    uri,
-                    new_full_content,
-                    ctx=ctx,
-                    lease_ref=lease_ref,
-                )
+            if adapter is not None:
+                await adapter.check_source(getattr(extract_context, "source_archive_uri", ""), ctx)
+            await viking_fs.write_file(
+                uri,
+                new_full_content,
+                ctx=ctx,
+                lease_ref=lease_ref,
+            )
 
     def _distribute_links_to_operations(self, operations: ResolvedOperations) -> None:
         """Distribute resolved_links to corresponding upsert operations by URI.
