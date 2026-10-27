@@ -76,8 +76,6 @@ logger = get_logger(__name__)
 
 # Per-call immutable output references are published under the content lease.
 _operation_outputs: ContextVar[Optional[dict]] = ContextVar("operation_outputs", default=None)
-# A target move reuses its covering metadata leases for nested JSON writes.
-_metadata_move: ContextVar[Optional[dict]] = ContextVar("compile_metadata_move", default=None)
 
 
 # ==========================================================================
@@ -163,14 +161,7 @@ class CompileStore(Protocol):
     def edit(
         self, account_id: str, to: str, *, create: bool = False
     ) -> AsyncContextManager[Dict[str, Any]]: ...
-    async def move_state(self, account_id: str, to: str, destination: str) -> None: ...
-    def lock_targets(self, account_id: str, targets: List[str]) -> AsyncContextManager[None]: ...
-    async def prepare_move(
-        self, account_id: str, to: str, destination: str, source_path: str
-    ) -> None: ...
-    async def list_summaries(
-        self, account_id: str, inherited_lease: Any = None
-    ) -> List[Dict[str, Any]]: ...
+    async def list_summaries(self, account_id: str) -> List[Dict[str, Any]]: ...
     async def list_accounts(self) -> List[str]: ...
     async def mark_content_updated(self, account_id: str, to: str) -> None: ...
 
@@ -268,7 +259,6 @@ class CompileStateStore:
 
     async def write_json(self, path: str, value: Any, lease: Any = None) -> None:
         """Write JSON; pass the held lease when ``path`` is already locked by the caller."""
-        lease = lease or self._move_lease(path)
         fs_ctx = fs_ctx_from_agfs_path(path)
         if lease is not None:
             fs_ctx["lease_ref"] = lease["lease_ref"]
@@ -279,7 +269,6 @@ class CompileStateStore:
     @asynccontextmanager
     async def locked(self, path: str, inherited_lease: Any = None) -> AsyncIterator[Any]:
         """Lock a JSON path, or reuse a caller-owned tree lease covering that path."""
-        inherited_lease = inherited_lease or self._move_lease(path)
         if inherited_lease is not None:
             yield inherited_lease
             return
@@ -289,41 +278,10 @@ class CompileStateStore:
         finally:
             await self._agfs.pathlock_release(lease)
 
-    def _move_lease(self, path: str) -> Any:
-        """Return this call's move lease only when it covers the requested metadata path."""
-        scope = _metadata_move.get()
-        if (
-            scope
-            and scope["store"] is self
-            and any(path == root or path.startswith(root + "/") for root in scope["roots"])
-        ):
-            return scope["lease"]
-        return None
-
-    @asynccontextmanager
-    async def lock_targets(self, account_id: str, targets: List[str]) -> AsyncIterator[None]:
-        """Exclude metadata writers during a move; busy targets fail without waiting on content."""
-        roots = sorted({self._target_dir(account_id, to) for to in targets})
-        if not roots or all(self._move_lease(root) is not None for root in roots):
-            yield
-            return
-        try:
-            lease = await self._agfs.pathlock_acquire_tree_batch(roots)
-        except LockAcquisitionError as exc:
-            raise ResourceBusyError("Compile target metadata is being processed") from exc
-        token = _metadata_move.set({"store": self, "roots": roots, "lease": lease})
-        try:
-            yield
-        finally:
-            _metadata_move.reset(token)
-            await self._agfs.pathlock_release(lease)
-
     # ---------- target discovery ----------
 
-    async def list_summaries(
-        self, account_id: str, inherited_lease: Any = None
-    ) -> List[Dict[str, Any]]:
-        """Summarize atomically published states, recovering interrupted target moves.
+    async def list_summaries(self, account_id: str) -> List[Dict[str, Any]]:
+        """Summarize atomically published states without modifying stored metadata.
 
         The list is not a point-in-time snapshot. Missing states are skipped;
         other I/O and JSON errors propagate instead of hiding registered targets.
@@ -339,8 +297,6 @@ class CompileStateStore:
             if len(name) != 64 or not entry.get("isDir", entry.get("is_dir", False)):
                 continue
             record = await self.read_json(f"{directory}/{name}/state.json")
-            if record is not None and record.get("move"):
-                record = await self.get(account_id, record["to"])
             if record is not None:
                 summaries.append(summarize(_normalize_schedule(record)))
         return summaries
@@ -348,15 +304,8 @@ class CompileStateStore:
     # ---------- state.json ----------
 
     async def get(self, account_id: str, to: str) -> Optional[Dict[str, Any]]:
-        """Read state by canonical URI, recovering interrupted moves; missing states return None."""
+        """Read state by canonical URI without writes; return None when it is missing."""
         record = await self.read_json(self._record_path(account_id, to))
-        if record is not None and record.get("move"):
-            move = record["move"]
-            source, destination = (
-                (record["to"], move["to"]) if "to" in move else (move["from"], record["to"])
-            )
-            await self.move_state(account_id, source, destination)
-            record = await self.read_json(self._record_path(account_id, to))
         return _normalize_schedule(record) if record is not None else None
 
     async def get_by_to(
@@ -378,22 +327,12 @@ class CompileStateStore:
         Revival preserves the operation history and deletion boundary.
         """
         to = to.rstrip("/")
-        existing = await self.get(account_id, to)
-        if not create and existing is None:
-            raise LookupError(f"Compile target not found: {to}")
         path = self._record_path(account_id, to)
         async with self.locked(path) as lease:
             record = await self.read_json(path)
-            if record is not None and record.get("move"):
-                raise ResourceBusyError("Compile target is moving", uri=to)
             if record is None:
                 if not create:
                     raise LookupError(f"Compile target not found: {to}")
-                # An interrupted move can leave JSON without its source state.
-                for folder in ("operations", "operation_outputs", "file_versions"):
-                    await self.remove(
-                        f"{self._target_dir(account_id, to)}/{folder}", recursive=True
-                    )
                 record = new_record(to)
             elif create and record["status"] != "active":
                 defaults = new_record(to)
@@ -417,92 +356,6 @@ class CompileStateStore:
                 record["execution_context"]["credential"] = None
             yield _normalize_schedule(record)
             await self.write_json(path, _normalize_schedule(record), lease)
-
-    async def prepare_move(
-        self, account_id: str, to: str, destination: str, source_path: str
-    ) -> None:
-        """Reserve both target URIs before content moves under their covering tree leases.
-
-        The source business path lets recovery distinguish a completed move from
-        a failed transfer. Every target in a moved parent is reserved before I/O.
-        """
-        record = await self.get(account_id, to)
-        if record is None or await self.get(account_id, destination) is not None:
-            raise ConflictError("Compile move target changed", resource="COMPILE_TARGET")
-        await self.write_json(
-            self._record_path(account_id, to),
-            record | {"move": {"to": destination, "source_path": source_path}},
-        )
-        await self.write_json(
-            self._record_path(account_id, destination),
-            record
-            | {
-                "to": destination,
-                "move": {"from": to, "phase": "transfer", "source_path": source_path},
-            },
-        )
-
-    async def move_state(self, account_id: str, to: str, destination: str) -> None:
-        """Recover a content move using pending state, without assuming atomic directory rename.
-
-        ``transfer`` reserves URIs before content moves; ``copying`` keeps the
-        complete source; ``cleanup`` never recopies history.
-        Pending destinations reject ordinary publication until source cleanup finishes.
-        Missing or replaced destination reservations raise ConflictError.
-        """
-        to, destination = to.rstrip("/"), destination.rstrip("/")
-        async with self.lock_targets(account_id, [to, destination]):
-            source = self._target_dir(account_id, to)
-            target = self._target_dir(account_id, destination)
-            original = await self.read_json(self._record_path(account_id, to))
-            record = await self.read_json(self._record_path(account_id, destination))
-            source_move = (original or {}).get("move", {})
-            transfer_path = source_move.get("source_path") or (record or {}).get("move", {}).get(
-                "source_path"
-            )
-            if transfer_path and (
-                record is None or record.get("move", {}).get("phase") == "transfer"
-            ):
-                try:
-                    await self._agfs.stat(transfer_path)
-                except (AGFSNotFoundError, FileNotFoundError):
-                    pass
-                else:
-                    # Content remains at the source, so its Compile registration stays there.
-                    if source_move.get("to") == destination:
-                        original.pop("move")
-                        await self.write_json(self._record_path(account_id, to), original)
-                    if record is not None and record.get("move", {}).get("from") == to:
-                        await self.remove(target, recursive=True)
-                    return
-            if record is not None and not record.get("move"):
-                # Another reader can finish recovery before this reader obtains the lease.
-                return
-            if record is None or record.get("move", {}).get("from") != to:
-                raise ConflictError("Compile move destination changed", resource="COMPILE_TARGET")
-            if record["move"]["phase"] == "transfer":
-                record["content_updated_at"] = time.time()
-                record["move"] = {"from": to, "phase": "copying"}
-                await self.write_json(self._record_path(account_id, destination), record)
-            if record["move"]["phase"] == "copying":
-                if source_move.get("to") != destination:
-                    raise ConflictError("Compile move source changed", resource="COMPILE_TARGET")
-                for folder in ("operations", "operation_outputs", "file_versions"):
-                    for name in await self.list_dir(f"{source}/{folder}"):
-                        value = await self.read_json(f"{source}/{folder}/{name}")
-                        if folder == "file_versions" and uri_matches_prefix(value["uri"], to):
-                            value["uri"] = destination + value["uri"][len(to) :]
-                            name = (
-                                hashlib.sha256(value["uri"].encode("utf-8")).hexdigest() + ".json"
-                            )
-                        await self.write_json(f"{target}/{folder}/{name}", value)
-                record["move"]["phase"] = "cleanup"
-                await self.write_json(self._record_path(account_id, destination), record)
-            # A recreated source is a different target and cannot be cleaned by this move.
-            if original is None or source_move.get("to") == destination:
-                await self.remove(source, recursive=True)
-            record.pop("move")
-            await self.write_json(self._record_path(account_id, destination), record)
 
     async def mark_content_updated(self, account_id: str, to: str) -> None:
         """Save the observed business-file change time in Unix seconds."""
@@ -603,7 +456,6 @@ class CompileStateStore:
 
     async def remove(self, path: str, *, recursive: bool = False, lease: Any = None) -> None:
         """Remove a path idempotently, reusing the caller's covering lease when supplied."""
-        lease = lease or self._move_lease(path)
         fs_ctx = fs_ctx_from_agfs_path(path)
         if lease is not None:
             fs_ctx["lease_ref"] = lease["lease_ref"]
@@ -1943,83 +1795,12 @@ class CompileVersions:
                         logger.exception("Failed to persist operation failure %s", operation_id)
                 raise exc from operation_error
 
-    async def guard_transfer(
-        self,
-        from_uri: str,
-        to_uri: str,
-        ctx: RequestContext,
-        *,
-        watched_uris: Optional[List[str]] = None,
-    ) -> bool:
-        """Reject Compile inputs or watched content transferred into a Compile target.
+    async def register_transfer(self, ctx: RequestContext) -> None:
+        """Update content timestamps for the current account's active package operation.
 
-        Destination intersections select the effective source subtree, so sibling
-        source branches do not block a transfer. Returns whether a target is touched.
-        watched_uris contains this account's Watch roots, including paused tasks.
-        """
-        source_root, destination = from_uri.rstrip("/"), to_uri.rstrip("/")
-        managed = False
-        for target in await self._store.list_summaries(ctx.account_id):
-            if target.get("status") != "active":
-                continue
-            to = target["to"]
-            if not (overlaps(source_root, to) or overlaps(destination, to)):
-                continue
-            managed = True
-            if not overlaps(destination, to):
-                continue
-            source = (
-                source_root + to[len(destination) :]
-                if uri_matches_prefix(to, destination)
-                else source_root
-            )
-            if source != source_root and not await self._fs.exists(source, ctx=ctx):
-                continue
-            record = await self._store.get(ctx.account_id, target["to"])
-            if record is None:
-                continue
-            sources = set(record["from"])
-            for run in await self._store.list_operations(ctx.account_id, target["to"]):
-                run_meta = run["meta"]
-                if (
-                    run_meta.get("task_id")
-                    and run["finished_at"] is None
-                    and run["status"] not in TERMINAL
-                    and run_meta["target_deleted_at"] == record["deleted_at"]
-                ):
-                    sources.update(run.get("params", {}).get("from", []))
-            if any(overlaps(source, root.rstrip("/")) for root in watched_uris or []):
-                raise ConflictError(
-                    "Watched resources cannot be transferred into a Compile target",
-                    resource="COMPILE_TARGET",
-                )
-            if any(overlaps(source, root.rstrip("/")) for root in sources):
-                raise InvalidArgumentError(
-                    "Compile sources cannot be transferred into their target"
-                )
-        return managed
-
-    async def register_transfer(
-        self,
-        from_uri: str,
-        to_uri: str,
-        ctx: RequestContext,
-        *,
-        lease_ref: Any,
-        move: bool = False,
-    ) -> None:
-        """Finalize target metadata and content timestamps under the transfer lease.
-
-        Partial moves relocate metadata only after the source disappears, except
-        when a whole target's metadata transaction already owns the move.
+        The caller holds the content lease; calls outside an operation have no effect.
         """
         context = _operation_outputs.get()
-        scope = _metadata_move.get()
-        source_root, destination = from_uri.rstrip("/"), to_uri.rstrip("/")
-        if move and (
-            (scope and scope.get("moves")) or not await self._fs.exists(source_root, ctx=ctx)
-        ):
-            await self.after_move(source_root, destination, ctx)
         if context is not None and context["account_id"] == ctx.account_id:
             for target in context["targets"].values():
                 await self._store.mark_content_updated(ctx.account_id, target["to"])
@@ -2512,28 +2293,13 @@ class CompileVersions:
         after = await self._fs.show_blob_raw(snapshot, path=uri, ctx=ctx)
         return before["oid"] != after["oid"]
 
-    async def move(self, account_id: str, from_uri: str, to_uri: str) -> None:
-        """Re-key indexes moved within one target; entries keep their old snapshot_path."""
-        source = await self.owning_target(account_id, from_uri)
-        if source is None:
-            return
-        target = await self.owning_target(account_id, to_uri)
-        for index in await self._indexes(account_id, source["to"]):
-            uri = index["uri"]
-            if uri != from_uri and not uri.startswith(f"{from_uri}/"):
-                continue
-            await self._store.delete_version_index(account_id, source["to"], uri)
-            if target is not None and target["to"] == source["to"]:
-                index["uri"] = to_uri + uri[len(from_uri) :]
-                await self._store.put_version_index(account_id, source["to"], index)
-
     async def drop_all(self, account_id: str, target_to: str) -> None:
         await self._store.clear_output_data(account_id, target_to)
 
-    # ---------- fs/rm and fs/mv ----------
+    # ---------- target removal ----------
 
     async def _targets_under(self, account_id: str, uri: str) -> List[Dict[str, Any]]:
-        """Active targets equal to or inside ``uri`` (a removed/moved directory)."""
+        """Return active targets equal to or inside the canonical directory URI."""
         return [
             item
             for item in await self._store.list_summaries(account_id)
@@ -2601,87 +2367,6 @@ class CompileVersions:
                 if is_versioned(uri):
                     async with self._store.edit(ctx.account_id, record["to"]) as record:
                         record["content_updated_at"] = time.time()
-
-    async def before_move(
-        self, from_uri: str, to_uri: str, ctx: RequestContext
-    ) -> List[Dict[str, Any]]:
-        """Validate target destinations and sources; return the targets whose metadata moves."""
-        targets = await self._reject_running(ctx.account_id, from_uri)
-        for item in targets:
-            record = await self._store.get(ctx.account_id, item["to"])
-            moved_to = to_uri + item["to"][len(from_uri) :]
-            existing = await self._store.get(ctx.account_id, moved_to)
-            if existing is not None:
-                raise ConflictError(
-                    "Compile destination is already registered", resource="COMPILE_TARGET"
-                )
-            if any(overlaps(source, moved_to) for source in record["from"]):
-                raise InvalidArgumentError("Compile target would overlap its sources")
-        return targets
-
-    @asynccontextmanager
-    async def lock_move(
-        self, from_uri: str, to_uri: str, ctx: RequestContext
-    ) -> AsyncIterator[None]:
-        """Cover target relocation with metadata leases inside the transfer's content lease.
-
-        Busy metadata fails immediately because Compile finalization can hold an
-        operation lock while waiting for content. Target layout is validated before locking.
-        """
-        from_uri, to_uri = from_uri.rstrip("/"), to_uri.rstrip("/")
-        targets = await self.before_move(from_uri, to_uri, ctx)
-        paths = [
-            uri
-            for target in targets
-            for uri in (target["to"], to_uri + target["to"][len(from_uri) :])
-        ]
-        async with self._store.lock_targets(ctx.account_id, paths):
-            if targets:
-                scope = _metadata_move.get()
-                scope["moves"] = targets
-                for target in targets:
-                    source_uri = (
-                        target["to"] if await self._fs.exists(target["to"], ctx=ctx) else from_uri
-                    )
-                    await self._store.prepare_move(
-                        ctx.account_id,
-                        target["to"],
-                        to_uri + target["to"][len(from_uri) :],
-                        self._fs._uri_to_path(source_uri, ctx=ctx),
-                    )
-            yield
-
-    async def after_move(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
-        """Relocate all target metadata and update this operation's destination routing."""
-        if from_uri == to_uri:
-            return
-        scope = _metadata_move.get()
-        moved = (
-            scope["moves"]
-            if scope and scope.get("moves") is not None
-            else await self._targets_under(ctx.account_id, from_uri)
-        )
-        for item in moved:
-            destination = to_uri + item["to"][len(from_uri) :]
-            await self._store.move_state(ctx.account_id, item["to"], destination)
-            record = await self._store.get(ctx.account_id, destination)
-            if record is None:
-                continue
-            context = _operation_outputs.get()
-            if context is not None and context["account_id"] == ctx.account_id:
-                target = context["targets"].pop(item["to"], None)
-                if target is not None:
-                    target["to"] = destination
-                    context["targets"][destination] = target
-                    context["outputs"][destination] = context["outputs"].pop(item["to"])
-            if self.reschedule is not None:
-                await self.reschedule(ctx.account_id, record, previous_to=item["to"])
-        if not moved:
-            await self.move(ctx.account_id, from_uri, to_uri)
-            for uri in {from_uri, to_uri}:
-                record = await self.owning_target(ctx.account_id, uri)
-                if record is not None and is_versioned(uri):
-                    await self._store.mark_content_updated(ctx.account_id, record["to"])
 
     # ---------- queries and single-file restore ----------
 

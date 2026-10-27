@@ -201,10 +201,9 @@ class CompileScheduler:
         account_id: str,
         record: Dict[str, Any],
         *,
-        previous_to: Optional[str] = None,
         raise_on_error: bool = False,
     ) -> None:
-        """Mirror the URI's schedule and remove ``previous_to`` after a move.
+        """Mirror the target URI's current schedule in the expiry scheduler.
 
         Strict callers receive 412 when enabling without Redis and 503 on registration failure.
         """
@@ -224,15 +223,6 @@ class CompileScheduler:
             record["to"],
         )
         try:
-            if previous_to is not None and previous_to != record["to"]:
-                await self._expiry.unregister(
-                    ItemIdentity(
-                        COMPILE_TARGET_ITEM_TYPE,
-                        account_id,
-                        "_system",
-                        previous_to,
-                    )
-                )
             if record.get("status") == "active" and record.get("auto_update"):
                 schedule = record["update_schedule"]
                 due = next_slot(schedule, datetime.now(TZ))

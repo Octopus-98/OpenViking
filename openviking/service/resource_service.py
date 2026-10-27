@@ -2588,9 +2588,7 @@ class ResourceService:
                     ctx,
                     "agent_revise",
                     {},
-                    lambda: self.compile_versions.register_transfer(
-                        skill_uri, skill_uri, ctx, lease_ref=lease_ref
-                    ),
+                    lambda: self.compile_versions.register_transfer(ctx),
                 )
 
         try:

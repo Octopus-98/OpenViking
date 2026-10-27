@@ -55,6 +55,42 @@ async def test_ordinary_writes_do_not_scan_compile_targets(monkeypatch, file_cou
     ] == "viking://resources/wiki0"
 
 
+@pytest.mark.asyncio
+async def test_skill_package_records_active_compile_operation(service):
+    """Skill installation records its operation and content time under an active Compile target."""
+    ctx = RequestContext(user=service.user, role=Role.ROOT)
+    store = service.compile.lifecycle.store
+    target = "viking://agent/skills"
+    operation = new_operation("cmp_package", "manual_compile", {}, ctx.user.user_id)
+    operation["meta"] = {"task_id": "cmp_package"}
+    async with store.edit(ctx.account_id, target, create=True) as record:
+        record.update(active_task_id=operation["operation_id"], content_updated_at=1)
+    await store.put_operation(ctx.account_id, target, operation)
+
+    result = await service.resources.add_skill(
+        {
+            "name": "compile-package",
+            "description": "Package tracked by Compile",
+            "content": "Use this package for testing.",
+        },
+        ctx,
+        target_uri=target,
+        apply_privacy=False,
+    )
+
+    assert result["root_uri"] == f"{target}/compile-package"
+    assert (await store.get(ctx.account_id, target))["content_updated_at"] > 1
+    revisions = [
+        entry
+        for entry in await store.list_operations(ctx.account_id, target)
+        if entry["operation_type"] == "agent_revise"
+    ]
+    assert len(revisions) == 1
+    assert revisions[0]["status"] == "completed"
+    assert revisions[0]["params"] == {"uris": [result["root_uri"]]}
+    assert revisions[0]["finished_at"] is not None
+
+
 @pytest.mark.parametrize(
     "skill,valid",
     [
