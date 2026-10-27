@@ -338,6 +338,7 @@ async def test_feishu_parse_sends_uat_and_uses_artifact_root(tmp_path: Path):
     result = await api.parse(
         "https://example.larkoffice.com/wiki/wikicnToken",
         feishu_access_token="u-test",
+        _feishu_resolved_type="docx",
     )
 
     api._create_response_for_url.assert_awaited_once_with(
@@ -512,6 +513,39 @@ async def test_submit_url_returns_response_id_without_persisting_auth():
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["parse", "submit_url"])
+@pytest.mark.parametrize("path,options", [
+    ("file/fileToken", {}),
+    ("wiki/wikiToken", {"_feishu_resolved_type": "file"}),
+    ("wiki/wikiToken", {"feishu_recursive": True}),
+])
+async def test_known_file_cannot_bypass_url_routing_guard(method, path, options):
+    from openviking_cli.exceptions import InvalidArgumentError
+
+    api = _understanding_api_for_parse()
+    api._resolve_lark_file = AsyncMock()
+    api._create_response_for_url = AsyncMock()
+    with pytest.raises(InvalidArgumentError, match="materialized"):
+        await getattr(api, method)("https://example.larkoffice.com/" + path, **options)
+    api._resolve_lark_file.assert_not_awaited()
+    api._create_response_for_url.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["parse", "submit_url"])
+async def test_unresolved_wiki_cannot_bypass_url_routing_guard(method):
+    from openviking_cli.exceptions import InvalidArgumentError
+
+    api = _understanding_api_for_parse()
+    api._resolve_lark_file = AsyncMock()
+    api._create_response_for_url = AsyncMock()
+    with pytest.raises(InvalidArgumentError, match="type must be resolved"):
+        await getattr(api, method)("https://example.larkoffice.com/wiki/wikiToken")
+    api._resolve_lark_file.assert_not_awaited()
+    api._create_response_for_url.assert_not_awaited()
+
+
 def test_add_resource_message_round_trips_internal_fields():
     msg = AddResourceMsg(
         task_id="task-1",
@@ -625,7 +659,13 @@ async def test_uat_producer_payload_reaches_worker_without_persisting_token(
     async def preflight(_self, _source, *, feishu_access_token=None, **kwargs):
         assert feishu_access_token == "u-secret"
         assert kwargs["feishu_config"] is feishu_config
-        return SimpleNamespace(source_name=preflight_name, source_format="file")
+        from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+
+        return SimpleNamespace(
+            doc_type=FeishuAccessor._parse_feishu_url(_source)[0],
+            source_name=preflight_name,
+            source_format="file",
+        )
 
     async def plan_source_job_target(*, source_info, **_kwargs):
         return root_uri, None, source_info.source_name is None, False
@@ -664,6 +704,7 @@ async def test_uat_producer_payload_reaches_worker_without_persisting_token(
         feishu_access_token="u-secret",
         feishu_config=feishu_config,
         custom_option="forwarded",
+        _feishu_resolved_type=source.split("/")[3],
     )
     payload = queue_manager.enqueue.await_args.args[1]
     assert queue_manager.enqueue.await_args.args[0] == QueueManager.EXTERNAL_PARSE
@@ -866,7 +907,7 @@ async def test_uat_producer_cancellation_respects_queue_ownership(
 
     async def preflight(_self, _source, *, feishu_access_token=None, **_kwargs):
         assert feishu_access_token == "u-secret"
-        return SimpleNamespace(source_name=None, source_format="file")
+        return SimpleNamespace(doc_type="docx", source_name=None, source_format="file")
 
     monkeypatch.setattr(
         "openviking.parse.accessors.feishu_accessor.FeishuAccessor.preflight_source",

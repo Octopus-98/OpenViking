@@ -9,6 +9,44 @@ from openviking.parse.parsers.media.utils import MPEG_TS_PACKET_SIZE, MPEG_TS_PR
 from openviking.parse.registry import ParserRegistry
 from openviking.parse.understanding_api import PREPARED_FILE_ID_ARG, PREPARED_RESPONSE_ID_ARG
 from openviking.utils.media_processor import UnifiedResourceProcessor
+from openviking_cli.exceptions import InvalidArgumentError
+
+
+@pytest.mark.asyncio
+async def test_unsupported_drive_file_does_not_fall_back_to_text(tmp_path):
+    source = tmp_path / "binary.exe"
+    source.write_bytes(b"MZ\x00\xff")
+    registry = ParserRegistry()
+    registry.parse = AsyncMock()
+    router = ParserRouter(registry)
+    resource = LocalResource(
+        path=source,
+        source_type=SourceType.FEISHU,
+        original_source="https://example.feishu.cn/file/test",
+        meta={"feishu_content_kind": "file"},
+    )
+
+    with pytest.raises(InvalidArgumentError, match="Unsupported Drive file format"):
+        await router.parse(resource, parser_backend="internal")
+
+    registry.parse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_drive_text_file_keeps_existing_text_fallback(tmp_path):
+    source = tmp_path / "settings.yaml"
+    source.write_text("enabled: true\n")
+    registry = ParserRegistry()
+    registry.parse = AsyncMock(return_value="parsed")
+    resource = LocalResource(
+        path=source,
+        source_type=SourceType.FEISHU,
+        original_source="https://example.feishu.cn/file/test",
+        meta={"feishu_content_kind": "file"},
+    )
+
+    assert await ParserRouter(registry).parse(resource, parser_backend="internal") == "parsed"
+    registry.parse.assert_awaited_once_with(source)
 
 
 def mpeg_ts_probe() -> bytes:

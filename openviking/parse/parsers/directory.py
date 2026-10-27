@@ -317,6 +317,8 @@ class DirectoryParser(BaseParser):
                         )
                         if kwargs.get("lark_file"):
                             parse_options["lark_file"] = kwargs["lark_file"]
+                        if entry.resolved_source is not None:
+                            parse_options["_feishu_resolved_type"] = entry.resolved_source.doc_type
                     checkpoint = kwargs.get("_feishu_checkpoint")
                     if plan and checkpoint is not None:
                         saved, save = checkpoint

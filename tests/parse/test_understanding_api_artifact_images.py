@@ -118,3 +118,66 @@ async def test_unpack_artifact_supports_local_output_store(tmp_path: Path):
     assert ref.resource_rel == "resource"
     assert Path(ref.root, "resource", "section.md").read_text() == "content"
     assert set(await read_artifact_manifest(store, ref)) == {"resource/section.md"}
+
+
+@pytest.mark.asyncio
+async def test_normalized_title_preserves_nested_artifact_references(tmp_path):
+    archive_path = tmp_path / "nested.zip"
+    markdown = "![diagram](./image.png)\n[child](../Child/body.md)\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("Raw Title /Chapter/body.md", markdown)
+        archive.writestr("Raw Title /Chapter/image.png", b"png")
+        archive.writestr("Raw Title /Child/body.md", "child")
+    store = LocalParseOutputStore(str(tmp_path / "artifacts"))
+    ref = await UnderstandingAPI.__new__(UnderstandingAPI)._unpack_zip_to_temp_dir(
+        archive_path, " Raw Title \u00a0", parse_output_store=store
+    )
+    root = Path(ref.root, ref.resource_rel)
+    assert ref.resource_rel == "Raw Title"
+    assert (root / "Chapter/body.md").read_text() == markdown
+    assert (root / "Chapter/image.png").read_bytes() == b"png"
+    assert (root / "Chapter/../Child/body.md").read_text() == "child"
+    mappings = json.loads((root / IMAGE_MAPPINGS_FILENAME).read_text())
+    assert mappings == {"Chapter/body.md": {"./image.png": "image.png"}}
+    assert set(await read_artifact_manifest(store, ref)) == {
+        "Raw Title/Chapter/body.md",
+        "Raw Title/Chapter/image.png",
+        "Raw Title/Child/body.md",
+        f"Raw Title/{IMAGE_MAPPINGS_FILENAME}",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title", [" Title ", "\tTitle\n", "\u3000Title\u00a0"])
+@pytest.mark.parametrize("backend", ["agfs", "local"])
+async def test_artifact_title_has_one_root_for_mkdir_and_writes(tmp_path, title, backend):
+    """Model AGFS's whole-path trim: the old code creates two sibling roots."""
+    from openviking.parse.output import ParseArtifactRef
+
+    class TrimmingFS(_FakeVikingFS):
+        async def mkdir(self, uri, exist_ok=False):
+            self.dirs.add(uri.strip())
+
+        async def write_file_bytes(self, uri, content):
+            self.dirs.add(uri.rsplit("/", 1)[0])
+            await super().write_file_bytes(uri, content)
+
+    archive_path = tmp_path / "artifact.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("document/body.md", "content")
+    fs = TrimmingFS()
+    options = {}
+    if backend == "local":
+        options["parse_output_store"] = LocalParseOutputStore(str(tmp_path / "artifacts"))
+    with patch("openviking.parse.understanding_api.get_viking_fs", return_value=fs):
+        ref = await UnderstandingAPI.__new__(UnderstandingAPI)._unpack_zip_to_temp_dir(
+            archive_path, title, **options
+        )
+    assert ref.resource_rel == "Title"
+    assert ParseArtifactRef.from_dict(ref.to_dict()).resource_rel == "Title"
+    if backend == "local":
+        assert [p.name for p in Path(ref.root).iterdir() if p.is_dir()] == ["Title"]
+        assert Path(ref.root, "Title", "body.md").read_text() == "content"
+    else:
+        assert fs.dirs - {ref.root} == {f"{ref.root}/Title"}
+        assert fs.files[f"{ref.root}/Title/body.md"] == b"content"

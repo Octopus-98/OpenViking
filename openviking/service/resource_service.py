@@ -1100,6 +1100,9 @@ class ResourceService:
                 feishu_config=feishu_config,
                 **({"feishu_recursive": True} if recursive else {}),
             )
+            # A Wiki URL can wrap a binary Drive file. Routing must use the
+            # resolved object, not the URL's /wiki/ prefix.
+            routing_kwargs = {**feishu_kwargs, "_feishu_resolved_type": preflight.doc_type}
             source_name = source_name or preflight.source_name
             source_info = _ResourceSourceInfo(
                 source_name=source_name,
@@ -1111,18 +1114,18 @@ class ResourceService:
                 mode is ParseMode.DEFAULT
                 and self._resource_processor.should_use_understanding_directly(
                     path,
-                    **feishu_kwargs,
+                    **routing_kwargs,
                 )
             )
             if direct_understanding:
                 understanding_response_id = await self._resource_processor.submit_understanding(
                     path,
-                    **feishu_kwargs,
+                    **routing_kwargs,
                 )
                 if watch_auth_state is None:
                     task_auth = {}
             else:
-                source_type, _ = FeishuAccessor._parse_feishu_url(path)
+                source_type = preflight.doc_type
                 if source_type in {"folder", "file"} or recursive:
                     if processor_kwargs.get("lark_file") is not None:
                         raise InvalidArgumentError(

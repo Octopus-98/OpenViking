@@ -123,6 +123,8 @@ class UnderstandingAPI(BaseParser):
         # Only a directly routed Feishu URL uses the Lark protocol. Accessor
         # output is an existing local Markdown file and must stay local.
         is_feishu_url = self._is_feishu_url(source_str)
+        if is_feishu_url and not prepared_response_id and not prepared_file_id:
+            self._validate_feishu_url_submission(source_str, kwargs)
         lark_file = (
             await self._resolve_lark_file(kwargs)
             if is_feishu_url and not prepared_response_id and not prepared_file_id
@@ -338,6 +340,8 @@ class UnderstandingAPI(BaseParser):
             raise ValueError("UnderstandingAPI URL submission requires an http(s) URL")
 
         is_feishu_url = self._is_feishu_url(source)
+        if is_feishu_url:
+            self._validate_feishu_url_submission(source, kwargs)
         lark_file = await self._resolve_lark_file(kwargs) if is_feishu_url else None
 
         parsed = urlparse(source)
@@ -361,8 +365,30 @@ class UnderstandingAPI(BaseParser):
             )
         return str(response_id)
 
+    @staticmethod
+    def _validate_feishu_url_submission(source: str, kwargs: Dict[str, Any]) -> None:
+        from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+        from openviking.parse.feishu_import import recursive_wiki
+
+        doc_type, _ = FeishuAccessor._parse_feishu_url(source)
+        if (
+            doc_type in {"file", "folder"}
+            or kwargs.get("_feishu_resolved_type") in {"file", "folder"}
+            or (doc_type == "wiki" and recursive_wiki(kwargs))
+        ):
+            raise InvalidArgumentError(
+                "Feishu files and recursive sources must be materialized before URL submission"
+            )
+        if doc_type == "wiki" and not kwargs.get("_feishu_resolved_type"):
+            raise InvalidArgumentError(
+                "Wiki backing object type must be resolved before URL submission; "
+                "use the resource import pipeline"
+            )
+
     def can_submit_url_directly(self, source: str, **kwargs) -> bool:
         """Return whether this URL can bypass source materialization."""
+        if kwargs.get("_feishu_prepared_source"):
+            return False
         if not source.startswith(("http://", "https://")) or not self._is_feishu_url(source):
             return False
         from openviking.parse.accessors.feishu_accessor import FeishuAccessor
@@ -370,6 +396,10 @@ class UnderstandingAPI(BaseParser):
 
         doc_type, _ = FeishuAccessor._parse_feishu_url(source)
         if doc_type in {"folder", "file"} or (doc_type == "wiki" and recursive_wiki(kwargs)):
+            return False
+        if kwargs.get("_feishu_resolved_type") in {"folder", "file"}:
+            return False
+        if doc_type == "wiki" and not kwargs.get("_feishu_resolved_type"):
             return False
         if self._normalize_lark_file(kwargs):
             return True
@@ -790,7 +820,9 @@ class UnderstandingAPI(BaseParser):
             parse_output_store,
             viking_fs=get_viking_fs() if parse_output_store is None else None,
         )
-        resource_rel = str(resource_name).strip("/")
+        from openviking_cli.utils.storage_name import normalize_title_segment
+
+        resource_rel = normalize_title_segment(resource_name)
         try:
             await writer.mkdir(resource_rel)
 
@@ -824,6 +856,11 @@ class UnderstandingAPI(BaseParser):
                         json.dumps(image_mappings, ensure_ascii=False),
                     )
         except BaseException:
+            logger.warning(
+                "[UnderstandingAPI] Artifact title original=%r normalized=%r",
+                resource_name,
+                resource_rel,
+            )
             try:
                 await writer.cleanup()
             except Exception as cleanup_exc:

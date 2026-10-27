@@ -9,7 +9,7 @@ import pytest
 from openviking.parse.accessors.base import LocalResource, SourceType
 from openviking.parse.accessors.feishu_accessor import FeishuAccessor, _FeishuWikiTreeNode
 from openviking.parse.base import NodeType, ResourceNode, create_parse_result
-from openviking.parse.feishu_import import FeishuImportPlan
+from openviking.parse.feishu_import import FeishuImportPlan, FeishuResolvedSource
 from openviking.parse.parser_router import ParserRouter
 from openviking.parse.parsers.directory import DirectoryParser
 from openviking.parse.understanding_api import UnderstandingAPI
@@ -32,6 +32,45 @@ def _runtime_config_manager(feishu_config=None):
         )
 
     return SimpleNamespace(resolve_account=resolve_account)
+
+
+@pytest.mark.asyncio
+async def test_colliding_wiki_titles_replay_with_stable_paths_and_checkpoints(monkeypatch, tmp_path):
+    accessor = FeishuAccessor()
+    root = _FeishuWikiTreeNode("root", "space", "Root", "docx", "root-doc")
+    children = [
+        _FeishuWikiTreeNode("node-a", "space", "A B", "docx", "doc-a"),
+        _FeishuWikiTreeNode("node-b", "space", "A_B", "docx", "doc-b"),
+        _FeishuWikiTreeNode("node-c", "space", "A B\u00a0", "docx", "doc-c"),
+    ]
+    snapshots = []
+    orders = (children, list(reversed(children)), children[1:], children[:1], children)
+    for index, order in enumerate(orders):
+        directory = tmp_path / str(index)
+        plan = FeishuImportPlan(
+            directory, use_understanding=True, source_url="https://example.feishu.cn/wiki/root"
+        )
+        monkeypatch.setattr(
+            accessor,
+            "_list_wiki_node_children",
+            lambda space, token, order=order, **kwargs: order if token == "root" else [],
+        )
+        await accessor._materialize_wiki_tree_node(root, directory, plan=plan, strict=True)
+        snapshot = {
+            entry.token: (entry.path.relative_to(directory).as_posix(), entry.checkpoint_key(directory))
+            for entry in plan.entries
+        }
+        assert len({value[0] for value in snapshot.values()}) == len(order) + 1
+        assert len({value[1] for value in snapshot.values()}) == len(order) + 1
+        snapshots.append(snapshot)
+    assert snapshots[0] == snapshots[1] == snapshots[-1]
+    # Removal can free a numbered path. Its new occupant must never resume
+    # another document's upstream response just because the path is reused.
+    for before, after in zip(snapshots, snapshots[1:], strict=False):
+        old_paths = {path: (token, key) for token, (path, key) in before.items()}
+        for token, (path, key) in after.items():
+            if path in old_paths and old_paths[path][0] != token:
+                assert key != old_paths[path][1]
 
 
 @pytest.mark.parametrize(
@@ -121,14 +160,15 @@ async def test_directory_executes_url_with_auth_and_preserves_output_parent(
     (tmp_path / "empty").mkdir()
     plan = FeishuImportPlan(tmp_path, use_understanding=True)
     path = tmp_path / "nested/Cloud.md"
-    url = "https://example.feishu.cn/base/app?table=t&view=v"
-    plan.add(path, url, "app", "url")
+    url = "https://example.feishu.cn/wiki/node?table=t&view=v"
+    plan.add(path, url, "app", "url", FeishuResolvedSource(url, "base", "app", "Cloud", "node"))
     fs = FakeVikingFS()
     parser = DirectoryParser()
     monkeypatch.setattr(parser, "_get_viking_fs", lambda: fs)
     calls = []
 
     async def parse_api(self, source, **options):
+        UnderstandingAPI._validate_feishu_url_submission(source, options)
         calls.append((source, options))
         await options["_response_checkpoint"]("response-1")
         await fs.mkdir("viking://temp/doc/Cloud", exist_ok=True)
@@ -158,6 +198,7 @@ async def test_directory_executes_url_with_auth_and_preserves_output_parent(
     assert calls[0][0] == url
     assert calls[0][1]["feishu_access_token"] == "secret"
     assert calls[0][1]["resource_name"] == "Cloud.md"
+    assert calls[0][1]["_feishu_resolved_type"] == "base"
     assert calls[0][1].get("understanding_response_id") == ("old" if resume else None)
     save.assert_awaited_once_with(plan.entries[0].checkpoint_key(plan.root), "response-1")
     assert result.meta["failed_files"] == []
@@ -243,7 +284,10 @@ async def test_media_prepare_enables_url_plan_only_for_correct_backend(monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind,recursive", [("folder", False), ("wiki", True), ("file", False)])
+@pytest.mark.parametrize(
+    "kind,recursive",
+    [("folder", False), ("wiki", True), ("file", False), ("wiki-file", False)],
+)
 async def test_async_source_plan_does_not_submit_collection_or_file_url(
     monkeypatch, kind, recursive
 ):
@@ -271,19 +315,24 @@ async def test_async_source_plan_does_not_submit_collection_or_file_url(
     )
     preflight = AsyncMock(
         return_value=SimpleNamespace(
-            doc_type=kind,
+            doc_type="file" if kind == "wiki-file" else kind,
             source_format="file" if kind == "file" else "directory",
             source_name="Root",
         )
     )
     monkeypatch.setattr(FeishuAccessor, "preflight_source", preflight)
-    path = "drive/folder/root" if kind == "folder" else f"{kind}/root"
+    url_kind = "wiki" if kind == "wiki-file" else kind
+    path = "drive/folder/root" if kind == "folder" else f"{url_kind}/root"
     plan = await service._prepare_standard_source_plan(
         path=f"https://example.feishu.cn/{path}",
         ctx=RequestContext(user=UserIdentifier("account", "user"), role=Role.USER),
         mode=ParseMode.DEFAULT,
         allow_local_path_resolution=False,
-        processor_kwargs={"feishu_recursive": recursive, "feishu_access_token": "secret"},
+        processor_kwargs={
+            "feishu_recursive": recursive,
+            "feishu_access_token": "secret",
+            "parser_backend": "understanding",
+        },
         watch_auth_state=None,
     )
     submit.assert_not_awaited()
@@ -316,7 +365,9 @@ async def test_direct_understanding_receives_effective_account_feishu_config(mon
     monkeypatch.setattr(
         FeishuAccessor,
         "preflight_source",
-        AsyncMock(return_value=SimpleNamespace(source_format="file", source_name="Doc")),
+        AsyncMock(
+            return_value=SimpleNamespace(doc_type="docx", source_format="file", source_name="Doc")
+        ),
     )
     service = ResourceService(
         viking_fs=SimpleNamespace(),
@@ -560,6 +611,9 @@ async def test_drive_wiki_reference_resolves_backing_content(monkeypatch, tmp_pa
     assert plan.entries[0].token == "app"
     assert plan.entries[0].kind == "url"
 
+    resolved = plan.entries[0].resolved_source
+    assert resolved == FeishuResolvedSource(url, "base", "app", "Table", "ref")
+
 
 @pytest.mark.asyncio
 async def test_source_preparation_does_not_silently_ignore_explicit_lark_auth():
@@ -607,7 +661,10 @@ async def test_single_feishu_file_no_split_uses_native_parser(monkeypatch, tmp_p
         meta={"feishu_content_kind": "file"},
         is_temporary=False,
     )
-    registry = SimpleNamespace(parse=AsyncMock(return_value=object()))
+    registry = SimpleNamespace(
+        parse=AsyncMock(return_value=object()),
+        get_parser_for_file=lambda path: object(),
+    )
     api = SimpleNamespace(parse=AsyncMock(return_value=object()))
     processor = UnifiedResourceProcessor(vlm_processor=object())
     processor._accessor_registry = SimpleNamespace(access=AsyncMock(return_value=resource))

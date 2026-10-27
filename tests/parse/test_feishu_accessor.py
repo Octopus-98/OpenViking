@@ -699,7 +699,8 @@ def test_download_image_advertises_user_token_when_provided(monkeypatch):
     assert args[1].user_access_token == "u-test"
 
 
-def test_access_downloads_drive_file_with_user_token(monkeypatch):
+@pytest.mark.parametrize("wiki", [False, True])
+def test_access_downloads_drive_file_with_user_token(monkeypatch, wiki):
     _install_fake_lark_modules(monkeypatch)
     _FakeTransport.response = _FakeRawResponse(
         b"%PDF-1.7",
@@ -708,6 +709,11 @@ def test_access_downloads_drive_file_with_user_token(monkeypatch):
     accessor = FeishuAccessor()
     _use_fake_client(monkeypatch, accessor, SimpleNamespace(_config=SimpleNamespace()))
     url = "https://bytedance.larkoffice.com/file/file_token"
+    if wiki:
+        url = "https://bytedance.larkoffice.com/wiki/wiki_token"
+        monkeypatch.setattr(
+            accessor, "_resolve_wiki_node", lambda *args, **kwargs: ("file", "file_token", "")
+        )
 
     assert accessor.can_handle(url)
     resource = asyncio.run(accessor.access(url, feishu_access_token="u-test"))
@@ -952,13 +958,16 @@ def test_access_wiki_recursive_materializes_mixed_tree(monkeypatch):
         assert (
             resource.path / "非飞书文档" / "飞书文档" / "飞书文档.md"
         ).read_text(encoding="utf-8") == "# doc_child"
-        assert (
+        assert not (
             resource.path / "非飞书文档" / "飞书文档" / "非飞书文档.bin"
-        ).read_bytes() == b"binary"
+        ).exists()
         assert resource.meta["original_filename"] == "飞书文档"
         assert not (resource.path / "飞书文档" / "飞书文档.md").exists()
         assert cleanup_path.exists()
-        assert resource.meta["feishu_folder_skipped_items"] == []
+        skipped = resource.meta["feishu_folder_skipped_items"]
+        assert len(skipped) == 1
+        assert skipped[0]["wiki_node_token"] == "wiki_bin"
+        assert "Cannot determine Drive file format" in skipped[0]["reason"]
     finally:
         resource.cleanup()
         assert not cleanup_path.exists()
@@ -980,6 +989,9 @@ def test_access_wiki_without_recursive_keeps_single_document_behavior(monkeypatc
         )
 
     monkeypatch.setattr(accessor, "_resolve_wiki_tree_root", recursive_root)
+    monkeypatch.setattr(
+        accessor, "_resolve_wiki_node", lambda *_args: ("docx", "doc_token", "Single Wiki")
+    )
     monkeypatch.setattr(accessor, "_fetch_document", fake_fetch_document)
     monkeypatch.setattr(
         accessor,

@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from openviking.parse.accessors.base import LocalResource, SourceType
 from openviking.parse.backend import ParserBackend, normalize_parser_backend
 from openviking.parse.base import ParseResult
+from openviking.parse.parsers.upload_utils import is_text_file
 from openviking.parse.registry import ParserRegistry
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.utils.logger import get_logger
@@ -153,6 +154,17 @@ class ParserRouter:
             logger.info(f"[ParserRouter] Using UnderstandingAPI for {display}")
             return await self._get_understanding_api().parse(str(source_path), **kwargs)
         else:
+            if (
+                isinstance(source, LocalResource)
+                and source.source_type == SourceType.FEISHU
+                and source.meta.get("feishu_content_kind") == "file"
+                and self._parser_registry.get_parser_for_file(source_path) is None
+                and not is_text_file(source_path)
+            ):
+                raise InvalidArgumentError(
+                    "Unsupported Drive file format for the selected internal parser: "
+                    f"{Path(source_path).suffix.lower() or '(no extension)'}"
+                )
             try:
                 display = Path(source_path).name
             except Exception:

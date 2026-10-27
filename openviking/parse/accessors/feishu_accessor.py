@@ -17,7 +17,7 @@ import mimetypes
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional, Tuple, Union
 from urllib.parse import parse_qs, unquote, urlparse, urlunparse
@@ -25,10 +25,12 @@ from urllib.parse import parse_qs, unquote, urlparse, urlunparse
 from lark_oapi.core.cache import ICache
 
 from openviking.parse.base import format_table_to_markdown
-from openviking.parse.feishu_import import FeishuImportPlan, recursive_wiki
+from openviking.parse.feishu_import import FeishuImportPlan, FeishuResolvedSource, recursive_wiki
 from openviking.utils.exceptions import error_code_from_http_status
+from openviking.utils.path_safety import normalize_storage_segment
 from openviking_cli.exceptions import InvalidArgumentError, OpenVikingError
 from openviking_cli.utils.logger import get_logger
+from openviking_cli.utils.storage_name import URI_SEGMENT_MAX_LENGTH, normalize_title_segment
 
 from .base import DataAccessor, LocalResource, SourceType
 from .feishu_session import FeishuAccessContext, FeishuApiSession
@@ -93,7 +95,7 @@ def _title_as_filename(title: str) -> str:
     through filename-oriented helpers downstream, so leaving separators in that
     field makes ``Path(...).name`` silently discard the title prefix.
     """
-    return title.replace("/", "_").replace("\\", "_")
+    return normalize_title_segment(title)
 
 
 def _truncate_text_for_path_segment(text: str, *, max_chars: int, max_bytes: int) -> str:
@@ -130,7 +132,7 @@ def _safe_path_segment(
     max_bytes: int = _MAX_PATH_SEGMENT_BYTES,
 ) -> str:
     """Return one portable path segment while preserving readable names."""
-    safe_name = re.sub(r"[\x00-\x1f/\\:*?\"<>|]+", "_", str(name or "")).strip(" ._")
+    safe_name = normalize_title_segment(name, fallback=fallback)
     safe_name = re.sub(r"\s+", " ", safe_name)
     if not safe_name:
         safe_name = fallback
@@ -170,7 +172,9 @@ def _numbered_path_segment(stem: str, suffix: str, index: int) -> str:
     marker_bytes = len(marker.encode("utf-8"))
     suffix_bytes = len(suffix.encode("utf-8"))
     max_stem_bytes = _MAX_PATH_SEGMENT_BYTES - marker_bytes - suffix_bytes
-    max_stem_chars = _MAX_PATH_SEGMENT_CHARS - len(marker) - len(suffix)
+    # Numbered names contain whitespace, so final URI normalization applies
+    # its shorter limit. Keep the discriminator inside that limit.
+    max_stem_chars = URI_SEGMENT_MAX_LENGTH - len(marker) - len(suffix)
     safe_stem = _truncate_text_for_path_segment(
         stem,
         max_chars=max_stem_chars,
@@ -471,6 +475,14 @@ class FeishuAccessor(DataAccessor):
         feishu_access_token = kwargs.get("feishu_access_token")
         try:
             doc_type, token = self._parse_feishu_url(source_str)
+            resolved_source = None
+            if doc_type == "wiki" and not recursive_wiki(kwargs):
+                resolved_source = await asyncio.to_thread(
+                    self._resolve_source_identity, source_str, feishu_access_token
+                )
+                doc_type, token = resolved_source.doc_type, resolved_source.token
+            elif doc_type == "file":
+                resolved_source = self._resolve_source_identity(source_str)
             if (
                 doc_type in {"folder", "file"} or (doc_type == "wiki" and recursive_wiki(kwargs))
             ) and kwargs.get("lark_file") is not None:
@@ -479,10 +491,13 @@ class FeishuAccessor(DataAccessor):
                     "Feishu application credentials, not lark_file."
                 )
             if doc_type == "file":
-                content, content_type, filename = await asyncio.to_thread(
-                    self._download_drive_file,
+                content, content_type, filename = await self._download_drive_content(
                     token,
                     feishu_access_token=feishu_access_token,
+                    filename_hint=resolved_source.title or None,
+                    max_bytes=self._positive_int_option(
+                        kwargs.get("feishu_max_download_bytes"), default=1024 * 1024 * 1024
+                    ),
                 )
                 local_path = self._write_temp_drive_file(
                     token,
@@ -500,6 +515,14 @@ class FeishuAccessor(DataAccessor):
                         "feishu_token": token,
                         "original_filename": local_path.name,
                         "_cleanup_path": str(local_path.parent),
+                        "feishu_resolved_source": asdict(
+                            replace(
+                                resolved_source,
+                                filename=local_path.name,
+                                extension=local_path.suffix.lower(),
+                                mime_type=content_type,
+                            )
+                        ),
                     },
                     is_temporary=True,
                 )
@@ -523,7 +546,7 @@ class FeishuAccessor(DataAccessor):
                         strict=bool(kwargs.get("strict", False)),
                         plan=plan,
                     )
-                except Exception:
+                except BaseException:
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     raise
                 return LocalResource(
@@ -570,7 +593,7 @@ class FeishuAccessor(DataAccessor):
                             default=5000,
                         ),
                     )
-                except Exception:
+                except BaseException:
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     raise
                 if not root_dir.exists():
@@ -600,6 +623,7 @@ class FeishuAccessor(DataAccessor):
             doc = await self._fetch_document(
                 source_str,
                 feishu_access_token=feishu_access_token,
+                **({"resolved_source": resolved_source} if resolved_source is not None else {}),
             )
 
             # lark-oapi media downloads are synchronous; run them off the event
@@ -660,6 +684,15 @@ class FeishuAccessor(DataAccessor):
             )
             raise
 
+    def _resolve_source_identity(
+        self, url: str, feishu_access_token: Optional[str] = None
+    ) -> FeishuResolvedSource:
+        doc_type, token = self._parse_feishu_url(url)
+        if doc_type == "wiki":
+            real_type, real_token, title = self._resolve_wiki_node(token, feishu_access_token)
+            return FeishuResolvedSource(url, real_type, real_token, title or "", token)
+        return FeishuResolvedSource(url, doc_type, token)
+
     async def preflight_source(
         self,
         source: Union[str, Path],
@@ -701,10 +734,8 @@ class FeishuAccessor(DataAccessor):
                 source_format="directory",
             )
         if doc_type == "wiki":
-            real_type, real_token, title = self._resolve_wiki_node(
-                token,
-                feishu_access_token,
-            )
+            resolved = self._resolve_source_identity(url, feishu_access_token)
+            real_type, real_token, title = resolved.doc_type, resolved.token, resolved.title
             if real_type != "base":
                 table_id = view_id = None
             self._probe_document_permission(
@@ -832,6 +863,7 @@ class FeishuAccessor(DataAccessor):
         url: str,
         *,
         feishu_access_token: Optional[str] = None,
+        resolved_source: Optional[FeishuResolvedSource] = None,
     ) -> FeishuDocument:
         """
         Fetch a Feishu document and convert to Markdown.
@@ -848,11 +880,10 @@ class FeishuAccessor(DataAccessor):
 
         if doc_type == "wiki":
             # Resolve wiki node to actual document type
-            real_type, real_token, title = await asyncio.to_thread(
-                self._resolve_wiki_node,
-                token,
-                feishu_access_token,
+            resolved = resolved_source or await asyncio.to_thread(
+                self._resolve_source_identity, url, feishu_access_token
             )
+            real_type, real_token, title = resolved.doc_type, resolved.token, resolved.title
             doc_type, token = real_type, real_token
             meta["wiki_resolved"] = True
 
@@ -1057,15 +1088,24 @@ class FeishuAccessor(DataAccessor):
             doc_type, token, _ = await asyncio.to_thread(
                 self._resolve_wiki_node, token, feishu_access_token
             )
+        url_type, url_token = self._parse_feishu_url(url)
+        resolved = FeishuResolvedSource(
+            url, doc_type, token, title, url_token if url_type == "wiki" else None
+        )
         if plan.download_exhausted:
             raise ValueError("Feishu import download byte limit exceeded")
         if doc_type == "file":
-            content, content_type, filename = await asyncio.to_thread(
-                self._download_drive_file,
-                token,
-                feishu_access_token=feishu_access_token,
-                filename_hint=title,
-            )
+            try:
+                content, content_type, filename = await self._download_drive_content(
+                    token,
+                    feishu_access_token=feishu_access_token,
+                    filename_hint=title,
+                    max_bytes=plan.max_bytes - plan.downloaded_bytes,
+                )
+            except InvalidArgumentError as exc:
+                if exc.details.get("reason") == "download_byte_limit":
+                    plan.download_exhausted = True
+                raise
             plan.account_download(len(content))
             path = self._unique_child_path(
                 target_dir,
@@ -1074,15 +1114,31 @@ class FeishuAccessor(DataAccessor):
                 ),
                 plan.reserved,
             )
-            path.write_bytes(content)
-            plan.add(path, url, token, "file")
+            try:
+                path.write_bytes(content)
+            except BaseException:
+                path.unlink(missing_ok=True)
+                plan.reserved.difference_update(self._path_reservation_keys(path))
+                raise
+            plan.add(
+                path,
+                url,
+                token,
+                "file",
+                replace(
+                    resolved,
+                    filename=filename or title,
+                    extension=path.suffix,
+                    mime_type=content_type,
+                ),
+            )
             return path
         if doc_type not in self._DOC_TYPE_HANDLERS:
             raise ValueError(f"Unsupported Feishu document type: {doc_type}")
         name = self._markdown_file_name(_safe_path_segment(title or token, fallback=token))
         path = self._unique_child_path(target_dir, name, plan.reserved)
         if plan.use_understanding and doc_type in {"docx", "sheets", "base"}:
-            plan.add(path, url, token, "url")
+            plan.add(path, url, token, "url", resolved)
             return path
         content_url = (
             self._import_doc_url(plan, doc_type, token)
@@ -1103,7 +1159,7 @@ class FeishuAccessor(DataAccessor):
             image_path = target_dir / rel_path
             image_path.parent.mkdir(parents=True, exist_ok=True)
             image_path.write_bytes(content)
-        plan.add(path, url, token, "markdown")
+        plan.add(path, url, token, "markdown", resolved)
         return path
 
     async def _materialize_wiki_tree_node(
@@ -1470,6 +1526,61 @@ class FeishuAccessor(DataAccessor):
         name = _getattr_safe(data, "name", None) or _getattr_safe(folder_meta, "name", None)
         return str(name) if name else None
 
+    async def _download_drive_content(
+        self,
+        token: str,
+        *,
+        feishu_access_token: Optional[str],
+        filename_hint: Optional[str],
+        max_bytes: int,
+    ) -> Tuple[bytes, Optional[str], Optional[str]]:
+        """Share bounded, cancellable retry policy across single and recursive imports.
+
+        The SDK owns authentication and the configured request timeout. Its
+        synchronous worker only returns bytes: cancelling cannot leave a file
+        written by a worker that outlives its awaiting task.
+        """
+        import requests
+
+        if max_bytes <= 0:
+            raise InvalidArgumentError(
+                "Feishu import download byte limit exceeded",
+                details={"reason": "download_byte_limit"},
+            )
+        for attempt in range(3):
+            try:
+                result = await asyncio.to_thread(
+                    self._download_drive_file,
+                    token,
+                    feishu_access_token=feishu_access_token,
+                    filename_hint=filename_hint,
+                )
+                if len(result[0]) > max_bytes:
+                    raise InvalidArgumentError(
+                        "Feishu import download byte limit exceeded",
+                        details={"reason": "download_byte_limit"},
+                    )
+                return result
+            except OpenVikingError as exc:
+                if exc.code not in {"UNAVAILABLE", "DEADLINE_EXCEEDED"} and (
+                    exc.details.get("http_status") != 429
+                ):
+                    raise
+                if attempt == 2:
+                    raise
+            except (requests.Timeout, requests.ConnectionError, TimeoutError) as exc:
+                if attempt == 2:
+                    code = (
+                        "DEADLINE_EXCEEDED"
+                        if isinstance(exc, (requests.Timeout, TimeoutError))
+                        else "UNAVAILABLE"
+                    )
+                    raise OpenVikingError(
+                        "Feishu Drive file download failed after retries", code
+                    ) from exc
+            await asyncio.sleep(0.5 * 2**attempt)
+        raise AssertionError("download retry loop must return or raise")
+
     def _download_drive_file(
         self,
         file_token: str,
@@ -1532,7 +1643,11 @@ class FeishuAccessor(DataAccessor):
         )
         temp_dir = Path(tempfile.mkdtemp(prefix="ov_feishu_file_"))
         path = temp_dir / filename
-        path.write_bytes(content)
+        try:
+            path.write_bytes(content)
+        except BaseException:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
         return path
 
     @staticmethod
@@ -1568,22 +1683,25 @@ class FeishuAccessor(DataAccessor):
         return f"{domain}/{doc_type}/{token}"
 
     @staticmethod
+    def _path_reservation_keys(path: Path) -> set[Path]:
+        final_path = path.with_name(normalize_storage_segment(path.name))
+        return {path, path.with_suffix(""), final_path, final_path.with_suffix("")}
+
+    @staticmethod
     def _unique_child_path(parent: Path, name: str, reserved: Optional[set[Path]] = None) -> Path:
         path = parent / _safe_path_segment(name)
         reserved = reserved if reserved is not None else set()
-        if not path.exists() and path not in reserved and path.with_suffix("") not in reserved:
-            reserved.update({path, path.with_suffix("")})
+        keys = FeishuAccessor._path_reservation_keys(path)
+        if not any(key.exists() for key in keys) and keys.isdisjoint(reserved):
+            reserved.update(keys)
             return path
         suffix = path.suffix
         stem = path.stem
         for index in range(2, 10000):
             candidate = parent / _numbered_path_segment(stem, suffix, index)
-            if (
-                not candidate.exists()
-                and candidate not in reserved
-                and candidate.with_suffix("") not in reserved
-            ):
-                reserved.update({candidate, candidate.with_suffix("")})
+            keys = FeishuAccessor._path_reservation_keys(candidate)
+            if not any(key.exists() for key in keys) and keys.isdisjoint(reserved):
+                reserved.update(keys)
                 return candidate
         raise RuntimeError(f"Unable to allocate unique path under {parent}")
 
@@ -1596,35 +1714,19 @@ class FeishuAccessor(DataAccessor):
         *,
         filename_hint: Optional[str] = None,
     ) -> str:
-        raw_name = filename_hint or file_token
-        if Path(raw_name).suffix:
-            return _safe_path_segment(raw_name, fallback=file_token)
-        ext = cls._guess_drive_file_ext(content, content_type)
-        return _safe_path_segment(f"{raw_name}{ext}", fallback=f"{file_token}{ext}")
+        from .drive_file import resolve_drive_extension
+
+        raw_name = (filename_hint or file_token).strip()
+        ext = resolve_drive_extension(content, raw_name, content_type)
+        old_ext = Path(raw_name).suffix
+        stem = raw_name[: -len(old_ext)] if old_ext else raw_name
+        return _safe_path_segment(f"{stem}{ext}", fallback=f"{file_token}{ext}")
 
     @staticmethod
     def _markdown_file_name(name: str) -> str:
         if str(name).lower().endswith((".md", ".markdown")):
             return _safe_path_segment(name)
         return _safe_path_segment(f"{name}.md")
-
-    @staticmethod
-    def _guess_drive_file_ext(content: bytes, content_type: Optional[str]) -> str:
-        if content.startswith(b"%PDF-"):
-            return ".pdf"
-        if (
-            content.startswith(b"PK\x03\x04")
-            or content.startswith(b"PK\x05\x06")
-            or content.startswith(b"PK\x07\x08")
-        ):
-            return ".zip"
-        if content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
-            return ".doc"
-        if content_type:
-            ext = get_preferred_extension(content_type)
-            if ext:
-                return ext
-        return ".bin"
 
     @staticmethod
     def _response_header(raw: Any, name: str) -> Optional[str]:

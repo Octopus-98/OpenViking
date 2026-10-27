@@ -18,11 +18,30 @@ def recursive_wiki(options: dict[str, Any]) -> bool:
 
 
 @dataclass(frozen=True)
+class FeishuResolvedSource:
+    """Backing object identity, independent of the URL used to reach it.
+
+    This contains provenance, never credentials. Binary metadata is completed
+    after download, when the response headers and content are available.
+    """
+
+    original_url: str
+    doc_type: str
+    token: str
+    title: str = ""
+    wiki_node_token: str | None = None
+    filename: str | None = None
+    extension: str | None = None
+    mime_type: str | None = None
+
+
+@dataclass(frozen=True)
 class FeishuContent:
     path: Path
     url: str
     token: str
     kind: str  # url, markdown, file
+    resolved_source: FeishuResolvedSource | None = None
 
     def checkpoint_key(self, root: Path) -> str:
         relative = self.path.resolve().relative_to(root.resolve()).as_posix()
@@ -55,5 +74,12 @@ class FeishuImportPlan:
             raise ValueError("Feishu import download byte limit exceeded")
         self.downloaded_bytes += size
 
-    def add(self, path: Path, url: str, token: str, kind: str) -> None:
-        self.entries.append(FeishuContent(path, url, token, kind))
+    def add(
+        self,
+        path: Path,
+        url: str,
+        token: str,
+        kind: str,
+        resolved_source: FeishuResolvedSource | None = None,
+    ) -> None:
+        self.entries.append(FeishuContent(path, url, token, kind, resolved_source))

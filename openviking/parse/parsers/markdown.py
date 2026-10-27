@@ -46,6 +46,7 @@ from openviking.parse.parsers.constants import (
 )
 from openviking_cli.utils.config.parser_config import ParserConfig
 from openviking_cli.utils.logger import get_logger
+from openviking_cli.utils.storage_name import normalize_title_segment
 
 # All known valid extensions - only these should be stripped when getting stem
 KNOWN_EXTENSIONS: set[str] = set()
@@ -1102,6 +1103,7 @@ class MarkdownParser(BaseParser):
             counter += 1
 
     def _sanitize_for_path(self, text: str, max_length: int = 50) -> str:
+        text = normalize_title_segment(text, fallback="section")
         safe = re.sub(
             r"[^\w\u0080-\u02af\u0400-\u052f\u0600-\u077f\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf\U00020000-\U0002a6df\s.-]",
             "",
@@ -1114,7 +1116,7 @@ class MarkdownParser(BaseParser):
         if len(safe) > max_length:
             hash_suffix = hashlib.sha256(text.encode()).hexdigest()[:8]
             return f"{safe[: max_length - 9]}_{hash_suffix}"
-        return safe
+        return normalize_title_segment(safe, fallback="section")
 
     @staticmethod
     def _doc_landing(layout: Dict[str, str]) -> Tuple[str, bool]:

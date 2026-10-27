@@ -42,13 +42,17 @@ def sanitize_relative_viking_path(rel_path: str) -> str:
     return rel_path.replace("\\", "/")
 
 
-def _normalize_storage_segments(path: str) -> str:
-    return "/".join(
+def normalize_storage_segment(segment: str) -> str:
+    """Project a source filename to the existing final-storage naming policy."""
+    return (
         VikingURI.sanitize_segment(segment)
         if any(character.isspace() for character in segment)
         else segment
-        for segment in path.split("/")
     )
+
+
+def _normalize_storage_segments(path: str) -> str:
+    return "/".join(normalize_storage_segment(segment) for segment in path.split("/"))
 
 
 def validate_safe_viking_uri_path(uri: str) -> str:

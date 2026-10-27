@@ -353,6 +353,29 @@ class UnifiedResourceProcessor:
                 "parse_artifact", self._get_parser_router().parse(source, **parse_kwargs)
             )
 
+        # A synchronous ingestion can reach this path without the service's
+        # enqueue preflight. Resolve Wiki backing types before URL routing here
+        # as well; queued binary/collection sources already require preparation.
+        if (
+            mode is ParseMode.DEFAULT
+            and prepared_resource is None
+            and not kwargs.get("_feishu_prepared_source")
+        ):
+            from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+            from openviking.parse.feishu_import import recursive_wiki
+
+            if (
+                FeishuAccessor._is_feishu_url(source)
+                and FeishuAccessor._parse_feishu_url(source)[0] == "wiki"
+                and not recursive_wiki(kwargs)
+            ):
+                identity = await FeishuAccessor().preflight_source(
+                    source,
+                    feishu_access_token=kwargs.get("feishu_access_token"),
+                    feishu_config=kwargs.get("feishu_config"),
+                )
+                kwargs["_feishu_resolved_type"] = identity.doc_type
+
         if (
             mode is ParseMode.DEFAULT
             and prepared_resource is None
