@@ -329,6 +329,9 @@ class WatchScheduler:
         execution_status = None
         execution_error = None
         execution_code = None
+        probed_checkpoint: Optional[Dict[str, Any]] = None
+        refreshed_checkpoint: Optional[Dict[str, Any]] = None
+        skipped_unchanged = False
 
         try:
             auth_state = getattr(task, "auth_state", None)
@@ -413,7 +416,29 @@ class WatchScheduler:
                         processor_kwargs["add_type"] = add_type
                         processor_kwargs["args"] = connector_args
 
-                if not should_deactivate:
+                # Cheap source-version gate for native git watches: skip the full
+                # clone/parse refresh while the watched branch tip is unchanged.
+                # Probe failures fail open to a normal refresh.
+                if not should_deactivate and not connector_watch:
+                    probed_checkpoint = await self._probe_git_checkpoint(
+                        task.path,
+                        processor_kwargs,
+                        instruction=task.instruction,
+                    )
+                    stored_checkpoint = getattr(task, "source_checkpoint", None) or {}
+                    if (
+                        probed_checkpoint is not None
+                        and stored_checkpoint == probed_checkpoint
+                        and stored_checkpoint.get("kind") == "git"
+                    ):
+                        skipped_unchanged = True
+                        execution_status = "completed"
+                        logger.info(
+                            f"[WatchScheduler] Task {task.task_id} source unchanged at "
+                            f"{probed_checkpoint.get('head_sha')}, skipping refresh"
+                        )
+
+                if not should_deactivate and not skipped_unchanged:
                     refresh_kwargs = {}
                     if connector_watch:
                         refresh_kwargs["connector_states"] = getattr(task, "connector_states", None)
@@ -437,7 +462,6 @@ class WatchScheduler:
                         **refresh_kwargs,
                         **processor_kwargs,
                     )
-
                     execution_code = result.get("code")
                     execution_task_id = result.get("task_id")
                     result_status = str(result.get("status") or "").lower()
@@ -477,8 +501,13 @@ class WatchScheduler:
                         else:
                             result_status = ingestion_task.status.value
                             execution_error = ingestion_task.error
-                            execution_code = (getattr(ingestion_task, "result", None) or {}).get(
-                                "code"
+                            ingestion_result = getattr(ingestion_task, "result", None) or {}
+                            execution_code = ingestion_result.get("code")
+                            refreshed_checkpoint = (
+                                self._resource_service._initial_source_checkpoint(
+                                    ingestion_result.get("meta"),
+                                    instruction=task.instruction,
+                                )
                             )
 
                     if result_status in {"failed", "error"}:
@@ -502,6 +531,14 @@ class WatchScheduler:
                             await self._watch_manager.update_connector_states(
                                 task.task_id,
                                 result["connector_states"],
+                            )
+                        if refreshed_checkpoint is not None:
+                            # Persist the revision actually imported. ZIP downloads
+                            # report their immutable target SHA; clone fallbacks
+                            # report the checked-out local HEAD.
+                            await self._watch_manager.update_source_checkpoint(
+                                task.task_id,
+                                refreshed_checkpoint,
                             )
                         logger.info(
                             f"[WatchScheduler] Task {task.task_id} executed successfully, "
@@ -589,6 +626,40 @@ class WatchScheduler:
     def _discard_executing(self, task_id: str) -> None:
         with self._lock:
             self._executing_tasks.discard(task_id)
+
+    async def _probe_git_checkpoint(
+        self,
+        path: str,
+        processor_kwargs: Dict[str, Any],
+        *,
+        instruction: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the watched git revision as a source checkpoint.
+
+        Commit-only sources resolve locally from the supplied commit. Returns
+        None for non-git sources and branch probe failures (fail open).
+        """
+        from openviking.parse.accessors.git_accessor import GitAccessor
+        from openviking.utils.code_hosting_utils import is_git_repo_url
+
+        if not path or not is_git_repo_url(path):
+            return None
+        try:
+            probed = await GitAccessor().probe_git_remote_head(path, **processor_kwargs)
+        except Exception as e:
+            logger.warning(
+                f"[WatchScheduler] git head probe failed for {path}: {e}; "
+                "falling back to full refresh"
+            )
+            return None
+        if probed is None:
+            return None
+        _, head_sha = probed
+        return {
+            "kind": "git",
+            "head_sha": head_sha,
+            "instruction": instruction,
+        }
 
     async def _prepare_feishu_auth_state(
         self,

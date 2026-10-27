@@ -310,6 +310,7 @@ class ResourceService:
         status: str,
         execution_task_id: Optional[str] = None,
         error: Optional[str] = None,
+        source_checkpoint: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record a pre-created Watch's first round and release its scheduler hold."""
         sanitized_error = (
@@ -326,6 +327,11 @@ class ResourceService:
                     execution_task_id=execution_task_id,
                     error=error,
                 )
+                if status == "completed" and source_checkpoint is not None:
+                    await watch_manager.update_source_checkpoint(
+                        task_id,
+                        source_checkpoint,
+                    )
                 logger.info(
                     "[ResourceService] Watch first round recorded: watch_task_id=%s status=%s "
                     "execution_task_id=%s%s",
@@ -404,6 +410,30 @@ class ResourceService:
     ) -> None:
         if (to or "").strip() and (parent or "").strip():
             raise InvalidArgumentError("Cannot specify both 'to' and 'parent' at the same time.")
+
+    @staticmethod
+    def _initial_source_checkpoint(
+        meta: Any,
+        *,
+        instruction: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Build the watch source checkpoint from the imported revision meta.
+
+        The accessor records ``resolved_head_sha`` for the exact imported
+        revision: a resolved branch tip or the supplied commit-only pin. The
+        tracked branch or commit selection itself lives in processor_kwargs.
+        The instruction is included so changing it forces one refresh even
+        when the source revision is unchanged. Failed branch probes leave the
+        checkpoint unset (fail open).
+        """
+        head_sha = meta.get("resolved_head_sha") if isinstance(meta, dict) else None
+        if head_sha:
+            return {
+                "kind": "git",
+                "head_sha": head_sha,
+                "instruction": instruction,
+            }
+        return None
 
     async def _manage_watch_if_needed(
         self,

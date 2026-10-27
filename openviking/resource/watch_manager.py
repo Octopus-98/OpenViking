@@ -85,6 +85,13 @@ class WatchTask(BaseModel):
     connector_states: Optional[Dict[str, Any]] = Field(
         default=None, description="Private external Connector stream states"
     )
+    source_checkpoint: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Private source version checkpoint used to skip unchanged refreshes, "
+            "e.g. {'kind': 'git', 'head_sha': '<sha>', 'instruction': '<instruction>'}"
+        ),
+    )
     created_at: datetime = Field(default_factory=datetime.now, description="Task creation time")
     last_execution_time: Optional[datetime] = Field(None, description="Last execution time")
     last_task_id: Optional[str] = Field(None, description="Latest ingestion task identifier")
@@ -139,6 +146,8 @@ class WatchTask(BaseModel):
             data["auth_state"] = self.auth_state
         if self.connector_states is not None:
             data["connector_states"] = self.connector_states
+        if self.source_checkpoint is not None:
+            data["source_checkpoint"] = self.source_checkpoint
         return data
 
     @classmethod
@@ -159,6 +168,10 @@ class WatchTask(BaseModel):
             data.get("connector_states"), dict
         ):
             data["connector_states"] = None
+        if data.get("source_checkpoint") is not None and not isinstance(
+            data.get("source_checkpoint"), dict
+        ):
+            data["source_checkpoint"] = None
         return cls(**data)
 
     def calculate_next_execution_time(self) -> datetime:
@@ -707,6 +720,21 @@ class WatchManager:
             if not task:
                 return
             task.connector_states = connector_states
+            await self._save_tasks()
+
+    async def update_source_checkpoint(
+        self,
+        task_id: str,
+        source_checkpoint: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist the source version checkpoint recorded after a successful refresh."""
+        if source_checkpoint is not None and not isinstance(source_checkpoint, dict):
+            raise ValueError("source_checkpoint must be an object")
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return
+            task.source_checkpoint = source_checkpoint
             await self._save_tasks()
 
     async def record_execution(

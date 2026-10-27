@@ -110,15 +110,28 @@ class AddResourceProcessor(DequeueHandlerBase):
         msg: AddResourceMsg,
         status: str,
         error: Optional[str] = None,
+        result: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not msg.watch_task_id:
             return
         try:
+            source_checkpoint = (
+                self._resource_service._initial_source_checkpoint(
+                    result.get("meta"),
+                    instruction=msg.instruction,
+                )
+                if status == "completed" and isinstance(result, dict)
+                else None
+            )
+            kwargs = {}
+            if source_checkpoint is not None:
+                kwargs["source_checkpoint"] = source_checkpoint
             await self._resource_service.record_watch_execution(
                 msg.watch_task_id,
                 status=status,
                 execution_task_id=msg.task_id,
                 error=error,
+                **kwargs,
             )
         except Exception:
             logger.exception("[AddResource] Failed to record initial Watch execution")
@@ -359,7 +372,7 @@ class AddResourceProcessor(DequeueHandlerBase):
                     reason=msg.reason,
                     source_name=msg.source_name,
                 )
-                await self._record_watch_execution(msg, "completed")
+                await self._record_watch_execution(msg, "completed", result=result)
                 await tracker.complete(
                     msg.task_id,
                     result,

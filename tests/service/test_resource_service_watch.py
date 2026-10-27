@@ -1047,6 +1047,7 @@ async def test_add_resource_processor_records_paused_watch_result(
     service = SimpleNamespace(
         execute_add_resource_job=execute,
         _link_resource_reason_memory=AsyncMock(),
+        _initial_source_checkpoint=Mock(return_value=None),
         record_watch_execution=AsyncMock(),
     )
     processor = AddResourceProcessor(
@@ -1082,6 +1083,47 @@ async def test_add_resource_processor_records_paused_watch_result(
 
 
 @pytest.mark.asyncio
+async def test_add_resource_processor_records_checkpoint_only_after_success():
+    service = SimpleNamespace(
+        _initial_source_checkpoint=ResourceService._initial_source_checkpoint,
+        record_watch_execution=AsyncMock(),
+    )
+    processor = AddResourceProcessor(
+        service,
+        QueueManager.ADD_RESOURCE,
+        SimpleNamespace(_async_agfs=SimpleNamespace()),
+    )
+    message = AddResourceMsg(
+        task_id="add-resource-1",
+        path="https://github.com/org/repo",
+        root_uri="viking://resources/repo",
+        account_id="account-1",
+        user_id="user-1",
+        role="user",
+        watch_task_id="watch-1",
+        instruction="focus on APIs",
+    )
+
+    await processor._record_watch_execution(
+        message,
+        "completed",
+        result={"meta": {"resolved_head_sha": "a" * 40}},
+    )
+
+    service.record_watch_execution.assert_awaited_once_with(
+        "watch-1",
+        status="completed",
+        execution_task_id="add-resource-1",
+        error=None,
+        source_checkpoint={
+            "kind": "git",
+            "head_sha": "a" * 40,
+            "instruction": "focus on APIs",
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_record_watch_execution_redacts_error_in_log(caplog):
     watch_manager = SimpleNamespace(record_execution=AsyncMock())
     scheduler = SimpleNamespace(
@@ -1111,6 +1153,34 @@ async def test_record_watch_execution_redacts_error_in_log(caplog):
         status="failed",
         execution_task_id="connector-1",
         error=error,
+    )
+    scheduler.release_execution.assert_awaited_once_with("watch-1")
+
+
+@pytest.mark.asyncio
+async def test_record_watch_execution_persists_checkpoint_after_completed_status():
+    watch_manager = SimpleNamespace(
+        record_execution=AsyncMock(),
+        update_source_checkpoint=AsyncMock(),
+    )
+    scheduler = SimpleNamespace(
+        watch_manager=watch_manager,
+        release_execution=AsyncMock(),
+    )
+    service = ResourceService(watch_scheduler=scheduler)
+    checkpoint = {"kind": "git", "head_sha": "a" * 40}
+
+    await service.record_watch_execution(
+        "watch-1",
+        status="completed",
+        execution_task_id="add-resource-1",
+        source_checkpoint=checkpoint,
+    )
+
+    watch_manager.record_execution.assert_awaited_once()
+    watch_manager.update_source_checkpoint.assert_awaited_once_with(
+        "watch-1",
+        checkpoint,
     )
     scheduler.release_execution.assert_awaited_once_with("watch-1")
 

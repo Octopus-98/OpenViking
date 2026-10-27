@@ -115,8 +115,14 @@ class GitAccessor(DataAccessor):
         temp_local_dir = None
         branch = kwargs.get("branch") or kwargs.get("ref")
         commit = kwargs.get("commit")
+        if commit:
+            branch = None
         auth_config = parse_git_http_auth_config(kwargs.get("auth_config"), source_str)
         git_env = None
+        used_git_clone = False
+        # Exact immutable revision fetched. Branch tracking resolves this from
+        # the remote/local HEAD; commit-only imports use the supplied commit.
+        resolved_sha: Optional[str] = None
 
         try:
             # Create local temp directory (non-blocking)
@@ -140,10 +146,20 @@ class GitAccessor(DataAccessor):
                     commit=commit,
                     env=git_env,
                 )
+                used_git_clone = True
             elif source_str.startswith(("http://", "https://", "git://", "ssh://")):
                 repo_url, branch, commit = self._parse_repo_source(source_str, **kwargs)
                 if auth_config is not None:
                     git_env = build_git_http_auth_env(auth_config, repo_url)
+                if commit:
+                    resolved_sha = commit
+                else:
+                    tracked = await self._resolve_tracked_head(repo_url, branch, git_env)
+                    if tracked is not None:
+                        _, resolved_sha = tracked
+                # Fetch an immutable per-SHA archive when resolved; fall back to
+                # the moving branch/commit name only when the probe was skipped.
+                download_ref = resolved_sha or commit or branch
                 if self._is_github_url(repo_url) and auth_config is None:
                     github_token = kwargs.get("github_token") or os.environ.get("GITHUB_TOKEN")
                     if github_token and is_git_https_url(repo_url):
@@ -157,7 +173,7 @@ class GitAccessor(DataAccessor):
                     try:
                         local_dir, repo_name = await self._github_zip_download(
                             repo_url,
-                            branch or commit,
+                            download_ref,
                             temp_local_dir,
                             github_token=github_token,
                         )
@@ -182,11 +198,12 @@ class GitAccessor(DataAccessor):
                             commit=commit,
                             env=git_env,
                         )
+                        used_git_clone = True
                 elif self._can_use_gitlab_zip(repo_url) and auth_config is None:
                     # Try GitLab ZIP API first, fall back to git clone
                     try:
                         local_dir, repo_name = await self._gitlab_zip_download(
-                            repo_url, branch or commit, temp_local_dir
+                            repo_url, download_ref, temp_local_dir
                         )
                     except Exception as zip_exc:
                         logger.warning(
@@ -209,6 +226,7 @@ class GitAccessor(DataAccessor):
                             commit=commit,
                             env=git_env,
                         )
+                        used_git_clone = True
                 else:
                     # Other configured code-hosting URLs: use git clone
                     repo_name = await self._git_clone(
@@ -218,8 +236,19 @@ class GitAccessor(DataAccessor):
                         commit=commit,
                         env=git_env,
                     )
+                    used_git_clone = True
             else:
                 raise ValueError(f"Unsupported source for GitAccessor: {source}")
+
+            if commit:
+                # A commit-only import is already pinned to an immutable revision.
+                # Keep the supplied value as the checkpoint without another probe.
+                resolved_sha = commit
+            elif used_git_clone:
+                # The clone fallback preserves the historical branch/commit
+                # behavior. Record the revision that was actually checked out,
+                # rather than the SHA probed before cloning.
+                resolved_sha = await self._resolve_local_head(temp_local_dir, git_env)
 
             # Build metadata
             # repo_name is in "org/repo" format (e.g. "volcengine/OpenViking")
@@ -229,6 +258,10 @@ class GitAccessor(DataAccessor):
                 meta["repo_ref"] = branch
             if commit:
                 meta["repo_commit"] = commit
+            if resolved_sha:
+                # Exact revision fetched; the watch layer persists this as its
+                # source checkpoint.
+                meta["resolved_head_sha"] = resolved_sha
 
             return LocalResource(
                 path=local_dir,
@@ -260,18 +293,71 @@ class GitAccessor(DataAccessor):
         if parsed_source is None:
             if source.startswith(("git@", "http://", "https://", "git://", "ssh://")):
                 raise ValueError(f"Unsupported Git repository URL: {source}")
-            return source, branch, commit
-
-        if commit is None or branch is None:
-            commit = parsed_source.commit or commit
-            # Preserve the existing precedence: a commit encoded in the URL
-            # overrides branch selection, while an explicit branch overrides a
-            # branch encoded in the URL.
             if commit:
                 branch = None
-            else:
-                branch = branch or parsed_source.branch
+            return source, branch, commit
+
+        commit = commit or parsed_source.commit
+        branch = None if commit else branch or parsed_source.branch
         return parsed_source.clone_url, branch, commit
+
+    @staticmethod
+    def _resolve_probe_target(
+        source: str, **kwargs
+    ) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+        """Resolve (clone_url, branch, commit) for a watch probe.
+
+        Mirrors ``_parse_repo_source`` but returns None for non-git sources
+        instead of raising, so callers can fall back to a full refresh.
+        """
+        branch = kwargs.get("branch") or kwargs.get("ref")
+        commit = kwargs.get("commit")
+        parsed_source = parse_git_repo_url(source)
+        if parsed_source is None:
+            if source.startswith(("git@", "http://", "https://", "git://", "ssh://")):
+                if commit:
+                    branch = None
+                return source, branch, commit
+            return None
+        commit = commit or parsed_source.commit
+        branch = None if commit else branch or parsed_source.branch
+        return parsed_source.clone_url, branch, commit
+
+    @staticmethod
+    def _parse_ls_remote_ref(stdout: str, ref: str) -> Optional[str]:
+        """Extract the SHA advertised for *ref* from ``git ls-remote`` output."""
+        for line in stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[1].strip() == ref:
+                return parts[0].strip() or None
+        return None
+
+    async def probe_git_remote_head(
+        self, source: Union[str, Path], **kwargs
+    ) -> Optional[Tuple[str, str]]:
+        """Resolve the watched git revision without downloading repository content.
+
+        Branch watches return the remotely advertised ``(ref, head_sha)``.
+        Commit-only watches return an empty ref and the supplied commit locally.
+        Raises on branch probe failures so callers can apply a fail-open policy.
+        """
+        source_str = str(source)
+        resolved = self._resolve_probe_target(source_str, **kwargs)
+        if resolved is None:
+            return None
+        repo_url, branch, commit = resolved
+        if commit:
+            # The supplied commit is already an immutable revision. Return it
+            # directly so callers can compare checkpoints without ls-remote.
+            return "", commit
+
+        auth_config = parse_git_http_auth_config(kwargs.get("auth_config"), source_str)
+        env = build_git_http_auth_env(auth_config, repo_url) if auth_config is not None else None
+        env = overlay_parser_subprocess_env(
+            ParserNetworkContext(ParserNetworkOperation.GIT_COMMAND, repo_url),
+            env,
+        )
+        return await self._git_ls_remote_head(repo_url, branch, env)
 
     def _normalize_repo_url(self, url: str) -> str:
         """Normalize a validated repository URL to a cloneable base form."""
@@ -396,6 +482,8 @@ class GitAccessor(DataAccessor):
         """Clone a git repository into target_dir; return the repo name."""
         name = self._get_repo_name(url)
         logger.info(f"[GitAccessor] Cloning {url} to {target_dir}...")
+        if commit:
+            branch = None
         network_env = overlay_parser_subprocess_env(
             ParserNetworkContext(ParserNetworkOperation.GIT_COMMAND, url),
             env,
@@ -465,6 +553,71 @@ class GitAccessor(DataAccessor):
         await asyncio.to_thread(_write_marker)
 
         return name
+
+    async def _resolve_local_head(
+        self,
+        repo_dir: str,
+        env: Optional[dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Return the revision actually checked out by git clone."""
+        try:
+            head_sha = await self._run_git(
+                ["git", "-C", repo_dir, "rev-parse", "HEAD"],
+                env=env,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[GitAccessor] failed to resolve cloned repository HEAD: {exc}; "
+                "continuing without an exact-revision checkpoint"
+            )
+            return None
+        return head_sha.strip() or None
+
+    async def _resolve_tracked_head(
+        self,
+        url: str,
+        branch: Optional[str],
+        env: Optional[dict[str, str]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        """Return ``(ref, sha)`` for the tracked branch tip, or None on failure.
+
+        Failures are non-fatal: callers fetch the branch by name and simply
+        skip recording an exact-revision checkpoint.
+        """
+        try:
+            return await self._git_ls_remote_head(url, branch, env)
+        except Exception as exc:
+            logger.warning(
+                f"[GitAccessor] git head probe failed for {url}: {exc}; "
+                "fetching ref by name without an exact-revision checkpoint"
+            )
+            return None
+
+    async def _git_ls_remote_head(
+        self,
+        url: str,
+        branch: Optional[str],
+        env: Optional[dict[str, str]] = None,
+    ) -> Tuple[str, str]:
+        """Probe a remote for the tip SHA of *branch* (or HEAD if branch is None).
+
+        Returns ``(ref, sha)`` where ref is the fully qualified ref advertised by
+        the remote. Uses ``ls-remote`` only (no content download) so the cost is
+        a single network round-trip.
+        """
+        if branch:
+            ref = branch if branch.startswith("refs/") else f"refs/heads/{branch}"
+            args = ["git", "ls-remote", "--heads", url, ref]
+        else:
+            # Track the remote's default branch via HEAD, which every server
+            # advertises; no --symref dependency.
+            ref = "HEAD"
+            args = ["git", "ls-remote", url, "HEAD"]
+        stdout = await self._run_git(args, env=env)
+        sha = self._parse_ls_remote_ref(stdout, ref)
+        if sha is None:
+            raise RuntimeError(f"git ls-remote did not advertise {ref} for {url}")
+        return ref, sha
 
     async def _github_zip_download(
         self,
