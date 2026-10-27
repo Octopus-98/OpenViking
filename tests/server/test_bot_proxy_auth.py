@@ -734,7 +734,7 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
         await tasks.cancel_recovered(first.task_id, "acct", "alice")
     if expected == TaskStatus.FAILED:
         assert "UNAVAILABLE" in (await state(first)).error
-        assert not cancel_entered.is_set()
+        assert cancel_entered.is_set()
     await queue.dequeue()
     assert (await state(waiting)).status == TaskStatus.COMPLETED
     assert submitted.count(first.task_id) == 1
