@@ -735,18 +735,13 @@ class CompileService:
     async def list_configs(
         self, ctx: RequestContext, *, limit: int, cursor: str | None
     ) -> dict[str, Any]:
-        """Page readable active targets by URI, checking one extra item for continuation."""
+        """Read active target states lazily in SHA256(to) order, with one readable lookahead."""
         from openviking.service.compile_scheduler import next_run_at
 
         lifecycle = self._require_lifecycle()
         items = []
-        summaries = sorted(
-            await lifecycle.store.list_summaries(ctx.account_id), key=lambda item: item["to"]
-        )
-        for item in summaries:
+        async for item in lifecycle.store.iter_summaries(ctx.account_id, cursor=cursor):
             if item["status"] == "deleted":
-                continue
-            if cursor and item["to"] <= cursor:
                 continue
             try:
                 await lifecycle._fs._ensure_access(item["to"], ctx)

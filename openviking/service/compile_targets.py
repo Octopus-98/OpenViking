@@ -162,6 +162,9 @@ class CompileStore(Protocol):
         self, account_id: str, to: str, *, create: bool = False
     ) -> AsyncContextManager[Dict[str, Any]]: ...
     async def list_summaries(self, account_id: str) -> List[Dict[str, Any]]: ...
+    def iter_summaries(
+        self, account_id: str, *, cursor: Optional[str] = None
+    ) -> AsyncIterator[Dict[str, Any]]: ...
     async def list_accounts(self) -> List[str]: ...
     async def mark_content_updated(self, account_id: str, to: str) -> None: ...
 
@@ -281,25 +284,36 @@ class CompileStateStore:
     # ---------- target discovery ----------
 
     async def list_summaries(self, account_id: str) -> List[Dict[str, Any]]:
-        """Summarize atomically published states without modifying stored metadata.
+        """Read all target summaries without modifying stored metadata."""
+        return [item async for item in self.iter_summaries(account_id)]
 
-        The list is not a point-in-time snapshot. Missing states are skipped;
-        other I/O and JSON errors propagate instead of hiding registered targets.
+    async def iter_summaries(
+        self, account_id: str, *, cursor: Optional[str] = None
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Yield target summaries in SHA256(to) order after the target URI cursor.
+
+        AGFS supplies name-sorted entries. States are read on demand without locks or writes.
+        Missing states are skipped;
+        other I/O and JSON errors propagate. Enumeration is not a point-in-time snapshot.
         """
         directory = f"{self.root(account_id)}/target_folders"
         try:
             entries = await self._agfs.ls(directory)
         except (AGFSNotFoundError, FileNotFoundError):
-            return []
-        summaries = []
+            return
+        after = hashlib.sha256(cursor.rstrip("/").encode("utf-8")).hexdigest() if cursor else ""
+        # shortcut: ls enumerates all target entries; use cursor-based directory listing when enumeration dominates.
         for entry in entries:
             name = str(entry.get("name") or "")
-            if len(name) != 64 or not entry.get("isDir", entry.get("is_dir", False)):
+            if (
+                len(name) != 64
+                or not entry.get("isDir", entry.get("is_dir", False))
+                or name <= after
+            ):
                 continue
             record = await self.read_json(f"{directory}/{name}/state.json")
             if record is not None:
-                summaries.append(summarize(_normalize_schedule(record)))
-        return summaries
+                yield summarize(_normalize_schedule(record))
 
     # ---------- state.json ----------
 
