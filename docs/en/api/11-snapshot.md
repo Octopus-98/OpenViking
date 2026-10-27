@@ -594,7 +594,7 @@ With `dry_run=true`, only the planned diff is returned and nothing is written. D
 
 Call `GET /api/v1/snapshot/versions?uri=<file URI>` to obtain `current_version` and the version history before submitting a restore:
 
-The response's `total` counts all retained, queryable versions before applying `limit` or `before_version`; use `next_before_version` to load older versions.
+The response's `to` identifies the file's owning Compile target directory; use it with a version's `meta.operation_id` to query operation details. `total` counts all retained, queryable versions before applying `limit` or `before_version`; use `next_before_version` to load older versions.
 
 ```bash
 curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \

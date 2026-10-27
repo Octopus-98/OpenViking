@@ -594,7 +594,7 @@ ov snapshot restore 3f2a1b9c viking://resources/my_project -m "restore to v1" -o
 
 先调用 `GET /api/v1/snapshot/versions?uri=<文件 URI>` 获取 `current_version` 和历史版本列表，再提交恢复请求：
 
-响应中的 `total` 表示当前保留的可查询版本总数，不受 `limit`、`before_version` 影响；`next_before_version` 用于继续加载更旧版本。
+响应中的 `to` 是文件所属的 Compile 目标目录，可与版本记录的 `meta.operation_id` 一起用于查询操作详情。`total` 表示当前保留的可查询版本总数，不受 `limit`、`before_version` 影响；`next_before_version` 用于继续加载更旧版本。
 
 ```bash
 curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \

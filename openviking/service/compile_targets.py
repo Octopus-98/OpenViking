@@ -2373,7 +2373,7 @@ class CompileVersions:
     async def versions(
         self, uri: str, ctx: RequestContext, *, limit: int, before: Optional[str]
     ) -> Dict[str, Any]:
-        """Return newest-first versions and the retained count before pagination."""
+        """Return the owning Compile target, newest-first versions, and retained count."""
         await self._fs._ensure_access(uri, ctx)
         record = await self._managed(uri, ctx)
         index = await self.load(ctx.account_id, record["to"], uri)
@@ -2386,6 +2386,7 @@ class CompileVersions:
         page = entries[:limit]
         return {
             "uri": uri,
+            "to": record["to"],
             "current_version": current,
             "total": total,
             "versions": page,

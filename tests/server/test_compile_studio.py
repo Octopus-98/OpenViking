@@ -646,6 +646,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     versions = (await client.get("/api/v1/snapshot/versions", params={"uri": picture})).json()[
         "result"
     ]
+    assert versions["to"] == target
     restore = {
         "path": picture,
         "restore_version": versions["versions"][-1]["version_id"],
@@ -847,6 +848,7 @@ async def test_nested_compile_restores_parent_scope(service, app, monkeypatch, t
         assert await service.fs.read(uri, ctx) == (output if successful else baseline)
         assert (await lifecycle.versions.owning_target(ctx.account_id, uri))["to"] == target
         versions = await service.compile.file_versions(uri, ctx, limit=20, before=None)
+        assert versions["to"] == target
         latest = versions["versions"][0]
         assert versions["current_version"] == latest["version_id"]
         assert await service.viking_fs.show(
