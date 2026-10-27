@@ -25,6 +25,7 @@ import heapq
 import json
 import math
 import random
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -109,7 +110,7 @@ def new_record(to: str) -> Dict[str, Any]:
     return {
         "to": to,
         "compile_type": "compile",  # Compile category for this target.
-        "conflicts_num": 0,  # Number of conflicting files under this target.
+        "conflicts_num": 0,  # Unfixed conflict records in non-hidden output files.
         "status": "active",
         "deleted_at": None,  # Last deletion Unix time; retained for operation boundary checks.
         "from": [],
@@ -1358,6 +1359,106 @@ class CompileLifecycle:
             "skill_snapshot": run_meta.get("skill_snapshot"),
         }
 
+    async def list_files(
+        self, to: str, ctx: RequestContext, *, offset: int, limit: int
+    ) -> Dict[str, Any]:
+        """Page non-hidden readable files in URI order, loading only their version indexes.
+
+        relative_dir omits the filename and is '/' at the query root. current_version
+        is the latest recorded version or None; updated_at is the filesystem modTime.
+        """
+        files = sorted(
+            (
+                entry
+                for entry in await self._fs.tree(
+                    to, show_all_hidden=False, node_limit=None, level_limit=None, ctx=ctx
+                )
+                if not entry["isDir"]
+                and entry.get("access") != "denied"
+                and not any(part.startswith(".") for part in entry["rel_path"].split("/"))
+            ),
+            key=lambda entry: entry["uri"],
+        )
+        target = await self.versions.owning_target(ctx.account_id, to)
+        page = []
+        for entry in files[offset : offset + limit]:
+            index = (
+                await self.versions.load(ctx.account_id, target["to"], entry["uri"])
+                if target
+                else None
+            )
+            versions = (index or {}).get("versions", [])
+            parent = entry["rel_path"].rpartition("/")[0]
+            page.append(
+                {
+                    "uri": entry["uri"],
+                    "relative_dir": f"{parent}/" if parent else "/",
+                    "current_version": versions[-1]["version_id"] if versions else None,
+                    "updated_at": entry["modTime"],
+                }
+            )
+        return {"total": len(files), "files": page, "has_more": offset + len(page) < len(files)}
+
+    async def _count_conflicts(self, to: str, ctx: RequestContext) -> int:
+        """Count unfixed metadata records under ``to`` while the caller holds its tree lease.
+
+        Count-only scans retain no detail records. Unreadable or malformed files contribute zero.
+        """
+        return (await self.list_conflicts(to, ctx, limit=0))["conflicts_num"]
+
+    async def list_conflicts(
+        self, to: str, ctx: RequestContext, *, offset: int = 0, limit: int = 20
+    ) -> Dict[str, Any]:
+        """Read visible conflict records, ordered by file URI and annotation order.
+
+        ``offset`` and ``limit`` select records, not files; zero limit only counts.
+        The total counts only unfixed records; pages include every conflict state.
+        Reserved comments contain comma-separated JSON objects. Hidden paths and
+        unreadable or malformed files are skipped. Reads use the caller's identity.
+        """
+        files = sorted(
+            entry["uri"]
+            for entry in await self._fs.tree(
+                to, show_all_hidden=False, node_limit=None, level_limit=None, ctx=ctx
+            )
+            if not entry["isDir"]
+            and not any(part.startswith(".") for part in entry["rel_path"].split("/"))
+        )
+        total = 0
+        position = 0
+        conflicts = []
+        for start in range(0, len(files), 8):
+            contents = await asyncio.gather(
+                *(self._fs.read_file_bytes(uri, ctx=ctx) for uri in files[start : start + 8]),
+                return_exceptions=True,
+            )
+            for uri, content in zip(files[start : start + 8], contents, strict=True):
+                if isinstance(content, BaseException):
+                    if not isinstance(content, Exception):
+                        raise content
+                    continue
+                try:
+                    blocks = re.findall(rb"<!--\s*CONFLICTS_CONTENT\b(.*?)(-->|$)", content, re.S)
+                    if any(not closing for _, closing in blocks):
+                        continue
+                    records = [
+                        item for body, _ in blocks for item in json.loads(b"[" + body + b"]")
+                    ]
+                    if any(not isinstance(item, dict) for item in records):
+                        continue
+                except Exception:
+                    continue
+                for item in records:
+                    if offset <= position < offset + limit:
+                        conflicts.append({**item, "uri": uri})
+                    position += 1
+                    total += item.get("state") == "unfixed"
+        return {
+            "conflicts_num": total,
+            "conflicts": conflicts,
+            "has_more": offset + len(conflicts) < position,
+        }
+
     async def on_finish(self, task: Any, snapshot: ExternalTaskSnapshot) -> ExternalTaskSnapshot:
         """Commit successful output and accept reindex before completing the run.
 
@@ -1435,6 +1536,19 @@ class CompileLifecycle:
                                 and (record.get("content_updated_at") or 0) < run["started_at"]
                             ):
                                 run_meta["content_changed"] = True
+                else:
+                    if run_meta["target_base"]:
+                        await self._rollback(request["to"], run, ctx)
+                    run["error"] = snapshot.error_message or snapshot.status
+                if self._task_is_current(record, task) and run["started_at"] is not None:
+                    run["conflicts_num"] = record.get("conflicts_num", 0)
+                    changed = run_meta.get("content_changed") or any(
+                        (run.get("result") or {}).get(key) for key in _RESULT_KEYS.values()
+                    )
+                    if not record["initialized"] or changed:
+                        async with self._locked_output(request["to"], ctx):
+                            run["conflicts_num"] = await self._count_conflicts(request["to"], ctx)
+                if run["status"] == "committing" and snapshot.status == "completed":
                     reindex_id = run_meta.get("reindex_task_id")
                     previous = (
                         await get_task_tracker().get(
@@ -1457,10 +1571,6 @@ class CompileLifecycle:
                         ctx=ctx,
                         task_id=run_meta["reindex_task_id"],
                     )
-                else:
-                    if run_meta["target_base"]:
-                        await self._rollback(request["to"], run, ctx)
-                    run["error"] = snapshot.error_message or snapshot.status
                 run["status"] = snapshot.status
                 run["finished_at"] = time.time()
                 await self._store.put_operation(account_id, target_to, run)
@@ -1486,6 +1596,8 @@ class CompileLifecycle:
                     # Write hooks can publish their marker after final operation state is saved.
                     run = await self._store.get_operation(account_id, target_to, task_id) or run
                     run_meta = run["meta"]
+                    if run["started_at"] is not None:
+                        record["conflicts_num"] = run["conflicts_num"]
                     record["last_run"] = {
                         "task_id": task_id,
                         "status": run["status"],
