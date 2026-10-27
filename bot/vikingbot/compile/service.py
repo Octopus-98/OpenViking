@@ -502,7 +502,7 @@ class BotCompileService:
         connection: Mapping[str, Any],
     ) -> SanitizedCompileRequest:
         args = request.args or {}
-        if args.keys() - {"last_compile_time", "wiki_links", "changes"}:
+        if args.keys() - {"last_compile_time", "changes"}:
             raise CompileFailure(
                 "INVALID_ARGUMENT",
                 "VikingBot Compile does not implement provider-specific args.",
@@ -548,11 +548,6 @@ class BotCompileService:
                     "Unavailable snapshots require full execution",
                     stage="queued",
                 )
-        wiki_links = args.get("wiki_links", False)
-        if not isinstance(wiki_links, bool):
-            raise CompileFailure(
-                "INVALID_ARGUMENT", "args.wiki_links must be a boolean", stage="queued"
-            )
         raw_sources = [str(value).strip() for value in request.from_]
         if not raw_sources or any(not value for value in raw_sources):
             raise CompileFailure(
@@ -622,7 +617,6 @@ class BotCompileService:
                 "skill": canonical_skill,
                 "last_compile_time": None if changes is not None else cutoff,
                 "changes": changes,
-                "wiki_links": wiki_links,
             }
         )
 
@@ -1028,7 +1022,6 @@ class BotCompileService:
                     "unchanged": unchanged,
                     "page_count": page_count,
                     "link_count": rendered.link_count,
-                    "link_report": rendered.link_report,
                     "warnings": warnings,
                 }
             )
@@ -1236,7 +1229,6 @@ class BotCompileService:
                 ),
                 page_count=len(set(published)),
                 link_count=rendered.link_count,
-                link_report=rendered.link_report,
                 warnings=pipeline.warnings,
             )
 

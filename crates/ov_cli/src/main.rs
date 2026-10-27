@@ -1297,7 +1297,7 @@ enum Commands {
         /// Additional instructions for this Compile task
         #[arg(long, value_name = "text")]
         instruction: Option<String>,
-        /// Provider arguments as JSON; VikingBot wiki_links defaults to false
+        /// Provider arguments as JSON
         #[arg(long, value_name = "json")]
         args: Option<String>,
     },
