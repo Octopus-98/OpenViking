@@ -220,7 +220,7 @@ POST /api/v1/tasks/{task_id}/cancel
 ov task cancel cmp_01abc
 ```
 
-任务会先进入 `cancelling`，待当前进程内工作和清理完成后进入 `cancelled`；已经完成的写入不会回滚。重复取消已经 `cancelled` 的任务是幂等的。
+运行中的 Compile 任务会先进入 `cancelling`，待执行端确认取消并完成回滚后进入 `cancelled`。回滚将 `to` 子树的文件恢复到该次 Compile 开始执行时的快照，期间其他操作及子任务在该范围内的修改也会撤销；`to` 范围外的路径不补偿。重复取消已经 `cancelled` 的任务是幂等的。
 
 | Status | 常见 Stage |
 |--------|------------|

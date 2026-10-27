@@ -8,6 +8,7 @@ and service dependency, avoiding MCP protocol complexity.
 """
 
 import base64
+import hashlib
 import json
 import re
 from types import SimpleNamespace
@@ -49,6 +50,7 @@ from openviking.server.mcp_endpoint import (
 from openviking.server.mcp_endpoint import ls as list_tool
 from openviking.service.fs_service import ListingPage
 from openviking_cli.exceptions import (
+    ConflictError,
     FailedPreconditionError,
     InvalidArgumentError,
     InvalidURIError,
@@ -2470,6 +2472,24 @@ async def test_edit_memory_file_preserves_metadata(service):
     assert "coffee" in raw_after
     visible = await service.fs.read_visible(uri, ctx=DEFAULT_CTX)
     assert visible.strip() == "likes: coffee"
+
+
+async def test_edit_compares_the_raw_revision_used_for_visible_content(service, monkeypatch):
+    uri = "viking://user/test_user/memories/preferences/test_edit_race.md"
+    await write(uri=uri, content="likes: tea\n", wait=True)
+    raw = await service.fs.read_file_bytes(uri, DEFAULT_CTX)
+    original_write = service.fs.write
+
+    async def write_after_concurrent_change(**kwargs):
+        assert kwargs["expected_sha256"] == hashlib.sha256(raw).hexdigest()
+        await service.viking_fs.write_file(uri, "concurrent change", ctx=DEFAULT_CTX)
+        return await original_write(**kwargs)
+
+    monkeypatch.setattr(service.fs, "write", write_after_concurrent_change)
+
+    with pytest.raises(ConflictError, match="Re-read"):
+        await edit(uri=uri, old_string="tea", new_string="coffee")
+    assert await service.fs.read(uri, ctx=DEFAULT_CTX) == "concurrent change"
 
 
 @pytest.mark.parametrize("role", [Role.USER, Role.ADMIN, Role.ROOT])

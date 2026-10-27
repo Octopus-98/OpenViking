@@ -259,7 +259,7 @@ async def test_concurrent_submission_retry_and_restart(monkeypatch):
 async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     service, app, client, monkeypatch, tmp_path, builtin_skill
 ):
-    """One target keeps its history, ordinary edits and live permissions across runs."""
+    """A target retains history and permissions while failed runs restore their starting files."""
     import base64
     from datetime import datetime, timedelta
 
@@ -509,12 +509,18 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     )
     assert (await tracker.get(failed, **owner)).status == "failed"
     assert (await store.get_by_to(ctx.account_id, target))["progress"] == progress
-    assert await service.fs.read(page, ctx) == "ordinary edit"
-    assert await service.fs.read(f"{target}/imported.md", ctx) == "keep imported"
-    assert await service.fs.read(f"{target}/copied.md", ctx) == "keep copied"
-    assert await service.fs.read(f"{target}/renamed.md", ctx) == "keep renamed"
-    for uri in (f"{target}/old.md", f"{target}/discard.md", f"{target}/partial.md"):
+    assert await service.fs.read(page, ctx) == "generated"
+    assert await service.fs.read(f"{target}/old.md", ctx) == "keep renamed"
+    assert await service.fs.read(f"{target}/discard.md", ctx) == "remove"
+    for name in ("imported.md", "copied.md", "renamed.md", "partial.md"):
+        uri = f"{target}/{name}"
         assert not await service.viking_fs.exists(uri, ctx=ctx)
+    assert not await service.viking_fs.exists("viking://resources/inbox/note.md", ctx=ctx)
+    assert await service.fs.read("viking://resources/inbox/copy.md", ctx) == "keep copied"
+    for entry in await store.list_operations(ctx.account_id, target):
+        manifest = await store.get_outputs(ctx.account_id, target, entry["operation_id"])
+        if manifest is not None:
+            assert set(manifest) == {"outputs"}
     history = (await client.get("/api/v1/compile/operations", params={"to": target})).json()[
         "result"
     ]
@@ -571,6 +577,15 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     assert ordinary_operation["params"] == {"batch": True, "uris": [page]}
     assert ordinary_operation["result"] == {"created": [], "updated": [page], "unchanged": []}
     assert ordinary_operation["conflicts_num"] == 0
+    ordinary_outputs = await service.compile.operation_outputs(
+        target, ordinary_operation["operation_id"], ctx, limit=20, cursor=None
+    )
+    assert len(ordinary_outputs["outputs"]) == 1
+    output = ordinary_outputs["outputs"][0]
+    assert output["uri"] == page
+    assert (
+        await service.viking_fs.show(output["snapshot_id"], path=page, ctx=ctx) == b"ordinary edit"
+    )
     cancelled_operation = next(
         op for op in history["operations"] if op["operation_id"] == cancelled_id
     )
@@ -722,6 +737,116 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     ] == []
     for path in queries:
         assert (await client.get(path, params={"to": target})).status_code == 403
+
+
+async def _prepare_compile_task(service, target, ctx):
+    """Validate and register a target; return a full manual task with the shared source and Skill."""
+    from openviking.service.compile_service import CompileRequest
+
+    request = CompileRequest.model_validate(
+        {
+            "from": ["viking://resources/source"],
+            "to": target,
+            "skill": "viking://system/compile/example-skills/llm-wiki",
+            "args": {"mode": "full"},
+        }
+    )
+    request = await service.compile._normalize_request(request, ctx)
+    payload = await service.compile.lifecycle.prepare(
+        request.model_dump(by_alias=True, exclude_none=True),
+        ctx,
+        instruction_set=False,
+    )
+    return SimpleNamespace(
+        task_id=f"cmp_{target.rsplit('/', 1)[-1]}",
+        account_id=ctx.account_id,
+        user_id=ctx.user.user_id,
+        created_at=time.time(),
+        meta={"request": payload},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+async def test_nested_compile_restores_parent_scope(service, app, monkeypatch, terminal_status):
+    """A parent rollback includes successful child output and preserves sibling content."""
+    from openviking.service.external_task_service import ExternalTaskSnapshot
+
+    ctx = RequestContext(user=service.user, role=Role.USER)
+    parent = "viking://resources/nested-wiki"
+    child, sibling = f"{parent}/child", f"{parent}_other"
+    for uri, content in {
+        "viking://resources/source/source.md": "source",
+        f"{parent}/page.md": "parent baseline",
+        f"{child}/page.md": "child baseline",
+        f"{sibling}/page.md": "sibling baseline",
+    }.items():
+        await service.viking_fs.write_file(uri, content, ctx=ctx)
+    monkeypatch.setattr(service, "reindex", AsyncMock(return_value={"status": "accepted"}))
+    monkeypatch.setattr(service.viking_fs, "_schedule_restore_reindex_for_paths", AsyncMock())
+    lifecycle = service.compile.lifecycle
+    store = lifecycle.store
+    order = (child, parent) if terminal_status == "completed" else (parent, child)
+    tasks = {target: await _prepare_compile_task(service, target, ctx) for target in order}
+
+    assert await lifecycle.on_start(tasks[parent]) == "proceed"
+    await service.viking_fs.write_file(f"{parent}/page.md", "parent output", ctx=ctx)
+    assert await lifecycle.on_start(tasks[child]) == "proceed"
+    await service.viking_fs.write_file(f"{child}/page.md", "child output", ctx=ctx)
+    await service.viking_fs.write_file(f"{child}/new.md", "child new", ctx=ctx)
+    await lifecycle.on_finish(tasks[child], ExternalTaskSnapshot(status="completed"))
+    assert (await store.get_operation(ctx.account_id, child, tasks[child].task_id))[
+        "status"
+    ] == "completed"
+    await service.viking_fs.write_file(f"{child}/page.md", "parent writes child", ctx=ctx)
+    await service.viking_fs.write_file(f"{sibling}/page.md", "sibling edit", ctx=ctx)
+    await lifecycle.on_finish(tasks[parent], ExternalTaskSnapshot(status=terminal_status))
+
+    successful = terminal_status == "completed"
+    for target, output, baseline in (
+        (parent, "parent output", "parent baseline"),
+        (child, "parent writes child", "child baseline"),
+    ):
+        uri = f"{target}/page.md"
+        assert await service.fs.read(uri, ctx) == (output if successful else baseline)
+        assert (await lifecycle.versions.owning_target(ctx.account_id, uri))["to"] == target
+        versions = await service.compile.file_versions(uri, ctx, limit=20, before=None)
+        latest = versions["versions"][0]
+        assert versions["current_version"] == latest["version_id"]
+        assert await service.viking_fs.show(
+            latest["snapshot_id"], path=latest["snapshot_path"], ctx=ctx
+        ) == await service.fs.read_file_bytes(uri, ctx)
+        if successful:
+            assert latest["source"] == "compile"
+            assert latest["meta"]["task_id"] == tasks[parent].task_id
+    assert await store.get_version_index(ctx.account_id, parent, f"{child}/page.md") is None
+    assert await service.viking_fs.exists(f"{child}/new.md", ctx=ctx) is successful
+    if not successful:
+        assert await store.get_version_index(ctx.account_id, child, f"{child}/new.md") is None
+    assert await service.fs.read(f"{sibling}/page.md", ctx) == "sibling edit"
+
+
+@pytest.mark.asyncio
+async def test_compile_requires_starting_snapshot_before_runtime(service, monkeypatch):
+    """A run without a rollback snapshot fails before recording file versions or changing content."""
+    import openviking.service.compile_targets as targets
+
+    ctx = RequestContext(user=service.user, role=Role.USER)
+    target = "viking://resources/wiki"
+    page = f"{target}/page.md"
+    await service.viking_fs.write_file("viking://resources/source/source.md", "source", ctx=ctx)
+    await service.viking_fs.write_file(page, "starting content", ctx=ctx)
+    task = await _prepare_compile_task(service, target, ctx)
+    lifecycle = service.compile.lifecycle
+    monkeypatch.setattr(targets, "commit_snapshot", AsyncMock(return_value=None))
+    monkeypatch.setattr(lifecycle.versions, "record_external", AsyncMock())
+
+    result = await lifecycle.on_start(task)
+
+    assert result.status == "failed"
+    assert "snapshot" in result.error_message.lower()
+    lifecycle.versions.record_external.assert_not_awaited()
+    assert await service.fs.read(page, ctx) == "starting content"
 
 
 async def _seed_compile_target(service, target, ctx):

@@ -689,12 +689,14 @@ class VikingClient:
         *,
         target_uri: str,
         wait: bool = True,
+        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         """Publish a Compile-created package so failed tasks can roll back their own output."""
         return await self.client.add_skill(
             path,
             options={
                 "target_uri": target_uri,
+                "expected_absent": expected_absent,
                 "extra": {
                     "source_metadata": {"type": "api", "source": "compile", "operation": "add"}
                 },
@@ -709,11 +711,16 @@ class VikingClient:
         *,
         target_uri: str,
         wait: bool = True,
+        expected_revision: str | None = None,
     ) -> Dict[str, Any]:
+        """Replace a package only if its optional integrity revision still matches."""
+        options = {"target_uri": target_uri}
+        if expected_revision is not None:
+            options["expected_revision"] = expected_revision
         return await self.client.update_skill(
             skill_name,
             path,
-            options={"target_uri": target_uri},
+            options=options,
             wait=wait,
         )
 

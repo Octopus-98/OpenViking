@@ -46,6 +46,10 @@ class AddSkillRequest(BaseModel):
     wait: bool = False
     source_metadata: Optional[Dict[str, Any]] = None
     target_uri: Optional[str] = None
+    expected_absent: bool = Field(
+        default=False,
+        description="Reject an existing package under the package write lock.",
+    )
     telemetry: TelemetryRequest = False
 
     @model_validator(mode="after")
@@ -216,6 +220,7 @@ async def add_skill(
                 allow_local_path_resolution=allow_local_path_resolution,
                 source_path_hint=source_path_hint,
                 telemetry=request.telemetry,
+                expected_absent=request.expected_absent,
             )
         finally:
             if resolved:

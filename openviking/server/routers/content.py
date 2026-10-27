@@ -53,6 +53,16 @@ class WriteContentRequest(BaseModel):
     acl: AclSpec | None = None
     # Who made the edit; versions of Compile outputs record it (console edit = manual).
     edit_source: Literal["manual", "agent", "compile"] = "manual"
+    # Conditions describe raw stored bytes; omission preserves unconditional writes.
+    expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    expected_absent: bool = False
+
+    @model_validator(mode="after")
+    def validate_precondition(self) -> "WriteContentRequest":
+        """Require one observed target state for a conditional write."""
+        if self.expected_sha256 is not None and self.expected_absent:
+            raise ValueError("expected_sha256 and expected_absent are mutually exclusive")
+        return self
 
 
 class BatchWriteOperation(BaseModel):
@@ -64,6 +74,7 @@ class BatchWriteOperation(BaseModel):
     mode: Literal["replace", "append", "create", "upsert"] = "replace"
     # Optional byte revision, checked under the existing file locks before any writes.
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    expected_absent: bool = False
     tags: list[str] | None = None
     tag_mode: Literal["replace", "append", "clear"] = "replace"
     acl: AclSpec | None = None
@@ -72,6 +83,8 @@ class BatchWriteOperation(BaseModel):
     def validate_content_shape(self) -> "BatchWriteOperation":
         if (self.content is None) == (self.content_base64 is None):
             raise ValueError("exactly one of content or content_base64 is required")
+        if self.expected_sha256 is not None and self.expected_absent:
+            raise ValueError("expected_sha256 and expected_absent are mutually exclusive")
         return self
 
 
@@ -272,6 +285,8 @@ async def write(
             tag_mode=request.tag_mode,
             acl=request.acl,
             edit_source=request.edit_source,
+            expected_sha256=request.expected_sha256,
+            expected_absent=request.expected_absent,
         ),
     )
     return Response(

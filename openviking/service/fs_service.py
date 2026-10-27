@@ -7,6 +7,7 @@ Provides file system operations: ls, mkdir, rm, mv, tree, stat, read, abstract, 
 """
 
 import asyncio
+import hashlib
 from collections.abc import Coroutine
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
@@ -472,11 +473,7 @@ class FSService:
                     )
                 try:
                     await viking_fs.mkdir(uri, ctx=ctx, **({"lease_ref": lease} if lease else {}))
-                    if managed:
-                        await versions.record_effects(
-                            [{"uri": directory_uri, "kind": "directory"}], ctx
-                        )
-                    else:
+                    if not managed:
                         lease = await viking_fs._async_agfs.pathlock_acquire_exact(
                             viking_fs._uri_to_path(abstract_uri, ctx=ctx)
                         )
@@ -597,9 +594,6 @@ class FSService:
                         recursive=recursive,
                         ctx=ctx,
                         **({"lease_ref": lease} if lease is not None else {}),
-                    )
-                    await self.compile_versions.record_effects(
-                        [{"uri": uri, "kind": "deleted"}], ctx
                     )
                     await self.compile_versions.after_remove(uri, ctx)
                     return result
@@ -1534,25 +1528,52 @@ class FSService:
                     },
                 )
         resolved_uri, content = await self._read_content(resolved_uri, ctx)
-        if classify_uri(resolved_uri).is_memory:
-            content = visible_content(content, uri=resolved_uri)
-        if self._privacy_sanitizer is not None:
-            content = (
-                await self._privacy_sanitizer.sanitize(
-                    content,
-                    ctx=ctx,
-                    uri=resolved_uri,
-                    prefer_credentials=(
-                        get_session_id_from_uri(resolved_uri, canonical_session_root(ctx))
-                        is not None
-                    ),
-                )
-            ).content
+        content = await self._make_content_visible(resolved_uri, content, ctx)
         if offset == 0 and limit == -1:
             return content
         lines = content.splitlines(keepends=True)
         sliced = lines[offset:] if limit == -1 else lines[offset : offset + limit]
         return "".join(sliced)
+
+    async def read_visible_with_revision(self, uri: str, ctx: RequestContext) -> tuple[str, str]:
+        """Return visible text and the SHA-256 of the same stored bytes for conditional edits.
+
+        Raw bytes are read once with normal read access and Privacy size limits;
+        memory metadata and private values stay hidden in the returned text.
+        """
+        viking_fs = self._ensure_initialized()
+        resolved_uri = await self._resolve_uri(uri, ctx)
+        max_bytes = (
+            self._privacy_sanitizer.max_content_bytes
+            if self._privacy_sanitizer is not None
+            else None
+        )
+        try:
+            raw = await viking_fs.read_file_bytes(resolved_uri, ctx=ctx, max_bytes=max_bytes)
+        except NotFoundError:
+            if "%20" not in resolved_uri:
+                raise
+            resolved_uri = validate_safe_viking_uri_path(resolved_uri.replace("%20", " "))
+            raw = await viking_fs.read_file_bytes(resolved_uri, ctx=ctx, max_bytes=max_bytes)
+        content = await self._make_content_visible(resolved_uri, viking_fs._decode_bytes(raw), ctx)
+        return content, hashlib.sha256(raw).hexdigest()
+
+    async def _make_content_visible(self, uri: str, content: str, ctx: RequestContext) -> str:
+        """Hide memory metadata and sanitize private values in already-read text."""
+        if classify_uri(uri).is_memory:
+            content = visible_content(content, uri=uri)
+        if self._privacy_sanitizer is not None:
+            content = (
+                await self._privacy_sanitizer.sanitize(
+                    content,
+                    ctx=ctx,
+                    uri=uri,
+                    prefer_credentials=(
+                        get_session_id_from_uri(uri, canonical_session_root(ctx)) is not None
+                    ),
+                )
+            ).content
+        return content
 
     async def abstract(self, uri: str, ctx: RequestContext) -> str:
         """Read L0 abstract (.abstract.md)."""
@@ -1697,10 +1718,13 @@ class FSService:
         edit_source: Literal["manual", "agent", "compile"] = "manual",
         record_version: bool = True,
         commit_content: Optional[Callable[..., Awaitable[Any]]] = None,
+        expected_sha256: str | None = None,
+        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         """Write content and refresh it after persisting managed output versions.
 
         Internal restores supply ``commit_content`` to record their own version.
+        Byte-revision or absence conditions are checked under the content lease.
         """
         viking_fs = self._ensure_initialized()
         if commit_content is None and self.compile_versions is not None:
@@ -1727,6 +1751,8 @@ class FSService:
             tags=tags,
             tag_mode=tag_mode,
             acl=acl,
+            expected_sha256=expected_sha256,
+            expected_absent=expected_absent,
         )
         if self.compile_versions is None or edit_source == "compile":
             return await write()

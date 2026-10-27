@@ -48,7 +48,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from openviking.core.namespace import classify_uri, uri_parts
+from openviking.core.namespace import classify_uri
 from openviking.pyagfs import AsyncAGFSClient
 from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
 from openviking.pyagfs.exceptions import (
@@ -63,7 +63,6 @@ from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker_concurrency import KeyedAsyncLockPool, run_to_completion
 from openviking.storage.acl import AclAction
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
-from openviking.storage.viking_fs._base import LS_ALL_NODES
 from openviking_cli.exceptions import (
     ConflictError,
     FailedPreconditionError,
@@ -209,8 +208,6 @@ class CompileStore(Protocol):
         operation_id: str,
         outputs: List[dict],
         *,
-        effects: Optional[List[dict]] = None,
-        ordinary_operation: Optional[str] = None,
         metadata_lease: Any = None,
     ) -> None: ...
 
@@ -577,16 +574,12 @@ class CompileStateStore:
         operation_id: str,
         outputs: List[dict],
         *,
-        effects: Optional[List[dict]] = None,
-        ordinary_operation: Optional[str] = None,
         metadata_lease: Any = None,
     ) -> None:
         """Persist one reference per output URI; retries preserve already recorded outputs.
 
         Null version/snapshot references indicate unavailable versions. URI paths
         stay fixed at production time so moving a live file cannot change history.
-        Path effects and task references retain content-commit order independently
-        of the operation's later refresh and terminal history updates.
         """
         path = self._outputs_path(account_id, target_to, operation_id)
         async with self.locked(path, metadata_lease) as lease:
@@ -594,13 +587,6 @@ class CompileStateStore:
             merged = {item["uri"]: item for item in data["outputs"]}
             merged.update((item["uri"], item) for item in outputs)
             data["outputs"] = [merged[uri] for uri in sorted(merged)]
-            if effects is not None:
-                paths = data.setdefault("effects", [])
-                paths.extend(effect for effect in effects if effect not in paths)
-            if ordinary_operation is not None:
-                references = data.setdefault("ordinary_operations", [])
-                if ordinary_operation not in references:
-                    references.append(ordinary_operation)
             await self.write_json(path, data, lease)
 
     async def list_dir(self, directory: str) -> List[str]:
@@ -1037,36 +1023,6 @@ class CompileLifecycle:
                     f"Compile 'from' directories must not overlap 'to': {source}"
                 )
 
-    async def validate_target_nesting(self, to: str, ctx: RequestContext) -> None:
-        """Reject canonical ``to`` when an ancestor or existing descendant is an active target.
-
-        The caller checks write access first. Internal traversal includes restricted
-        descendants so ACL filtering cannot hide conflicts; their URIs stay private.
-        Self and deleted registrations are allowed. Storage errors propagate.
-        """
-        parts = uri_parts(to)
-        related = {"viking://" + "/".join(parts[:index]) for index in range(1, len(parts))}
-        try:
-            entries = await self._fs.tree(
-                to,
-                ctx=task_ctx(ctx.account_id, ctx.user.user_id),
-                directories_only=True,
-                show_all_hidden=False,
-                node_limit=None,
-                level_limit=None,
-            )
-        except NotFoundError:
-            entries = []
-        related.update(entry["uri"].rstrip("/") for entry in entries if entry.get("isDir"))
-        related.discard(to)
-        records = await asyncio.gather(
-            *(self._store.get_by_to(ctx.account_id, uri) for uri in sorted(related))
-        )
-        if any(record is not None for record in records):
-            raise InvalidArgumentError(
-                "Compile target must not contain or be contained in another Compile target"
-            )
-
     @staticmethod
     def apply_sources(record: Dict[str, Any], sources: List[str], skill: str) -> None:
         """Save configured sources and Skill without advancing successful execution progress."""
@@ -1223,6 +1179,7 @@ class CompileLifecycle:
             return ExternalTaskSnapshot(
                 status="completed" if run["status"] == "committing" else run["status"],
                 result=run.get("result") or {},
+                error_message=run.get("error"),
             )
         return "proceed"
 
@@ -1232,7 +1189,7 @@ class CompileLifecycle:
         """Return the persisted run planned from a task, target record and optional queued run.
 
         System Skills use live reads and URI identity; other Skills use snapshots.
-        An unavailable current source snapshot requires full execution; busy scopes raise ResourceBusyError.
+        A missing output snapshot fails before Runtime execution; busy scopes raise ResourceBusyError.
         """
         meta, request = task.meta["request"]["compile"], task.meta["request"]
         ctx = task_ctx(task.account_id, task.user_id)
@@ -1289,7 +1246,10 @@ class CompileLifecycle:
                 lease_ref=lease,
             )
             if not run_meta["target_base"]:
-                mode = "full"
+                run["status"] = "failed"
+                run["error"] = "Compile requires an available start snapshot for rollback"
+                await self._store.put_operation(task.account_id, record["to"], run)
+                return run
             run_meta["execution"] = {"mode": mode}
             await self.versions.record_external(
                 task.account_id, record, run_meta["target_base"], ctx
@@ -1511,7 +1471,7 @@ class CompileLifecycle:
                                 "instruction": (run["params"].get("instruction") or "").strip(),
                                 "skill_snapshot": run_meta.get("skill_snapshot"),
                             }
-                    # Rollback snapshots include the ordinary edits retained by the run.
+                    # The head identifies the content published by completion or rollback.
                     synced = run_meta.get("target_head") or run_meta.get("target_base")
                     if synced:
                         record["versions_head"] = synced
@@ -1523,11 +1483,11 @@ class CompileLifecycle:
             await self.reschedule(account_id, record)
 
     async def _rollback(self, to: str, run: Dict[str, Any], ctx: RequestContext) -> None:
-        """Restore the start snapshot overlaid with this task's confirmed ordinary operations.
+        """Restore only ``to`` to the run's start snapshot, discarding intermediate edits.
 
-        The tree lease settles in-flight content commits before reading the ordered
-        task references. Immutable outputs survive deleted version indexes; the
-        completion marker closes association before new content can acquire a lease.
+        The tree lease settles in-flight writes. A durable rollback head prevents a
+        repeated completion from undoing later writes; failed restoration is retried.
+        Paths outside ``to`` and target registration metadata are unchanged.
         """
         run_meta = run["meta"]
         restored, deleted = [], []
@@ -1536,166 +1496,26 @@ class CompileLifecycle:
                 if run_meta.get("rollback_head"):
                     run_meta["target_head"] = run_meta["rollback_head"]
                     return
-                manifest = await self._store.get_outputs(ctx.account_id, to, run_meta["task_id"])
                 head = await self._commit(
                     [to], f"compile {run_meta['task_id']} rollback point", ctx, lease_ref=lease
                 )
                 if not head:
-                    return
-                record = await self._store.get(ctx.account_id, to)
-                changes = {
-                    change["uri"]: change["change_type"]
-                    for change in await self._fs.diff_paths(
-                        dirs=[to], base=run_meta["target_base"], head=head, ctx=ctx
-                    )
-                }
-                desired = {
-                    uri: None
-                    if change == "added"
-                    else {"snapshot_id": run_meta["target_base"], "snapshot_path": uri}
-                    for uri, change in changes.items()
-                }
-                directories, scopes, protected_scopes = set(), set(), set()
-                for operation_id in (manifest or {}).get("ordinary_operations", []):
-                    operation = await self._store.get_outputs(ctx.account_id, to, operation_id)
-                    if operation is None:
-                        raise FailedPreconditionError("Compile operation effects are unavailable")
-                    for effect in operation.get("effects", []):
-                        uri = effect["uri"]
-                        if not uri_matches_prefix(uri, to):
-                            raise FailedPreconditionError(
-                                "Compile operation effect is outside target"
-                            )
-                        if effect["kind"] in {"deleted", "snapshot"}:
-                            desired = {
-                                path: version
-                                for path, version in desired.items()
-                                if not uri_matches_prefix(path, uri)
-                            }
-                            directories = {
-                                path for path in directories if not uri_matches_prefix(path, uri)
-                            }
-                            protected_scopes = {
-                                path
-                                for path in protected_scopes
-                                if not uri_matches_prefix(path, uri)
-                            }
-                        if effect["kind"] == "deleted":
-                            scopes.add(uri)
-                        elif effect["kind"] == "directory":
-                            directories.add(uri)
-                        elif effect["kind"] == "snapshot":
-                            if not effect.get("snapshot_id"):
-                                raise FailedPreconditionError(
-                                    "Compile operation snapshot is unavailable"
-                                )
-                            scopes = {path for path in scopes if not uri_matches_prefix(path, uri)}
-                            if effect["is_dir"]:
-                                directories.add(uri)
-                                protected_scopes.add(uri)
-                            for change in await self._fs.diff_paths(
-                                dirs=[uri], base=effect["snapshot_id"], head=head, ctx=ctx
-                            ):
-                                path = change["uri"]
-                                desired[path] = (
-                                    None
-                                    if change["change_type"] == "added"
-                                    else {
-                                        "kind": "file",
-                                        "snapshot_id": effect["snapshot_id"],
-                                        "snapshot_path": path,
-                                    }
-                                )
-                            if not effect["is_dir"]:
-                                desired[uri] = {
-                                    "kind": "file",
-                                    "snapshot_id": effect["snapshot_id"],
-                                    "snapshot_path": uri,
-                                }
-                    for output in operation["outputs"]:
-                        uri = output["uri"]
-                        if not uri_matches_prefix(uri, to):
-                            raise FailedPreconditionError(
-                                "Compile operation output is outside target"
-                            )
-                        if not output.get("snapshot_id"):
-                            raise FailedPreconditionError(
-                                "Compile operation snapshot is unavailable"
-                            )
-                        desired[uri] = {"kind": "file", **output, "snapshot_path": uri}
-                await self.versions.record_compile(
-                    ctx.account_id,
-                    record,
-                    run,
-                    head,
-                    [
-                        {"uri": uri, "change_type": change}
-                        for uri, change in changes.items()
-                        if change != "deleted"
-                    ],
-                    ctx,
+                    raise FailedPreconditionError("Compile rollback snapshot is unavailable")
+                changes = await self._fs.diff_paths(
+                    dirs=[to], base=run_meta["target_base"], head=head, ctx=ctx
                 )
-                indexes = {
-                    index["uri"]: index
-                    for index in await self.versions._indexes(ctx.account_id, to)
-                }
-                changed = False
-                ordinary_files = {
-                    uri
-                    for uri, version in desired.items()
-                    if version is not None and version.get("kind") == "file"
-                }
-                protected_dirs = set(directories)
-                for uri in ordinary_files | directories:
-                    parent = uri.rsplit("/", 1)[0]
-                    while parent != to and uri_matches_prefix(parent, to):
-                        protected_dirs.add(parent)
-                        parent = parent.rsplit("/", 1)[0]
-                removals = scopes | {uri for uri, version in desired.items() if version is None}
-                pending = list(removals)
-                while pending:
-                    uri = pending.pop()
-                    if uri in ordinary_files or not await self._fs.exists(uri, ctx=ctx):
-                        continue
-                    # Git snapshots omit empty directories inside a protected ordinary scope.
-                    if uri in protected_scopes and uri not in desired:
-                        continue
-                    if any(
-                        uri_matches_prefix(path, uri) for path in ordinary_files | protected_dirs
-                    ):
-                        stat = await self._fs.stat(uri, ctx=ctx, skip_count=True)
-                        if stat.get("isDir"):
-                            pending.extend(
-                                entry["uri"]
-                                for entry in await self._fs.ls(
-                                    uri, show_all_hidden=True, node_limit=LS_ALL_NODES, ctx=ctx
-                                )
-                                if not (
-                                    uri in protected_dirs
-                                    and entry["uri"].rsplit("/", 1)[-1] in _DERIVED
-                                )
-                            )
-                            continue
-                    await self._fs.rm(uri, recursive=True, ctx=ctx, lease_ref=lease)
-                    deleted.append(self._fs._uri_to_tree_path(uri, ctx=ctx))
-                    changed = changed or is_versioned(uri)
-                for uri in sorted(protected_dirs, key=lambda value: (value.count("/"), value)):
-                    if await self._fs.exists(uri, ctx=ctx) and not (
-                        await self._fs.stat(uri, ctx=ctx, skip_count=True)
-                    ).get("isDir"):
+                for change in sorted(
+                    changes, key=lambda item: item["uri"].count("/"), reverse=True
+                ):
+                    uri = change["uri"]
+                    if change["change_type"] == "added" and await self._fs.exists(uri, ctx=ctx):
                         await self._fs.rm(uri, recursive=True, ctx=ctx, lease_ref=lease)
                         deleted.append(self._fs._uri_to_tree_path(uri, ctx=ctx))
-                    await self._fs.mkdir(uri, exist_ok=True, ctx=ctx, lease_ref=lease)
-                    for name in (".abstract.md", ".overview.md"):
-                        marker = f"{uri}/{name}"
-                        if await self._fs.exists(marker, ctx=ctx):
-                            restored.append(self._fs._uri_to_tree_path(marker, ctx=ctx))
-                for uri, version in desired.items():
-                    if version is None:
+                for change in sorted(changes, key=lambda item: item["uri"].count("/")):
+                    if change["change_type"] == "added":
                         continue
-                    content = await self._fs.show(
-                        version["snapshot_id"], path=version["snapshot_path"], ctx=ctx
-                    )
+                    uri = change["uri"]
+                    content = await self._fs.show(run_meta["target_base"], path=uri, ctx=ctx)
                     if await self._fs.exists(uri, ctx=ctx):
                         if (await self._fs.stat(uri, ctx=ctx, skip_count=True)).get("isDir"):
                             await self._fs.rm(uri, recursive=True, ctx=ctx, lease_ref=lease)
@@ -1704,31 +1524,15 @@ class CompileLifecycle:
                             continue
                     await self._fs.write_file_bytes(uri, content, ctx=ctx, lease_ref=lease)
                     restored.append(self._fs._uri_to_tree_path(uri, ctx=ctx))
-                    changed = changed or is_versioned(uri)
-                if changed:
-                    await self._store.mark_content_updated(ctx.account_id, to)
-                for uri, index in indexes.items():
-                    if not await self._fs.exists(uri, ctx=ctx):
-                        await self._store.delete_version_index(ctx.account_id, to, uri)
-                        continue
-                    retained = [
-                        v
-                        for v in index["versions"]
-                        if not (
-                            v["meta"]["task_id"] == run_meta["task_id"] and v["source"] == "compile"
-                        )
-                    ]
-                    if retained == index["versions"]:
-                        continue
-                    if retained:
-                        index["versions"] = retained
-                        await self._store.put_version_index(ctx.account_id, to, index)
-                    else:
-                        await self._store.delete_version_index(ctx.account_id, to, uri)
-                run_meta["target_head"] = await self._commit(
+                rollback_head = await self._commit(
                     [to], f"compile {run_meta['task_id']} rollback", ctx, lease_ref=lease
                 )
-                run_meta["rollback_head"] = run_meta["target_head"]
+                if not rollback_head:
+                    raise FailedPreconditionError("Compile rollback snapshot is unavailable")
+                await self.versions.reconcile_rollback(
+                    to, rollback_head, ctx, changed_uris=[change["uri"] for change in changes]
+                )
+                run_meta["target_head"] = run_meta["rollback_head"] = rollback_head
                 await self._store.put_operation(ctx.account_id, to, run)
         finally:
             if restored or deleted:
@@ -1773,7 +1577,7 @@ async def commit_snapshot(
     lease_ref: Optional[Dict[str, Any]] = None,
     wait_busy: bool = True,
 ) -> Optional[str]:
-    """Return the snapshot oid, or None when Git is disabled (Compile then runs in full).
+    """Return the snapshot oid, or None when Git cannot provide a snapshot.
 
     Busy paths wait up to ``SNAPSHOT_BUSY_SECONDS`` unless ``wait_busy=False``
     lets the caller defer work through its queue.
@@ -1826,7 +1630,7 @@ def is_versioned(uri: str) -> bool:
 
 
 class CompileVersions:
-    """Version metadata preserves ordinary edits across Compile retries and rollback."""
+    """Persist output versions and reconcile current indexes with committed content."""
 
     def __init__(self, store: CompileStore, viking_fs: Any) -> None:
         self._store = store
@@ -2131,63 +1935,6 @@ class CompileVersions:
                         logger.exception("Failed to persist operation failure %s", operation_id)
                 raise exc from operation_error
 
-    async def record_effects(
-        self, effects: List[dict], ctx: RequestContext, *, metadata_lease: Any = None
-    ) -> None:
-        """Publish confirmed outputs and path effects under the content lease.
-
-        Unfinished Compile tasks retain scope snapshots and ordered operation IDs.
-        File version references remain independent of directory baselines.
-        """
-        context = _operation_outputs.get()
-        if context is None or context["account_id"] != ctx.account_id:
-            return
-        for target_to, original in context["targets"].items():
-            record = await self._store.get(ctx.account_id, original["to"])
-            if (
-                record is None
-                or record["to"] != target_to
-                or record["status"] != "active"
-                or record["deleted_at"] != original.get("deleted_at")
-            ):
-                continue
-            scoped = []
-            for effect in effects:
-                uri = effect["uri"].rstrip("/")
-                scopes = {original["to"], record["to"]}
-                if any(uri_matches_prefix(uri, scope) for scope in scopes):
-                    scoped.append({**effect, "uri": uri})
-                elif effect["kind"] in {"deleted", "snapshot"} and uri_matches_prefix(
-                    record["to"], uri
-                ):
-                    scoped.append({**effect, "uri": record["to"]})
-            outputs = list(context["outputs"][target_to].values())
-            if not scoped and not outputs:
-                continue
-
-            async def persist(target_to=target_to, scoped=scoped, outputs=outputs, record=record):
-                owner = (await self._write_meta(ctx.account_id, record)).get("task_id")
-                if outputs or owner:
-                    await self._store.merge_outputs(
-                        ctx.account_id,
-                        target_to,
-                        context["operation_id"],
-                        outputs,
-                        effects=scoped if owner and scoped else None,
-                        metadata_lease=metadata_lease,
-                    )
-                if owner:
-                    await self._store.merge_outputs(
-                        ctx.account_id,
-                        target_to,
-                        owner,
-                        [],
-                        ordinary_operation=context["operation_id"],
-                        metadata_lease=metadata_lease,
-                    )
-
-            await run_to_completion(persist)
-
     async def guard_transfer(
         self,
         from_uri: str,
@@ -2253,60 +2000,21 @@ class CompileVersions:
         lease_ref: Any,
         move: bool = False,
     ) -> None:
-        """Snapshot final transfer scopes while the caller holds their content lease.
+        """Finalize target metadata and content timestamps under the transfer lease.
 
-        Directory snapshots form one ordinary baseline, including merged contents.
-        Moves retain the final source state and re-key indexes only after source removal.
+        Partial moves relocate metadata only after the source disappears, except
+        when a whole target's metadata transaction already owns the move.
         """
         context = _operation_outputs.get()
         scope = _metadata_move.get()
-        collecting = context is not None and context["account_id"] == ctx.account_id
-        if not collecting and not (scope and scope.get("moves")):
-            return
         source_root, destination = from_uri.rstrip("/"), to_uri.rstrip("/")
         if move and (
             (scope and scope.get("moves")) or not await self._fs.exists(source_root, ctx=ctx)
         ):
             await self.after_move(source_root, destination, ctx)
-        if not collecting:
-            return
-        targets = []
-        for target_to in context["targets"]:
-            await self._store.mark_content_updated(
-                ctx.account_id, context["targets"][target_to]["to"]
-            )
-            record = await self._store.get(ctx.account_id, context["targets"][target_to]["to"])
-            if record and (await self._write_meta(ctx.account_id, record)).get("task_id"):
-                targets.append(record["to"])
-        if not targets:
-            return
-        paths = [source_root, destination] if move else [destination]
-        snapshot_paths = {
-            target if uri_matches_prefix(target, uri) else uri
-            for uri in paths
-            for target in targets
-            if overlaps(uri, target)
-        }
-        snapshot = await self._commit(
-            sorted(snapshot_paths), "ordinary transfer", ctx, lease_ref=lease_ref
-        )
-        effects = []
-        for uri in paths:
-            if not await self._fs.exists(uri, ctx=ctx):
-                effects.append({"uri": uri, "kind": "deleted"})
-                continue
-            stat = await self._fs.stat(uri, ctx=ctx, skip_count=True)
-            if not stat.get("isDir", False) and not is_versioned(uri):
-                continue
-            effects.append(
-                {
-                    "uri": uri,
-                    "kind": "snapshot",
-                    "snapshot_id": snapshot,
-                    "is_dir": stat.get("isDir", False),
-                }
-            )
-        await self.record_effects(effects, ctx)
+        if context is not None and context["account_id"] == ctx.account_id:
+            for target in context["targets"].values():
+                await self._store.mark_content_updated(ctx.account_id, target["to"])
 
     async def _managed(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
         record = await self.owning_target(ctx.account_id, uri)
@@ -2338,6 +2046,7 @@ class CompileVersions:
 
         Ordinary versions remain immutable; full runs record all sources, while
         incremental runs extend the latest version's provenance with changed roots.
+        Each file belongs to its nearest target; output references stay with this run.
         """
         if not head:
             await self._store.merge_outputs(account_id, record["to"], run["operation_id"], [])
@@ -2355,13 +2064,17 @@ class CompileVersions:
             or run["params"]["args"]["mode"] == "full"
         )
         manifest = await self._store.get_outputs(account_id, record["to"], run["operation_id"])
+        output_indexes = list(indexes.values())
+        for target in await self._targets_under(account_id, record["to"]):
+            if target["to"] != record["to"]:
+                output_indexes.extend(await self._indexes(account_id, target["to"]))
         outputs = list((manifest or {}).get("outputs", [])) + [
             {
                 "uri": version["snapshot_path"],
                 "version_id": version["version_id"],
                 "snapshot_id": version["snapshot_id"],
             }
-            for index in indexes.values()
+            for index in output_indexes
             for version in index["versions"]
             if version["source"] == "compile" and version["meta"]["task_id"] == run_meta["task_id"]
         ]
@@ -2373,25 +2086,62 @@ class CompileVersions:
                     continue
                 if uri in recorded:
                     continue
-                index, version = indexes.get(uri), ordinary.get(uri)
+                owner = await self.owning_target(account_id, uri)
+                target_to = owner["to"] if owner is not None else record["to"]
+                index = (
+                    indexes.get(uri)
+                    if target_to == record["to"]
+                    else await self.load(account_id, target_to, uri)
+                )
+                existing = next(
+                    (
+                        version
+                        for version in (index or {}).get("versions", [])
+                        if version["source"] == "compile"
+                        and version["meta"]["task_id"] == run_meta["task_id"]
+                        and version["snapshot_id"] == head
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    outputs.append(
+                        {
+                            "uri": uri,
+                            "version_id": existing["version_id"],
+                            "snapshot_id": existing["snapshot_id"],
+                        }
+                    )
+                    continue
+                version = self._ordinary_version(index, run_meta["task_id"])
                 change_type = changes.get(uri, "modified")
+                if target_to != record["to"]:
+                    # Nested ordinary edits have no parent task marker; compare live bytes.
+                    exists = await self._fs.exists(uri, ctx=ctx)
+                    if change_type == "deleted":
+                        if exists and not (await self._fs.stat(uri, ctx=ctx, skip_count=True)).get(
+                            "isDir"
+                        ):
+                            continue
+                    elif not exists or (await self._fs.stat(uri, ctx=ctx, skip_count=True)).get(
+                        "isDir"
+                    ):
+                        continue
+                    elif await self._fs.read_file_bytes(uri, ctx=ctx) != await self._fs.show(
+                        head, path=uri, ctx=ctx
+                    ):
+                        continue
                 if version:
                     if version["meta"]["after_compile_snapshot"]:
                         continue
                     if change_type != "deleted":
                         try:
-                            if not await self._changed(ctx, record["to"], uri, head):
+                            if not await self._changed(ctx, target_to, uri, head):
                                 continue
                         except (AGFSNotFoundError, NotFoundError):
                             change_type = "deleted"
                 if change_type == "deleted":
                     if version is None:
-                        await self._store.delete_version_index(account_id, record["to"], uri)
-                    continue
-                if index and any(
-                    v["meta"]["task_id"] == run_meta["task_id"] and v["source"] == "compile"
-                    for v in index["versions"]
-                ):
+                        await self._store.delete_version_index(account_id, target_to, uri)
                     continue
                 if full or not (index or {}).get("versions"):
                     roots = list(run["params"]["from"])
@@ -2402,7 +2152,7 @@ class CompileVersions:
                     roots = sorted(set(previous_roots) | set(run_meta["changed_roots"]))
                 created = await self.append(
                     account_id,
-                    record["to"],
+                    target_to,
                     uri,
                     head,
                     {
@@ -2473,20 +2223,66 @@ class CompileVersions:
             uri = change["uri"]
             if not is_versioned(uri):
                 continue
+            owner = await self.owning_target(account_id, uri)
+            target_to = owner["to"] if owner is not None else record["to"]
             if change["change_type"] == "deleted":
-                changed = changed or await self.load(account_id, record["to"], uri) is not None
-                await self._store.delete_version_index(account_id, record["to"], uri)
-            elif await self._changed(ctx, record["to"], uri, target_base):
+                changed = changed or await self.load(account_id, target_to, uri) is not None
+                await self._store.delete_version_index(account_id, target_to, uri)
+            elif await self._changed(ctx, target_to, uri, target_base):
                 changed = True
                 await self.append(
                     account_id,
-                    record["to"],
+                    target_to,
                     uri,
                     target_base,
                     {"source": "external", "actor": None, "provenance": {}},
                 )
         if changed and record.get("versions_head"):
             await self._store.mark_content_updated(account_id, record["to"])
+
+    async def reconcile_rollback(
+        self, to: str, snapshot: str, ctx: RequestContext, *, changed_uris: List[str]
+    ) -> None:
+        """Align current versions under ``to`` with a restored snapshot under its tree lease.
+
+        Existing ancestor indexes are reconciled without duplicating new versions
+        across targets. Files without history belong to their nearest active target.
+        Intermediate versions remain available as history; missing files lose indexes.
+        changed_uris identifies restored or removed business files for target timestamps.
+        """
+        live = {
+            change["uri"]
+            for change in await self._fs.diff_paths(dirs=[to], base=None, head=snapshot, ctx=ctx)
+            if is_versioned(change["uri"])
+        }
+        owners = {}
+        for uri in live:
+            owner = await self.owning_target(ctx.account_id, uri)
+            if owner is not None:
+                owners[uri] = owner["to"]
+        for target in await self._targets_under(ctx.account_id, to):
+            target_to = target["to"]
+            indexes = {
+                index["uri"]: index
+                for index in await self._indexes(ctx.account_id, target_to)
+                if uri_matches_prefix(index["uri"], to)
+            }
+            uris = indexes.keys() | {uri for uri, owner in owners.items() if owner == target_to}
+            for uri in sorted(uris):
+                if uri not in live:
+                    await self._store.delete_version_index(ctx.account_id, target_to, uri)
+                elif await self._changed(ctx, target_to, uri, snapshot):
+                    await self.append(
+                        ctx.account_id,
+                        target_to,
+                        uri,
+                        snapshot,
+                        {"source": "external", "actor": None, "provenance": {}},
+                    )
+            async with self._store.edit(ctx.account_id, target_to) as record:
+                record["versions_head"] = snapshot
+                if any(uri_matches_prefix(uri, target_to) for uri in changed_uris):
+                    record["content_updated_at"] = time.time()
 
     async def record_write(
         self,
@@ -2503,8 +2299,8 @@ class CompileVersions:
         Unversioned writes still record actual content changes.
         Ordinary batches save each target's change time during batch finalization.
         Active Compile writes defer the directory timestamp to task finalization.
-        Operation outputs select rollback content; after_compile_snapshot protects newer
-        ordinary versions from a retry of the frozen finish snapshot.
+        after_compile_snapshot protects newer ordinary versions from a retry of
+        the frozen finish snapshot.
         """
         grouped: Dict[str, List[str]] = {}
         records = {}
@@ -2583,38 +2379,34 @@ class CompileVersions:
             return written
         if not changed:
             return written
-        try:
-            snapshot = await self._commit(
-                [uri for targets in changed.values() for uri in targets],
-                f"{edit_source} edit",
-                ctx,
-                lease_ref=lease_ref,
-            )
-            if context and context["account_id"] == ctx.account_id:
-                for target_to, targets in changed.items():
-                    if target_to in context["outputs"]:
-                        for uri in targets:
-                            context["outputs"][target_to][uri]["snapshot_id"] = snapshot
+        snapshot = await self._commit(
+            [uri for targets in changed.values() for uri in targets],
+            f"{edit_source} edit",
+            ctx,
+            lease_ref=lease_ref,
+        )
+        if context and context["account_id"] == ctx.account_id:
             for target_to, targets in changed.items():
-                record = await self._store.get(ctx.account_id, records[target_to]["to"])
-                run_entry = await self._write_meta(ctx.account_id, record)
-                for uri in targets:
-                    if snapshot:
-                        await self.append(
-                            ctx.account_id,
-                            target_to,
-                            uri,
-                            snapshot,
-                            {
-                                "source": edit_source,
-                                "actor": ctx.user.user_id,
-                                "provenance": {"source_roots": [uri]},
-                                "meta": run_entry,
-                            },
-                        )
-        finally:
-            if edit_source != "compile":
-                await self.record_effects([], ctx)
+                if target_to in context["outputs"]:
+                    for uri in targets:
+                        context["outputs"][target_to][uri]["snapshot_id"] = snapshot
+        for target_to, targets in changed.items():
+            record = await self._store.get(ctx.account_id, records[target_to]["to"])
+            run_entry = await self._write_meta(ctx.account_id, record)
+            for uri in targets:
+                if snapshot:
+                    await self.append(
+                        ctx.account_id,
+                        target_to,
+                        uri,
+                        snapshot,
+                        {
+                            "source": edit_source,
+                            "actor": ctx.user.user_id,
+                            "provenance": {"source_roots": [uri]},
+                            "meta": run_entry,
+                        },
+                    )
         return written
 
     async def _write_meta(self, account_id: str, record: dict) -> dict:
@@ -2665,10 +2457,6 @@ class CompileVersions:
         if context is None or context["account_id"] != ctx.account_id:
             return
         snapshot = result.get("new_commit_oid")
-        effects = [
-            {"uri": self._fs._tree_path_to_uri(path), "kind": "deleted"}
-            for path in result.get("deleted_paths", [])
-        ]
         files = []
         for path in result.get("written_paths", []):
             uri = self._fs._tree_path_to_uri(path)
@@ -2681,25 +2469,22 @@ class CompileVersions:
                         "snapshot_id": snapshot,
                     }
                 files.append((record, uri))
-        try:
-            for record, uri in files:
-                if not snapshot:
-                    continue
-                await self.append(
-                    ctx.account_id,
-                    record["to"],
-                    uri,
-                    snapshot,
-                    {
-                        "source": "restore",
-                        "actor": ctx.user.user_id,
-                        "provenance": {"source_roots": [uri]},
-                        "meta": await self._write_meta(ctx.account_id, record),
-                    },
-                    metadata_lease=metadata_lease,
-                )
-        finally:
-            await self.record_effects(effects, ctx, metadata_lease=metadata_lease)
+        for record, uri in files:
+            if not snapshot:
+                continue
+            await self.append(
+                ctx.account_id,
+                record["to"],
+                uri,
+                snapshot,
+                {
+                    "source": "restore",
+                    "actor": ctx.user.user_id,
+                    "provenance": {"source_roots": [uri]},
+                    "meta": await self._write_meta(ctx.account_id, record),
+                },
+                metadata_lease=metadata_lease,
+            )
 
     async def _changed(self, ctx: RequestContext, target_to: str, uri: str, snapshot: str) -> bool:
         """Compare blob IDs at their recorded paths using the caller's identity.

@@ -220,7 +220,7 @@ POST /api/v1/tasks/{task_id}/cancel
 ov task cancel cmp_01abc
 ```
 
-The task first enters `cancelling`, then becomes `cancelled` after in-process work and cleanup settle. Writes that already completed are not rolled back. Repeated cancellation of an already `cancelled` task is idempotent.
+A running Compile task first enters `cancelling`, then becomes `cancelled` after the execution backend confirms cancellation and rollback finishes. Rollback restores files in the `to` subtree to the snapshot taken when that Compile run started, including changes made there by other operations and child tasks during the run. Paths outside `to` are not restored. Repeated cancellation of an already `cancelled` task is idempotent.
 
 | Status | Typical stages |
 |--------|----------------|

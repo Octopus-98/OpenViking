@@ -428,6 +428,8 @@ async def run(runtime: Pipeline, references: list[str]) -> RenderedBundle:
         }
         if revision:
             operation["expected_sha256"] = revision
+        else:
+            operation["expected_absent"] = True
         operation.pop("content_base64" if operation["content"] is not None else "content")
         rendered.operations.append(operation)
         (rendered.updated if revision else rendered.created).append(uri)

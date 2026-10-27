@@ -34,11 +34,13 @@ async def install_skills(
     allow_local_path_resolution: bool = False,
     source_path_hint: Optional[str] = None,
     telemetry: TelemetryRequest = False,
+    expected_absent: bool = False,
 ) -> dict[str, Any]:
     """Install the skills found in ``data``; return one result or ``{"installed", "total"}``.
 
     ``list_only`` describes the source's skills without persisting anything.
     ``target_uri`` must already be validated as a skill root by the caller.
+    ``expected_absent`` rejects occupied package roots under each package write lock.
     """
     service = get_service()
     async with resolve_skill_source(
@@ -61,6 +63,7 @@ async def install_skills(
                     source_path_hint=source_path_hint,
                     target_uri=target_uri,
                     source_metadata=skill_source,
+                    expected_absent=expected_absent,
                 )
                 return result
 

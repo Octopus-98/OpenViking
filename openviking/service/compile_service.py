@@ -974,8 +974,6 @@ class CompileService:
         else:
             if not target_stat.get("isDir"):
                 raise InvalidArgumentError("Compile target must be a directory")
-        if self._lifecycle is not None:
-            await self._lifecycle.validate_target_nesting(request.to, ctx)
         return request
 
     @staticmethod

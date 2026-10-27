@@ -1404,6 +1404,8 @@ async def write(
     mode: Literal["replace", "append", "create"] = "replace",
     wait: bool = False,
     acl: Optional[AclSpec] = None,
+    expected_sha256: Optional[str] = None,
+    expected_absent: bool = False,
 ) -> str:
     """Write text to a viking:// file. Use this for files you author yourself (notes, profiles, state), the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite. To store a file, document, URL, or repo the user gives you, use add_resource; for a skill, use add_skill. Do not copy its text into a file here instead.
 
@@ -1415,6 +1417,9 @@ async def write(
       (principal=user:<id>/group:<id>/user:*, level=read/write/manage). Explicit ACL
       requires manage on the target, or its parent for a new file. Omit to preserve
       existing ACL or inherit on creation.
+    - expected_sha256: optional SHA-256 of the raw bytes last read; a changed or missing
+      file is rejected. expected_absent=true requires a missing file. These conditions
+      are mutually exclusive; on conflict, re-read before preparing another write.
 
     Writable scopes: viking://resources/, viking://user/{user_id}/, viking://agent/. The viking://~ home alias expands to the caller's user root. The managed user subtrees skills/, peers/, privacy/ and sessions/ are read-only. Do not write inside a skill package under viking://agent/skills/ either: a plain write skips installation, so the skill's abstract, overview and source metadata go stale. Change a skill with the add_skill tool. After a write, semantic search indexes refresh in the background; pass wait=true to block until search reflects the change."""
     # An explicit ACL uses the kernel's manage check before any content is written.
@@ -1423,7 +1428,14 @@ async def write(
     uri = _resolve_mcp_workspace_uri(uri, ctx)
 
     result = await service.fs.write(
-        uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, acl=acl
+        uri=uri,
+        content=content,
+        ctx=ctx,
+        mode=mode,
+        wait=wait,
+        acl=acl,
+        expected_sha256=expected_sha256,
+        expected_absent=expected_absent,
     )
     written = result.get("written_bytes", 0)
     message = (
@@ -1453,7 +1465,7 @@ async def edit(
     if not old_string:
         raise InvalidArgumentError("old_string must not be empty")
     try:
-        current = await service.fs.read_visible(uri, ctx=ctx)
+        current, revision = await service.fs.read_visible_with_revision(uri, ctx=ctx)
     except (InvalidArgumentError, PermissionDeniedError, UnauthenticatedError):
         raise
     except Exception as exc:
@@ -1475,7 +1487,9 @@ async def edit(
     updated = current.replace(old_string, new_string)
     if updated == current:
         return f"No changes: {uri} already matches the requested edit."
-    result = await service.fs.write(uri=uri, content=updated, ctx=ctx, mode="replace", wait=wait)
+    result = await service.fs.write(
+        uri=uri, content=updated, ctx=ctx, mode="replace", wait=wait, expected_sha256=revision
+    )
     written = result.get("written_bytes", 0)
     message = f"Edited {result.get('uri', uri)} ({written} bytes written)."
     return message + _indexing_hint(result)

@@ -2542,6 +2542,7 @@ class ResourceService:
         source_metadata: Optional[Dict[str, Any]] = None,
         task_id: Optional[str] = None,
         owner_lease_ref: Optional[Dict[str, Any]] = None,
+        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         """Add skill to OpenViking.
 
@@ -2549,6 +2550,7 @@ class ResourceService:
             data: Skill data (directory path, file path, string, or dict)
             wait: Whether to wait for vectorization to complete
             target_uri: Optional root URI override (e.g. ``viking://agent/skills``).
+            expected_absent: Reject existing package contents before privacy or file writes.
 
         Returns:
             Processing result
@@ -2573,7 +2575,7 @@ class ResourceService:
         telemetry_cleanup_scheduled = False
 
         async def record_package(skill_uri: str, lease_ref: Any) -> None:
-            """Preserve standalone ordinary packages under their lease for Compile rollback."""
+            """Record an ordinary Skill package operation under its content lease."""
             if (
                 self.compile_versions is not None
                 and owner_lease_ref is None
@@ -2633,6 +2635,7 @@ class ResourceService:
                             source_metadata=source_metadata,
                             owner_lease_ref=owner_lease_ref,
                             on_package_written=record_package,
+                            expected_absent=expected_absent,
                         )
                     else:
                         result = await self._skill_processor.process_skill(
@@ -2647,6 +2650,7 @@ class ResourceService:
                             source_metadata=source_metadata,
                             owner_lease_ref=owner_lease_ref,
                             on_package_written=record_package,
+                            expected_absent=expected_absent,
                         )
                 if isinstance(result, dict) and "root_uri" not in result and result.get("uri"):
                     result["root_uri"] = result["uri"]

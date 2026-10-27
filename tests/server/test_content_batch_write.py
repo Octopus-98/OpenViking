@@ -25,6 +25,7 @@ from openviking.telemetry.context import bind_telemetry
 from openviking.telemetry.operation import OperationTelemetry
 from openviking.utils.content_hash import content_md5
 from openviking_cli.exceptions import (
+    ConflictError,
     InvalidArgumentError,
     NotFoundError,
 )
@@ -126,6 +127,45 @@ class _VFS:
         except UnicodeDecodeError:
             self.files[uri] = content
         self.writes.append(uri)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "root,name",
+    [
+        ("viking://resources/wiki", "page.md"),
+        ("viking://resources/wiki", ".abstract.md"),
+        ("viking://user/default/memories/preferences", "page.md"),
+        ("viking://system/memory/memory_templates/custom/demo", "template.md"),
+    ],
+)
+async def test_single_write_rechecks_revision_after_acquiring_each_content_lock(
+    root, name, monkeypatch
+):
+    uri = f"{root}/{name}"
+    vfs = _VFS(root, {uri: "observed"})
+    acquire = vfs._async_agfs.pathlock_acquire_exact
+
+    async def acquire_after_concurrent_write(path):
+        lease = await acquire(path)
+        vfs.files[uri] = "concurrent"
+        return lease
+
+    monkeypatch.setattr(vfs._async_agfs, "pathlock_acquire_exact", acquire_after_concurrent_write)
+    coordinator = ContentWriteCoordinator(vfs)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ADMIN)
+
+    with pytest.raises(ConflictError, match="Re-read"):
+        await coordinator.write(
+            uri=uri,
+            content="stale update",
+            expected_sha256=hashlib.sha256(b"observed").hexdigest(),
+            ctx=ctx,
+        )
+
+    assert vfs.files[uri] == "concurrent"
+    assert vfs.writes == []
+    assert vfs._async_agfs.releases == 1
 
 
 @pytest.mark.asyncio
@@ -1297,6 +1337,26 @@ async def test_batch_refresh_groups_resource_and_memory_work(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_content_write_api_distinguishes_empty_and_missing_files(client, service):
+    uri = "viking://system/memory/memory_templates/custom/demo/template.md"
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    for content, condition, status in [
+        ("lost", {"expected_sha256": empty_hash}, 409),
+        ("", {"expected_absent": True}, 200),
+        ("lost", {"expected_absent": True}, 409),
+        ("updated", {"expected_sha256": empty_hash}, 200),
+        ("lost", {"expected_sha256": empty_hash}, 409),
+    ]:
+        response = await client.post(
+            "/api/v1/content/write", json={"uri": uri, "content": content, **condition}
+        )
+        assert response.status_code == status, response.text
+
+    ctx = RequestContext(user=service.user, role=Role.ROOT)
+    assert await service.viking_fs.read_file(uri, ctx=ctx) == "updated"
+
+
+@pytest.mark.asyncio
 async def test_batch_write_api_upserts_files(client_with_resource):
     client, root = client_with_resource
     listing = await client.get(
@@ -1336,6 +1396,21 @@ async def test_batch_write_api_upserts_files(client_with_resource):
         json={},
     )
     assert waited.status_code == 200
+
+    conflict = await client.post(
+        "/api/v1/content/batch-write",
+        json={
+            "root_uri": root,
+            "operations": [
+                {**operations[0], "content": "# Must not change"},
+                {**operations[1], "expected_sha256": hashlib.sha256(b"stale").hexdigest()},
+            ],
+            "wait": False,
+        },
+    )
+    assert conflict.status_code == 409, conflict.text
+    unchanged = await client.get("/api/v1/content/read", params={"uri": existing})
+    assert unchanged.json()["result"] == "# Batch updated"
 
     retry = await client.post(
         "/api/v1/content/batch-write",

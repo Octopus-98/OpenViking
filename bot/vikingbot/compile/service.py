@@ -1349,9 +1349,12 @@ class BotCompileService:
         skill_dir: Path,
         stage: str = "loading_skill",
     ) -> None:
+        """Copy a package view, rejecting bytes that differ from its integrity manifest."""
         skill_dir.mkdir(parents=True, exist_ok=True)
         content = str(skill_result.get("content") or "")
         encoded = content.encode("utf-8")
+        if skill_result.get("content_sha256") not in {None, content_hash(encoded)}:
+            raise CompileFailure("WRITE_CONFLICT", "Skill definition changed", stage=stage)
         (skill_dir / "SKILL.md").write_bytes(encoded)
 
         files = skill_result.get("files") or []
@@ -1369,6 +1372,10 @@ class BotCompileService:
             except ValueError as exc:
                 raise CompileFailure("SKILL_INVALID", str(exc), stage=stage) from exc
             data = await client.download_bytes(str(item.get("uri") or ""))
+            if item.get("sha256") not in {None, content_hash(data)}:
+                raise CompileFailure(
+                    "WRITE_CONFLICT", f"Skill file changed: {relative}", stage=stage
+                )
             local.parent.mkdir(parents=True, exist_ok=True)
             local.write_bytes(data)
 
@@ -1381,9 +1388,9 @@ class BotCompileService:
     ) -> dict[str, list[str]]:
         """Publish one validated package, retaining untouched existing attachments.
 
-        Pipeline operations contain target-relative file revisions. Recheck those
-        revisions against the materialized package before invoking the Skill API;
-        Skill updates replace the whole package and do not offer atomic file CAS.
+        Pipeline file guards bind generated content to its original reads. An
+        integrity snapshot also guards retained attachments through the Skill
+        API's atomic package-revision check; newly created packages require absence.
         The returned URIs identify Skill roots, as required by Compile's Skill result.
         """
         result = {"created": [], "updated": [], "unchanged": []}
@@ -1422,9 +1429,17 @@ class BotCompileService:
                     raise
                 exists = False
             if exists:
+                skill_result = await client.get_skill(
+                    skill_name, target_uri=target_uri, include_integrity=True
+                )
+                revision = skill_result.get("revision")
+                if not revision:
+                    raise CompileFailure(
+                        "WRITE_CONFLICT", "Skill package revision is unavailable", stage="writing"
+                    )
                 await self._materialize_skill_package(
                     client=client,
-                    skill_result=await client.get_skill(skill_name, target_uri=target_uri),
+                    skill_result=skill_result,
                     skill_dir=skill_dir,
                     stage="writing",
                 )
@@ -1459,10 +1474,16 @@ class BotCompileService:
                 )
             if exists:
                 published = await client.update_skill(
-                    skill_name, str(skill_dir), target_uri=target_uri, wait=True
+                    skill_name,
+                    str(skill_dir),
+                    target_uri=target_uri,
+                    wait=True,
+                    expected_revision=revision,
                 )
             else:
-                published = await client.add_skill(str(skill_dir), target_uri=target_uri, wait=True)
+                published = await client.add_skill(
+                    str(skill_dir), target_uri=target_uri, wait=True, expected_absent=True
+                )
             result["updated" if exists else "created"].append(
                 str(published.get("root_uri") or published.get("uri") or root_uri)
             )
