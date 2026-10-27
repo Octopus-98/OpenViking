@@ -3,13 +3,22 @@
 """Reconcile packaged system assets across all active accounts."""
 
 import asyncio
+import random
 from collections.abc import Collection
 from typing import Protocol
 
 from openviking.server.account_stores.models import AccountSummary
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.errors import ResourceBusyError
 from openviking.system_assets.sync import SystemAssetSynchronizer
 from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils import get_logger
+
+logger = get_logger(__name__)
+
+_SYNC_MAX_RETRIES = 6
+_SYNC_RETRY_BASE_DELAY_SECONDS = 0.2
+_SYNC_RETRY_MAX_DELAY_SECONDS = 2.0
 
 
 class AccountLister(Protocol):
@@ -85,10 +94,28 @@ class SystemAssetReconciler:
         account_id = account.get("account_id")
         if not account_id:
             raise ValueError("account summary is missing account_id")
-        async with self._semaphore:
-            return await self._synchronizer.sync(
-                RequestContext(
-                    user=UserIdentifier(account_id, self._user_id),
-                    role=Role(Role.ROOT),
+        ctx = RequestContext(
+            user=UserIdentifier(account_id, self._user_id),
+            role=Role(Role.ROOT),
+        )
+        for retry in range(_SYNC_MAX_RETRIES + 1):
+            try:
+                async with self._semaphore:
+                    return await self._synchronizer.sync(ctx)
+            except ResourceBusyError:
+                if retry == _SYNC_MAX_RETRIES:
+                    raise
+                delay = min(
+                    _SYNC_RETRY_BASE_DELAY_SECONDS * (2**retry),
+                    _SYNC_RETRY_MAX_DELAY_SECONDS,
+                ) * random.uniform(0.8, 1.2)
+                logger.warning(
+                    "System assets busy for account %s; retry %d/%d in %.2fs",
+                    account_id,
+                    retry + 1,
+                    _SYNC_MAX_RETRIES,
+                    delay,
                 )
-            )
+                await asyncio.sleep(delay)
+
+        raise AssertionError("unreachable")
