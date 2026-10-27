@@ -36,7 +36,7 @@ from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry, register_telemetry
 from openviking.utils.path_safety import safe_join_viking_uri
 from openviking.utils.zip_safe import safe_extract_zip
-from openviking_cli.exceptions import ConflictError, InvalidArgumentError
+from openviking_cli.exceptions import ConflictError, InvalidArgumentError, NotFoundError
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -221,15 +221,20 @@ class SkillProcessor:
                 )
 
             await run_to_completion(acquire_package_lock)
-            # Tree locking can create an empty root; only existing package entries conflict.
-            if expected_absent and await viking_fs.ls(
-                skill_dir_uri,
-                ctx=ctx,
-                show_all_hidden=True,
-                node_limit=1,
-                include_abstract=False,
-            ):
-                raise ConflictError("Skill package already exists", resource="VERSION_CONFLICT")
+            # Package locks do not guarantee a directory exists; missing or empty roots are available.
+            if expected_absent:
+                try:
+                    entries = await viking_fs.ls(
+                        skill_dir_uri,
+                        ctx=ctx,
+                        show_all_hidden=True,
+                        node_limit=1,
+                        include_abstract=False,
+                    )
+                except NotFoundError:
+                    entries = []
+                if entries:
+                    raise ConflictError("Skill package already exists", resource="VERSION_CONFLICT")
 
             # Preparation above is read-only. A rejected package writer must
             # not change its privacy config, and cancellation must let an
