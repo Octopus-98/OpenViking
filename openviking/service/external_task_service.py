@@ -524,7 +524,8 @@ class ExternalTaskService:
             and isinstance(failure, ExternalTaskError)
             and not isinstance(failure, _RetryExhaustedError)
             and not failure.transient
-            and failure.code in {"INVALID_ARGUMENT", "PERMISSION_DENIED", "UNAUTHENTICATED"}
+            and failure.code
+            in {"INVALID_ARGUMENT", "NOT_FOUND", "PERMISSION_DENIED", "UNAUTHENTICATED"}
         )
         if not auth.get("external_task_id") and (task.stage in {None, "queued"} or rejected):
             await self._apply_snapshot(

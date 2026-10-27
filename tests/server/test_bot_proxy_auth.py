@@ -613,6 +613,7 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
     submitted = []
     polls = 0
     rejected_id = None
+    rejected_submissions = []
 
     async def runtime_request(_client, method, url, headers, json):
         nonlocal polls
@@ -621,7 +622,11 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
             assert json["payload"].get("args") == (args or None)
             task_id = headers["Idempotency-Key"]
             if task_id == rejected_id:
-                return FakeResponse({"detail": "invalid request"}, status_code=422)
+                rejected_submissions.append(task_id)
+                return FakeResponse(
+                    {"detail": {"code": rejected_code, "message": "invalid request"}},
+                    status_code=404 if rejected_code == "NOT_FOUND" else 422,
+                )
             submitted.append(task_id)
             return FakeResponse({"session_id": task_id})
         task_id = json["session_id"]
@@ -741,13 +746,18 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
     assert not backend.pending and not backend.processing
 
     # Submission failure also releases the target for the next task.
-    rejected = await create()
-    rejected_id = rejected.task_id
-    await queue.dequeue()
-    assert (await state(rejected)).status == TaskStatus.FAILED
-    after_rejection = await create()
-    await queue.dequeue()
-    assert (await state(after_rejection)).status == TaskStatus.COMPLETED
+    for rejected_code in ("INVALID_ARGUMENT", "NOT_FOUND"):
+        rejected = await create()
+        rejected_id = rejected.task_id
+        await queue.dequeue()
+        failed = await state(rejected)
+        assert failed.status == TaskStatus.FAILED
+        assert failed.error.startswith(f"{rejected_code}:")
+        assert "cleanup_error" not in failed.meta
+        assert rejected_submissions.count(rejected_id) == 1
+        after_rejection = await create()
+        await queue.dequeue()
+        assert (await state(after_rejection)).status == TaskStatus.COMPLETED
     for secret in private_args.values():
         if secret:
             assert secret not in caplog.text
