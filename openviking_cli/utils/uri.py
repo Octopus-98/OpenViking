@@ -41,7 +41,7 @@ class VikingURI:
     - resources: Independent resource scope (viking://resources/{project}/...)
     - user: Explicit user scope (viking://user/{user_id}/...), including sessions under
       viking://user/{user_id}/sessions/{session_id}.
-    - session: Legacy alias for user sessions (viking://session/{session_id}/...)
+    - session: Historical scope parsed only for explicit data migration
     - agent: Agent capabilities scope (viking://agent/skills/..., viking://agent/endpoints/...)
     - queue: Queue scope (viking://queue/...)
     - ~: Server-side alias for the caller's user root, expanded to viking://user/{user_id}

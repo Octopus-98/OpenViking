@@ -444,7 +444,7 @@ function sessionToRef(session: Pick<SessionListItem, 'session_id' | 'uri'>) {
   return {
     label: session.session_id,
     meta: 'session',
-    uri: session.uri || `viking://session/${session.session_id}`,
+    uri: session.uri || `viking://~/sessions/${session.session_id}`,
   }
 }
 
@@ -1095,7 +1095,7 @@ export function TerminalPanel({
             const sessionRef = (id: string): ResourceRef => ({
               label: id,
               meta: 'session',
-              uri: `viking://session/${id}`,
+              uri: `viking://~/sessions/${id}`,
             })
 
             switch (subcommand) {
@@ -1206,7 +1206,7 @@ export function TerminalPanel({
                     {
                       label: archiveId,
                       meta: 'archive',
-                      uri: `viking://session/${id}/history/${archiveId}`,
+                      uri: `viking://~/sessions/${id}/history/${archiveId}`,
                     },
                   ],
                   title: `/session archive ${id} ${archiveId}`,
@@ -1298,7 +1298,7 @@ export function TerminalPanel({
                     {
                       label: toolResultId,
                       meta: 'tool result',
-                      uri: `viking://session/${id}/tool-results/${toolResultId}`,
+                      uri: `viking://~/sessions/${id}/tool-results/${toolResultId}`,
                     },
                   ],
                   title: `/session tool-result ${id} ${toolResultId}`,
@@ -1331,7 +1331,7 @@ export function TerminalPanel({
                     {
                       label: toolResultId,
                       meta: 'tool search',
-                      uri: `viking://session/${id}/tool-results/${toolResultId}`,
+                      uri: `viking://~/sessions/${id}/tool-results/${toolResultId}`,
                     },
                   ],
                   title: `/session tool-search ${id} ${toolResultId}`,
