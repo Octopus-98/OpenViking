@@ -944,10 +944,7 @@ class OpenVikingService:
         effective_ctx = ctx or RequestContext(user=self.user, role=Role.ROOT)
         from openviking.service.reindex_executor import ReindexExecutor
 
-        executor = ReindexExecutor(
-            vlm_resolver=self._vlm_resolver,
-            vector_config_resolver=self._vector_config_resolver,
-        )
+        executor = ReindexExecutor()
         execute_kwargs = {
             "uri": uri,
             "mode": mode,
