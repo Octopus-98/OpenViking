@@ -588,15 +588,14 @@ class BotCompileService:
 
             raw_target = request.to.strip().rstrip("/")
             try:
-                target_attrs = await client.attrs(raw_target)
+                target_stat = await client.stat(raw_target)
             except OpenVikingError as exc:
                 if exc.code != "NOT_FOUND":
                     raise
                 self._validate_target_directory(raw_target, {"isDir": True})
-                await client.mkdir(raw_target)
-                target_attrs = await client.attrs(raw_target)
-            target = str(target_attrs.get("uri") or "").rstrip("/")
-            target_stat = await client.stat(target)
+                await client.mkdir(raw_target, description="compile target folder")
+                target_stat = await client.stat(raw_target)
+            target = str(target_stat.get("uri") or "").rstrip("/")
             self._validate_target_directory(target, target_stat)
         except CompileFailure:
             raise

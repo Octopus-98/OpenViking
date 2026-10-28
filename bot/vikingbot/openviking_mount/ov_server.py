@@ -617,8 +617,9 @@ class VikingClient:
     async def attrs(self, uri: str) -> Dict[str, Any]:
         return await self.client.attrs(uri)
 
-    async def mkdir(self, uri: str) -> None:
-        await self.client.mkdir(uri)
+    async def mkdir(self, uri: str, description: Optional[str] = None) -> None:
+        """Create a directory; description initializes its L0 when provided."""
+        await self.client.mkdir(uri, description=description)
 
     async def tree(
         self, uri: str, *, node_limit: int = 1000, offset: int = 0
