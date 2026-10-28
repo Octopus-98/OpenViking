@@ -19,12 +19,12 @@ from openviking.server.identity import RequestContext
 from openviking.server.models import ListingResponse, Response
 from openviking.server.routers.content import SetTagsRequest
 from openviking.server.routers.content import set_tags as content_set_tags
-from openviking.storage.acl import AclSpec, has_implicit_manage
+from openviking.storage.acl import AclSpec, is_acl_uri
 from openviking.storage.expr import And, Eq, In
 from openviking.storage.vector_ids import is_vector_record_id
 from openviking.storage.vikingdb_manager import VikingDBManagerProxy
 from openviking.utils.tags import normalize_search_tags
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
 
 router = APIRouter(prefix="/api/v1/fs", tags=["filesystem"])
 
@@ -223,7 +223,8 @@ async def stat(
 async def attrs(
     uri: str = Query(..., description="Viking URI"),
     include_acl: Annotated[
-        bool, Query(description="Include shared-resource ACL details for account admins")
+        bool,
+        Query(description="Include shared-resource ACL details when authorized to manage them"),
     ] = False,
     _ctx: RequestContext = Depends(get_request_context),
 ):
@@ -245,8 +246,12 @@ async def attrs(
         }
         if result["context_type"] == "memory" and not stat_result.get("isDir", False):
             result["attrs"]["memory"] = _clean_memory_attrs(await service.fs.read(uri, ctx=_ctx))
-        if include_acl and has_implicit_manage(_ctx, uri):
-            result["attrs"]["acl"] = await service.fs.get_acl(uri, ctx=_ctx)
+        if include_acl and is_acl_uri(uri):
+            try:
+                result["attrs"]["acl"] = await service.fs.get_acl(uri, ctx=_ctx)
+            except PermissionDeniedError:
+                # Read access still allows ordinary attrs without the optional ACL report.
+                pass
         return Response(status="ok", result=result)
     except AGFSNotFoundError:
         raise NotFoundError(uri, "file")

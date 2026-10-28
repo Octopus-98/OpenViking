@@ -2,7 +2,7 @@
 
 ACL 通过独立的 `/api/v1/acl` 接口查询和修改，只适用于 `viking://resources/...` 共享资源。权限模型见[资源访问控制](../concepts/15-acl.md)。
 
-账号 `ADMIN` 也可通过 [`GET /api/v1/fs/attrs?uri={uri}&include_acl=true`](03-filesystem.md#attrs) 在查询其他属性时一并获得共享资源的 ACL，返回在 `result.attrs.acl` 中，内容与独立查询接口相同。修改 ACL 仍使用下列独立接口。
+拥有共享资源 `manage` 权限的调用者（包括账号 `ADMIN`）也可通过 [`GET /api/v1/fs/attrs?uri={uri}&include_acl=true`](03-filesystem.md#attrs) 在查询其他属性时一并获得该资源的 ACL，返回在 `result.attrs.acl` 中，内容与独立查询接口相同。有 `read` 但没有 `manage` 时返回普通属性并省略 `acl`；无权读取普通属性时仍返回 403。修改 ACL 仍使用下列独立接口。
 
 ## 接口
 

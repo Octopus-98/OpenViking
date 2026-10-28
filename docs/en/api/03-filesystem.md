@@ -420,7 +420,7 @@ Get logical extended attributes for a file or directory.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | uri | str | Yes | - | Viking URI |
-| include_acl | bool | No | false | Include `attrs.acl` for account ADMIN requests to shared resources; HTTP query parameter or CLI `--include-acl` |
+| include_acl | bool | No | false | Include `attrs.acl` when the caller has `manage` permission on the shared resource; HTTP query parameter or CLI `--include-acl` |
 
 
 **Python SDK (HTTP)**
@@ -461,7 +461,7 @@ curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/a
   -H "X-API-Key: your-key"
 
 curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/api.md&include_acl=true" \
-  -H "X-API-Key: your-admin-key"
+  -H "X-API-Key: your-manage-key"
 
 curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -H "X-API-Key: your-key" \
@@ -469,9 +469,11 @@ curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -d '{"uri":"viking://resources/docs","tags":["team=search"],"mode":"append","recursive":true}'
 ```
 
-With `include_acl=true`, an account `ADMIN` querying a shared resource under `viking://resources/...` also receives `result.attrs.acl`. Its value is the same report returned in `result` by [GET /api/v1/acl](12-acl.md): `uri`, `acl_mode`, `direct_entries`, `inherited_entries`, and `effective_entries`.
+With `include_acl=true`, a caller with `manage` permission on a shared resource under `viking://resources/...` also receives `result.attrs.acl`. Its value is the same report returned in `result` by [GET /api/v1/acl](12-acl.md): `uri`, `acl_mode`, `direct_entries`, `inherited_entries`, and `effective_entries`.
 
-The `acl` field is omitted when the parameter is absent or false, the caller has any other role (including `ROOT` and ordinary users with `manage` permission), or the URI is outside shared resources. Normal resource access checks still apply.
+The permission check matches the dedicated ACL endpoint: account `ADMIN` has implicit `manage`; other roles, including `ROOT`, need effective `manage` from direct or inherited user, group, or `user:*` grants. When account ACL is disabled, those grants do not authorize ACL queries; account `ADMIN` can still query them.
+
+The `acl` field is omitted when the parameter is absent or false, the caller lacks `manage`, or the URI is outside shared resources. A caller with `read` but without `manage` receives the ordinary attributes; a caller denied access to the ordinary attributes still receives 403.
 
 **CLI**
 
@@ -485,7 +487,7 @@ ov attrs set-tags viking://resources/docs/api.md --tags team=search,env=prod
 ov attrs set-tags viking://resources/docs --tags team=search --mode append --recursive
 ```
 
-`--include-acl` sends `include_acl=true` and is disabled by default. The same account `ADMIN` and shared-resource restrictions apply; the optional `acl` key selects only that field from the returned attributes.
+`--include-acl` sends `include_acl=true` and is disabled by default. The same `manage` permission and shared-resource restrictions apply; the optional `acl` key selects only that field from the returned attributes.
 
 For `set-tags`, directory targets update the directory semantic records; `recursive=true` also updates existing descendant files and directory semantic records.
 

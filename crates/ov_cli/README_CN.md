@@ -145,7 +145,7 @@ ov grep "openviking" --uri viking://resources
 - `cp` - 复制文件，或使用 `-r` 递归复制目录。
 - `mv` - 移动或重命名资源。
 - `stat` - 查看资源元数据。
-- `attrs` - 获取逻辑扩展属性。账号 ADMIN 可使用 `attrs get <uri> [key] --include-acl` 一并查询共享资源的 ACL。
+- `attrs` - 获取逻辑扩展属性。拥有共享资源 `manage` 权限的调用者（包括账号 ADMIN）可使用 `attrs get <uri> [key] --include-acl` 一并查询该资源的 ACL。
 - `get` - 下载文件到本地路径。
 
 ```bash

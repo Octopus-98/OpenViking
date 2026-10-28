@@ -458,7 +458,7 @@ ov stat viking://resources/my-project/docs
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | uri | str | 是 | - | Viking URI |
-| include_acl | bool | 否 | false | 账号 ADMIN 查询共享资源时额外返回 `attrs.acl`；支持 HTTP 查询参数或 CLI `--include-acl` |
+| include_acl | bool | 否 | false | 调用者拥有该共享资源的 `manage` 权限时额外返回 `attrs.acl`；支持 HTTP 查询参数或 CLI `--include-acl` |
 
 
 **Python SDK (HTTP)**
@@ -499,7 +499,7 @@ curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/a
   -H "X-API-Key: your-key"
 
 curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/api.md&include_acl=true" \
-  -H "X-API-Key: your-admin-key"
+  -H "X-API-Key: your-manage-key"
 
 curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -H "X-API-Key: your-key" \
@@ -507,9 +507,11 @@ curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -d '{"uri":"viking://resources/docs","tags":["team=search"],"mode":"append","recursive":true}'
 ```
 
-传入 `include_acl=true` 时，账号 `ADMIN` 查询 `viking://resources/...` 下的共享资源会额外获得 `result.attrs.acl`。其内容与 [GET /api/v1/acl](12-acl.md) 的 `result` 相同，包含 `uri`、`acl_mode`、`direct_entries`（直接授权）、`inherited_entries`（继承授权）和 `effective_entries`（有效授权）。
+传入 `include_acl=true` 时，拥有目标节点 `manage` 权限的调用者查询 `viking://resources/...` 下的共享资源会额外获得 `result.attrs.acl`。其内容与 [GET /api/v1/acl](12-acl.md) 的 `result` 相同，包含 `uri`、`acl_mode`、`direct_entries`（直接授权）、`inherited_entries`（继承授权）和 `effective_entries`（有效授权）。
 
-未传此参数或值为 false、调用者为其他角色（包括 `ROOT` 和具有 `manage` 权限的普通用户）、URI 不属于共享资源时，均省略 `acl` 字段。原有资源访问权限检查仍然生效。
+权限检查与独立 ACL 接口一致：账号 `ADMIN` 隐式拥有 `manage`；其他角色（包括 `ROOT`）需要通过直接或继承的用户、用户组、`user:*` 授权获得有效 `manage`。账号 ACL 关闭时，这些授权不参与 ACL 查询鉴权，账号 `ADMIN` 仍可查询。
+
+未传此参数或值为 false、调用者没有 `manage`、URI 不属于共享资源时，均省略 `acl` 字段。有 `read` 但没有 `manage` 时返回普通属性；无权读取普通属性时仍返回 403。
 
 **CLI**
 
@@ -523,7 +525,7 @@ ov attrs set-tags viking://resources/docs/api.md --tags team=search,env=prod
 ov attrs set-tags viking://resources/docs --tags team=search --mode append --recursive
 ```
 
-`--include-acl` 会发送 `include_acl=true`，默认关闭。CLI 同样仅向账号 `ADMIN` 返回共享资源的 ACL；可选的 `acl` 键用于只显示返回属性中的该字段。
+`--include-acl` 会发送 `include_acl=true`，默认关闭。CLI 同样要求调用者拥有共享资源的 `manage` 权限；可选的 `acl` 键用于只显示返回属性中的该字段。
 
 `set-tags` 的目录目标会更新目录语义记录；`recursive=true` 还会更新已有子文件和子目录语义记录。
 

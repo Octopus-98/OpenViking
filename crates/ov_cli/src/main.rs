@@ -301,7 +301,7 @@ enum AttrsCommands {
         /// Optional attrs key, for example tags, acl, memory, or memory.tags
         #[arg(value_name = "key")]
         key: Option<String>,
-        /// Include shared-resource ACL details for account admins
+        /// Include shared-resource ACL details (requires manage permission)
         #[arg(long)]
         include_acl: bool,
     },

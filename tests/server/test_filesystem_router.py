@@ -19,7 +19,9 @@ from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import filesystem
 from openviking.service.fs_service import ListingPage
+from openviking.storage.acl import AclManager, DirectAcl
 from openviking.storage.queuefs.queue_manager import get_queue_manager
+from openviking.storage.viking_fs import VikingFS
 from openviking.system_assets import builtin_memory_templates_dir
 from openviking_cli.exceptions import InvalidURIError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
@@ -314,21 +316,17 @@ async def test_system_attrs_returns_empty_tags_without_querying_vector_store(mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("role", "include_acl", "is_dir", "expect_acl"),
+    ("include_acl", "is_dir", "expect_acl"),
     [
-        (Role.ADMIN, "true", False, True),
-        (Role.ADMIN, "true", True, True),
-        (Role.ADMIN, "false", False, False),
-        (Role.ADMIN, None, False, False),
-        (Role.USER, "true", False, False),
-        (Role.ROOT, "true", False, False),
+        ("true", False, True),
+        ("true", True, True),
+        ("false", False, False),
+        (None, False, False),
     ],
 )
-async def test_http_attrs_acl_is_opt_in_and_admin_only(
-    monkeypatch, role, include_acl, is_dir, expect_acl
-):
+async def test_http_attrs_acl_is_opt_in_for_admin(monkeypatch, include_acl, is_dir, expect_acl):
     uri = "viking://resources/docs" if is_dir else "viking://resources/docs/api.md"
-    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=role)
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=Role(Role.ADMIN))
     acl = {
         "uri": uri,
         "acl_mode": "inherit",
@@ -376,6 +374,98 @@ async def test_http_attrs_acl_is_opt_in_and_admin_only(
         "attrs": expected_attrs,
     }
     stat.assert_awaited_once_with(uri, ctx=ctx, skip_count=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "grant_scope", "level", "groups", "enabled", "expect_acl"),
+    [
+        pytest.param(Role.ADMIN, "target", "read", (), True, True, id="admin"),
+        pytest.param(Role.ADMIN, "target", "read", (), False, True, id="admin-acl-disabled"),
+        pytest.param(Role.USER, "target", "manage", (), True, True, id="direct-manage"),
+        pytest.param(Role.USER, "parent", "manage", (), True, True, id="inherited-manage"),
+        pytest.param(Role.USER, "group", "manage", ("editors",), True, True, id="group-manage"),
+        pytest.param(Role.USER, "group", "manage", (), True, False, id="group-nonmember"),
+        pytest.param(Role.USER, "target", "read", (), True, False, id="read-only"),
+        pytest.param(Role.USER, "target", "write", (), True, False, id="write-only"),
+        pytest.param(Role.USER, "sibling", "manage", (), True, False, id="other-node-manage"),
+        pytest.param(
+            Role.USER, "restricted-parent", "manage", (), True, False, id="restricted-child"
+        ),
+        pytest.param(Role.USER, "target", "manage", (), False, False, id="acl-disabled"),
+        pytest.param(Role.ROOT, "target", "read", (), True, False, id="root-no-implicit-manage"),
+        pytest.param(Role.ROOT, "target", "manage", (), True, True, id="root-explicit-manage"),
+    ],
+)
+async def test_http_attrs_acl_requires_effective_manage(
+    monkeypatch, role, grant_scope, level, groups, enabled, expect_acl
+):
+    uri = "viking://resources/docs/api.md"
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=role, group_ids=groups)
+    own_read = {"principal": "user:alice", "level": "read"}
+    grants = [{"principal": "user:alice", "level": level}]
+
+    def record(record_uri, entries):
+        return {
+            "uri": record_uri,
+            "acl_mode": "restricted",
+            **DirectAcl.from_entries(entries).context_fields("acl_direct"),
+        }
+
+    records = {uri: record(uri, [own_read])}
+    if grant_scope in {"parent", "restricted-parent"}:
+        parent = "viking://resources/docs"
+        records[parent] = record(parent, grants)
+        if grant_scope == "parent":
+            records.pop(uri)
+    elif grant_scope == "sibling":
+        sibling = "viking://resources/docs/other.md"
+        records[sibling] = record(sibling, grants)
+    else:
+        if grant_scope == "group":
+            grants = [{"principal": "group:editors", "level": level}, own_read]
+        records[uri] = record(uri, grants)
+
+    # Only replace storage I/O: resolve inheritance, principals, and manage checks for real.
+    async def fetch_records(uris, ctx):
+        return [records[value] for value in set(uris) if value in records]
+
+    runtime_config = AsyncMock()
+    runtime_config.get_account.return_value = SimpleNamespace(enabled=enabled)
+    acl_manager = AclManager(context_store=AsyncMock(), runtime_config=runtime_config)
+    monkeypatch.setattr(acl_manager, "_records_for_uris", fetch_records)
+    viking_fs = VikingFS(agfs=SimpleNamespace(), acl_manager=acl_manager)
+    monkeypatch.setattr(
+        viking_fs, "_async_agfs", SimpleNamespace(stat=AsyncMock(return_value={"isDir": False}))
+    )
+    get_acl = AsyncMock(wraps=viking_fs.get_acl)
+    monkeypatch.setattr(viking_fs, "get_acl", get_acl)
+    monkeypatch.setattr(filesystem, "get_service", lambda: SimpleNamespace(fs=viking_fs))
+    app = FastAPI()
+    app.include_router(filesystem.router)
+    app.dependency_overrides[get_request_context] = lambda: ctx
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.get("/api/v1/fs/attrs", params={"uri": uri, "include_acl": "true"})
+
+    assert response.status_code == 200, response.text
+    expected_attrs: dict[str, Any] = {"tags": []}
+    if expect_acl:
+        inherited = grant_scope == "parent"
+        expected_attrs["acl"] = {
+            "uri": uri,
+            "acl_mode": "inherit" if inherited else "restricted",
+            "direct_entries": [] if inherited else grants,
+            "inherited_entries": grants if inherited else [],
+            "effective_entries": grants,
+        }
+    assert response.json()["result"] == {
+        "uri": uri,
+        "context_type": "resource",
+        "attrs": expected_attrs,
+    }
+    get_acl.assert_awaited_once_with(uri, ctx=ctx)
 
 
 @pytest.mark.asyncio
@@ -457,6 +547,30 @@ async def test_http_attrs_include_acl_preserves_access_check(monkeypatch):
             await client.get("/api/v1/fs/attrs", params={"uri": uri, "include_acl": "true"})
 
     get_acl.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_http_attrs_include_acl_propagates_backend_failure(monkeypatch):
+    uri = "viking://resources/docs/api.md"
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=Role(Role.USER))
+    get_acl = AsyncMock(side_effect=RuntimeError("ACL backend unavailable"))
+    monkeypatch.setattr(
+        filesystem,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(stat=AsyncMock(return_value={"isDir": False}), get_acl=get_acl)
+        ),
+    )
+    app = FastAPI()
+    app.include_router(filesystem.router)
+    app.dependency_overrides[get_request_context] = lambda: ctx
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        with pytest.raises(RuntimeError, match="ACL backend unavailable"):
+            await client.get("/api/v1/fs/attrs", params={"uri": uri, "include_acl": "true"})
+
+    get_acl.assert_awaited_once_with(uri, ctx=ctx)
 
 
 @pytest.mark.asyncio
