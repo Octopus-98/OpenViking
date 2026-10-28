@@ -75,6 +75,7 @@ from openviking.storage.context_update_plan import (
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.storage.index_action import FieldPatch, IndexAction
 from openviking.storage.internal_names import is_storage_internal_name
+from openviking.storage.manual_conflicts import resolve_manual_conflicts
 from openviking.storage.pathlock_transfer import PathLockGuard
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
@@ -101,7 +102,7 @@ from openviking.utils.embedding_utils import vectorize_directory_meta
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.path_safety import normalize_storage_target_uri, validate_safe_viking_uri_path
 from openviking.utils.summarizer import FileRefreshRequest, Summarizer
-from openviking.utils.tags import normalize_search_tags
+from openviking.utils.tags import merge_search_tags, normalize_search_tags
 from openviking_cli.exceptions import (
     ConflictError,
     DeadlineExceededError,
@@ -317,6 +318,7 @@ class ContentWriteCoordinator:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
         expected_sha256: str | None = None,
+        resolve_conflicts: bool = False,
     ) -> Dict[str, Any]:
         task = None
         task_id = None
@@ -348,6 +350,7 @@ class ContentWriteCoordinator:
                 tag_mode=tag_mode,
                 acl=acl,
                 expected_sha256=expected_sha256,
+                resolve_conflicts=resolve_conflicts,
                 root_operation="content_write",
                 root_task_factory=create_root_task,
             )
@@ -507,6 +510,7 @@ class ContentWriteCoordinator:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
         expected_sha256: str | None = None,
+        resolve_conflicts: bool = False,
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
     ) -> Dict[str, Any]:
@@ -604,6 +608,7 @@ class ContentWriteCoordinator:
             root_operation=root_operation,
             root_task_factory=root_task_factory,
             expected_sha256=expected_sha256,
+            resolve_conflicts=resolve_conflicts,
         )
 
     async def batch_write(
@@ -1878,6 +1883,7 @@ class ContentWriteCoordinator:
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
         expected_sha256: str | None = None,
+        resolve_conflicts: bool = False,
     ) -> Dict[str, Any]:
         # ``.abstract.md`` / ``.overview.md`` are generated sidecars whose body is
         # re-embedded in place (no LLM regeneration and no RNFV plan). Keep that
@@ -1917,7 +1923,18 @@ class ContentWriteCoordinator:
             target_preexisting = target_state.preexisting
             is_new_file = target_state.is_new_file
             previous_content = target_state.existing_raw
-            if mode == "append" and target_preexisting and previous_content is None:
+            resolve_conflicts = (
+                resolve_conflicts
+                and context_type == "resource"
+                and uri.lower().endswith(".md")
+                and mode == "replace"
+                and target_preexisting
+            )
+            if (
+                (mode == "append" or resolve_conflicts)
+                and target_preexisting
+                and previous_content is None
+            ):
                 previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
             final_bytes = self._render_final_bytes(
                 uri,
@@ -1926,6 +1943,22 @@ class ContentWriteCoordinator:
                 existing_raw=previous_content,
                 is_new_file=is_new_file,
             )
+            if resolve_conflicts:
+                resolved, conflict_tags = resolve_manual_conflicts(
+                    previous_content, final_bytes.decode("utf-8")
+                )
+                final_bytes = resolved.encode("utf-8")
+                if conflict_tags is not None:
+                    options = ingest_options or IngestOptions()
+                    ingest_options = replace(
+                        options,
+                        search_tags=merge_search_tags(options.search_tags, conflict_tags),
+                        search_tag_mode=(
+                            "append"
+                            if options.search_tags is None
+                            else IngestOptions.vector_search_tag_mode(options.search_tag_mode)
+                        ),
+                    )
             request = RequestIntent.from_ingest_options(
                 target_uri=uri,
                 processing_mode=processing_mode,

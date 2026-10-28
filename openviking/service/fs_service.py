@@ -1596,11 +1596,13 @@ class FSService:
         record_version: bool = True,
         commit_content: Optional[Callable[..., Awaitable[Any]]] = None,
         expected_sha256: str | None = None,
+        resolve_conflicts: bool = False,
     ) -> Dict[str, Any]:
         """Write content and refresh it after persisting managed output versions.
 
         Internal restores supply ``commit_content`` to record their own version.
         Byte-revision conditions are checked under the content lease.
+        resolve_conflicts enables manual conflict resolution.
         """
         viking_fs = self._ensure_initialized()
         if commit_content is None and self.compile_versions is not None:
@@ -1628,6 +1630,7 @@ class FSService:
             tag_mode=tag_mode,
             acl=acl,
             expected_sha256=expected_sha256,
+            resolve_conflicts=resolve_conflicts,
         )
         if self.compile_versions is None or edit_source == "compile":
             return await write()

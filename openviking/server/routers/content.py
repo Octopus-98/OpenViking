@@ -53,6 +53,8 @@ class WriteContentRequest(BaseModel):
     acl: AclSpec | None = None
     # Who made the edit; versions of Compile outputs record it (console edit = manual).
     edit_source: Literal["manual", "agent", "compile"] = "manual"
+    # Mark this edit as conflict resolution.
+    resolve_conflicts: bool = False
     # The revision describes raw stored bytes; omission preserves unconditional writes.
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
@@ -287,6 +289,7 @@ async def write(
             tag_mode=request.tag_mode,
             acl=request.acl,
             edit_source=request.edit_source,
+            resolve_conflicts=request.resolve_conflicts,
             expected_sha256=request.expected_sha256,
         ),
     )

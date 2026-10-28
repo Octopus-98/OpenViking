@@ -5,7 +5,7 @@
 import asyncio
 import math
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, Header, Path, Query, status
 from fastapi import Response as HTTPResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -16,7 +16,6 @@ from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.service.compile_service import (
-    CompileConfigQuery,
     CompileConfigUpdate,
     CompileRequest,
 )
@@ -88,18 +87,6 @@ async def list_compile_configs(
         status="ok",
         result=await get_service().compile.list_configs(ctx, limit=limit, cursor=cursor),
     )
-
-
-@router.post("/compile/configs/query")
-async def query_compile_configs(
-    body: CompileConfigQuery,
-    request: Request,
-    ctx: RequestContext = Depends(get_request_context),
-):
-    """Query one directory page's targets; the JSON body is limited to 128 KiB."""
-    if len(await request.body()) > 128 * 1024:
-        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Request body exceeds 128 KiB")
-    return Response(status="ok", result=await get_service().compile.query_configs(body, ctx))
 
 
 @router.get("/compile/operations")
