@@ -251,8 +251,8 @@ async def run(runtime: Pipeline, references: list[str]) -> RenderedBundle:
                 raise ValueError(f"Create conflicts with an existing target: {uri}")
         elif revision is not None and (old is None or content_hash(old) != revision):
             raise ValueError(f"Stale prepared artifact: {uri}")
-        # Resource writes recheck even identical cached bytes under server locks;
-        # concurrent changes become per-file conflicts in the publication result.
+        # Resource updates recheck observed revisions under server locks, including
+        # identical cached bytes; mismatches become per-file publication conflicts.
         if (
             runtime.skill_target
             and old is not None
@@ -267,8 +267,6 @@ async def run(runtime: Pipeline, references: list[str]) -> RenderedBundle:
         }
         if revision:
             operation["expected_sha256"] = revision
-        else:
-            operation["expected_absent"] = True
         operation.pop("content_base64" if operation["content"] is not None else "content")
         rendered.operations.append(operation)
         (rendered.updated if revision else rendered.created).append(uri)

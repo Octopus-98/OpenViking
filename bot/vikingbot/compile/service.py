@@ -1381,7 +1381,7 @@ class BotCompileService:
 
         Pipeline file guards bind generated content to its original reads. An
         integrity snapshot also guards retained attachments through the Skill
-        API's atomic package-revision check; newly created packages require absence.
+        API's atomic package-revision check when updating an existing package.
         The returned URIs identify Skill roots, as required by Compile's Skill result.
         """
         result = {"created": [], "updated": [], "unchanged": []}
@@ -1472,9 +1472,7 @@ class BotCompileService:
                     expected_revision=revision,
                 )
             else:
-                published = await client.add_skill(
-                    str(skill_dir), target_uri=target_uri, wait=True, expected_absent=True
-                )
+                published = await client.add_skill(str(skill_dir), target_uri=target_uri, wait=True)
             result["updated" if exists else "created"].append(
                 str(published.get("root_uri") or published.get("uri") or root_uri)
             )

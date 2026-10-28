@@ -16,6 +16,7 @@ from openviking.service.compile_targets import (
     compile_operation_id,
     make_operation_id,
     new_operation,
+    task_ctx,
 )
 from openviking.service.external_task_service import ExternalTaskService
 from openviking.service.task_domain import TaskPatch
@@ -25,6 +26,24 @@ from openviking.service.task_tracker import TaskStatus, TaskTracker
 from openviking_cli.exceptions import ConflictError, InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
+
+
+def _mock_compile_processing(monkeypatch, service):
+    """Stub reindex completion without changing other task waits."""
+    from openviking.service.task_tracker import get_task_tracker
+
+    tracker = get_task_tracker()
+    original_wait = tracker.wait
+    reindex = AsyncMock(return_value={"status": "accepted"})
+
+    async def wait(task_id, *args, **kwargs):
+        if any(call.kwargs["task_id"] == task_id for call in reindex.await_args_list):
+            return SimpleNamespace(status=TaskStatus.COMPLETED, result={}, error=None)
+        return await original_wait(task_id, *args, **kwargs)
+
+    monkeypatch.setattr(service, "reindex", reindex)
+    monkeypatch.setattr(tracker, "wait", wait)
+    monkeypatch.setattr(service.fs, "finalize_compile_directories", AsyncMock())
 
 
 @pytest.mark.asyncio
@@ -369,7 +388,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
 
     # Drive the real task provider explicitly; generation and derived refresh are external work.
     monkeypatch.setattr(external, "get_queue_manager", lambda: SimpleNamespace(enqueue=AsyncMock()))
-    monkeypatch.setattr(service, "reindex", AsyncMock(return_value={"status": "accepted"}))
+    _mock_compile_processing(monkeypatch, service)
     monkeypatch.setattr(service.fs, "_enqueue_copy_refresh", AsyncMock(return_value="queued"))
     monkeypatch.setattr(service.fs, "_enqueue_delete_refresh", AsyncMock(return_value="skipped"))
     monkeypatch.setattr("openviking.service.fs_service.vectorize_directory_meta", AsyncMock())
@@ -544,6 +563,9 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
 
     unchanged = await submit(payload, "compile-unchanged-key")
     assert (await tracker.get(unchanged, **owner)).status == "completed" and len(calls) == 1
+    service.fs.finalize_compile_directories.assert_awaited_with(
+        target, task_ctx(ctx.account_id, ctx.user.user_id)
+    )
     payload = {**payload, "instruction": "Change the title"}
     await submit(payload, "compile-instruction-key")
     assert len(calls) == 2 and calls[-1]["args"]["changes"]["execution"]["mode"] == "full"
@@ -840,7 +862,7 @@ async def test_nested_compile_restores_parent_scope(service, app, monkeypatch, t
         f"{sibling}/page.md": "sibling baseline",
     }.items():
         await service.viking_fs.write_file(uri, content, ctx=ctx)
-    monkeypatch.setattr(service, "reindex", AsyncMock(return_value={"status": "accepted"}))
+    _mock_compile_processing(monkeypatch, service)
     monkeypatch.setattr(service.viking_fs, "_schedule_restore_reindex_for_paths", AsyncMock())
     lifecycle = service.compile.lifecycle
     store = lifecycle.store

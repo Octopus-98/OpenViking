@@ -548,6 +548,59 @@ Content-Disposition: attachment; filename*=UTF-8''logo.png
 
 ---
 
+### ensure_directory_index()
+
+Ensure semantic indexes for one existing directory without replacing its L0/L1 content or tags. If both `.abstract.md` and `.overview.md` are absent, create only L0 using `fallback_abstract`. Existing summaries remain unchanged; only missing indexes are built, without an LLM call. Files, unsupported namespaces, empty or malformed summaries, and permission failures return errors.
+
+**Python SDK**
+
+```python
+result = client.ensure_directory_index(
+    uri="viking://resources/project/",
+    fallback_abstract="This is the compile generated folder",
+    wait=True,
+)
+client.set_tags(
+    uri="viking://resources/project/",
+    tags=["compile_target=true"],
+    mode="append",
+    recursive=False,
+)
+```
+
+TypeScript exposes `client.ensureDirectoryIndex(uri, fallbackAbstract, { wait: true })`; Go exposes `client.EnsureDirectoryIndex(ctx, uri, fallbackAbstract, nil)` with readiness waiting enabled by default.
+
+**HTTP API**
+
+```http
+POST /api/v1/content/ensure_directory_index
+Content-Type: application/json
+
+{
+  "uri": "viking://resources/project/",
+  "fallback_abstract": "This is the compile generated folder",
+  "wait": true
+}
+```
+
+`uri` and a non-empty `fallback_abstract` are required. `wait` defaults to `true`: the response confirms that indexes for all existing summary levels are readable. With `wait=false`, missing indexes are queued and the result includes `task_id`; `indexed_levels` lists only levels already readable at response time. The operation checks directory write access and does not process descendants.
+
+**Response**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "uri": "viking://resources/project",
+    "created_abstract": true,
+    "indexed_levels": [0],
+    "vector_status": "complete"
+  }
+}
+```
+
+---
+
 ### set_tags()
 
 Set explicit `k=v` tags used by retrieval filters. `replace` replaces existing tags, `append` adds tags, and `clear` explicitly removes existing tags. When the target is a directory, `recursive=true` applies the update to files below it. Omitting `tags`, or passing an empty list with `replace`, is a no-op; only `clear` removes tags and it ignores any supplied tag values.

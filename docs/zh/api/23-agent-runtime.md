@@ -212,6 +212,8 @@ ov task status cmp_01abc
 
 任务进入终态后，响应还会包含结果或错误。
 
+OpenViking 仅在 `to` 及全部子目录的索引可读取，且目录索引记录均已追加 `compile_target=true` 后，才将 Compile 任务标记为 `completed`。目录初始化保留已有 L0/L1 内容，追加标签时保留其他标签；两层摘要都缺失时，仅创建正文为 `This is the compile generated folder` 的 L0。文件不会获得此标签。收尾阶段索引或打标失败会使任务失败，但保留已经提交的产物。
+
 ### 取消任务
 
 ```http
@@ -222,7 +224,7 @@ POST /api/v1/tasks/{task_id}/cancel
 ov task cancel cmp_01abc
 ```
 
-运行中的 Compile 任务会先进入 `cancelling`，待执行端确认取消并完成回滚后进入 `cancelled`。回滚将 `to` 子树的文件恢复到该次 Compile 开始执行时的快照，期间其他操作及子任务在该范围内的修改也会撤销；`to` 范围外的路径不补偿。重复取消已经 `cancelled` 的任务是幂等的。
+运行中的 Compile 任务会先进入 `cancelling`，待执行端确认取消并完成清理后进入 `cancelled`。产物快照提交前取消时，回滚将 `to` 子树的文件恢复到该次 Compile 开始执行时的快照，期间其他操作及子任务在该范围内的修改也会撤销；`to` 范围外的路径不补偿。产物快照提交后，索引和标签收尾阶段的失败或取消会保留已提交产物，此时索引或标签可能尚未完整。重复取消已经 `cancelled` 的任务是幂等的。
 
 | Status | 常见 Stage |
 |--------|------------|

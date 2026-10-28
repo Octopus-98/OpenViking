@@ -17,6 +17,7 @@ from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
     canonical_session_root,
     classify_uri,
+    content_owner_context_for_uri,
     context_type_for_uri,
     is_session_uri,
     uri_leaf_name,
@@ -32,16 +33,23 @@ from openviking.privacy.session_restore import get_session_id_from_uri, restore_
 from openviking.privacy.skill_restore import get_skill_name_from_uri, restore_skill_content
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
+from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
 from openviking.service.task_tracker_concurrency import run_to_completion
-from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
+from openviking.service.task_work_index import (
+    bind_task_context,
+    get_enqueued_work_ids,
+    get_task_context,
+)
 from openviking.session.memory.account_templates import (
     validate_account_memory_template_transfer,
 )
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.content_visibility import visible_content
 from openviking.storage.abstract_overview import (
+    AbstractOverviewFormatError,
+    body_for_preview,
     is_abstract_overview_uri,
     mark_abstract_overview_pending,
     plan_abstract_overview_refresh,
@@ -49,9 +57,12 @@ from openviking.storage.abstract_overview import (
 )
 from openviking.storage.acl import AclAction, AclMode, AclSpec
 from openviking.storage.content_write import ContentWriteCoordinator
+from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.storage.expr import And, Eq, In, Or
 from openviking.storage.internal_names import is_storage_internal_name
+from openviking.storage.pathlock_transfer import PathLockGuard
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
+from openviking.storage.queuefs.content_write_msg import ContentWriteMsg
 from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
 from openviking.storage.vector_ids import is_vector_record_id
@@ -67,6 +78,7 @@ from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
     NotInitializedError,
+    OpenVikingError,
     PermissionDeniedError,
     ResourceExhaustedError,
 )
@@ -1584,12 +1596,11 @@ class FSService:
         record_version: bool = True,
         commit_content: Optional[Callable[..., Awaitable[Any]]] = None,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         """Write content and refresh it after persisting managed output versions.
 
         Internal restores supply ``commit_content`` to record their own version.
-        Byte-revision or absence conditions are checked under the content lease.
+        Byte-revision conditions are checked under the content lease.
         """
         viking_fs = self._ensure_initialized()
         if commit_content is None and self.compile_versions is not None:
@@ -1617,7 +1628,6 @@ class FSService:
             tag_mode=tag_mode,
             acl=acl,
             expected_sha256=expected_sha256,
-            expected_absent=expected_absent,
         )
         if self.compile_versions is None or edit_source == "compile":
             return await write()
@@ -1700,6 +1710,249 @@ class FSService:
             recursive=recursive,
             ctx=ctx,
         )
+
+    async def _directory_index_records(self, uri: str, ctx: RequestContext) -> List[Dict[str, Any]]:
+        """Read L0/L1 records and tags; propagate store errors."""
+        store = self._ensure_initialized()._get_vector_store()
+        if store is None:
+            raise NotInitializedError("Vector store")
+        records, cursor = await store.scroll(
+            filter=And([Eq("uri", uri), In("level", [0, 1])]),
+            limit=3,
+            output_fields=["id", "uri", "level", "search_tags"],
+            ctx=ctx,
+        )
+        if cursor is not None or len({record["level"] for record in records}) != len(records):
+            raise OpenVikingError(
+                f"Duplicate directory index records: {uri}", code="FAILED_PRECONDITION"
+            )
+        return records
+
+    async def ensure_directory_index(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        fallback_abstract: str,
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """Preserve summaries; create fallback L0 only when both are absent.
+        Return readable levels with wait=True, otherwise queued work; invalid summaries fail.
+        """
+        viking_fs = self._ensure_initialized()
+        uri = validate_safe_viking_uri_path(uri)
+        self._reject_storage_internal_target(uri)
+        if (
+            namespace_policy_for_uri(uri).processing_mode is NamespaceProcessingMode.FILE_ONLY
+            or context_type_for_uri(uri) not in {"resource", "memory", "skill"}
+            or is_session_uri(uri)
+        ):
+            raise InvalidArgumentError(f"directory indexing is not supported for namespace: {uri}")
+        if not isinstance(fallback_abstract, str) or not fallback_abstract.strip():
+            raise InvalidArgumentError("fallback_abstract must not be empty")
+        await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
+        if not (await viking_fs.stat(uri, ctx=ctx, skip_count=True)).get("isDir"):
+            raise InvalidArgumentError(f"directory index target must be a directory: {uri}")
+
+        async def execute() -> Dict[str, Any]:
+            context = get_task_context()
+            assert context is not None
+            with bind_task_context(
+                context.task_id, context.account_id, context.user_id, enqueued_work=[]
+            ):
+                guard = PathLockGuard(viking_fs._async_agfs)
+                try:
+                    # Lock the parent to avoid recreating a deleted target.
+                    parent_uri = VikingURI(uri).parent.uri
+                    try:
+                        lease = await guard.acquire(
+                            lambda: viking_fs._async_agfs.pathlock_acquire_tree(
+                                viking_fs._uri_to_path(parent_uri, ctx=ctx)
+                            )
+                        )
+                    except LockAcquisitionError as exc:
+                        raise ResourceBusyError(
+                            f"Directory is being processed: {uri}", uri=uri
+                        ) from exc
+                    stat = await viking_fs.stat(uri, ctx=ctx, skip_count=True)
+                    if not stat.get("isDir"):
+                        raise InvalidArgumentError(
+                            f"directory index target must be a directory: {uri}"
+                        )
+                    await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
+                    summaries: Dict[int, str] = {}
+                    for level, name in ((0, ".abstract.md"), (1, ".overview.md")):
+                        try:
+                            raw = await viking_fs.read_file(f"{uri}/{name}", ctx=ctx)
+                        except Exception as exc:
+                            if is_not_found_error(exc):
+                                continue
+                            raise
+                        try:
+                            body = body_for_preview(raw)
+                        except AbstractOverviewFormatError as exc:
+                            raise InvalidArgumentError(
+                                f"Invalid directory summary {uri}/{name}: {exc}"
+                            ) from exc
+                        if not body.strip():
+                            raise InvalidArgumentError(f"Directory summary is empty: {uri}/{name}")
+                        summaries[level] = raw
+                    created_abstract = not summaries
+                    if created_abstract:
+                        summaries[0] = render_abstract_overview(
+                            ContextLevel.ABSTRACT,
+                            uri,
+                            fallback_abstract,
+                            {
+                                "generated_by": {
+                                    "component": "FSService",
+                                    "trigger": "ensure_directory_index",
+                                }
+                            },
+                        )
+                        await viking_fs.write_file(
+                            f"{uri}/.abstract.md", summaries[0], ctx=ctx, lease_ref=lease
+                        )
+                    records = await self._directory_index_records(uri, ctx)
+                    indexed = {record["level"] for record in records}
+                    missing = summaries.keys() - indexed
+                    if created_abstract:
+                        missing.add(0)
+                        indexed.discard(0)
+                    if missing:
+                        enqueued = await vectorize_directory_meta(
+                            uri=uri,
+                            abstract=summaries.get(0, ""),
+                            overview=summaries.get(1, ""),
+                            context_type=context_type_for_uri(uri),
+                            ctx=content_owner_context_for_uri(uri, ctx),
+                            include_abstract=0 in missing,
+                            include_overview=1 in missing,
+                            scalar_overrides={
+                                record["level"]: {"_record_id": record["id"]}
+                                for record in records
+                                if record["level"] in missing
+                            },
+                        )
+                        if enqueued != missing:
+                            raise OpenVikingError(
+                                f"Failed to enqueue directory index: {uri}", code="PROCESSING_ERROR"
+                            )
+                    if missing and wait:
+                        queue_status = await self._wait_for_refresh()
+                        if (queue_status.get("Embedding") or {}).get("error_count", 0):
+                            raise OpenVikingError(
+                                f"Directory index processing failed: {uri}", code="PROCESSING_ERROR"
+                            )
+                        indexed = {
+                            record["level"]
+                            for record in await self._directory_index_records(uri, ctx)
+                        }
+                        if summaries.keys() - indexed:
+                            raise OpenVikingError(
+                                f"Directory index is not readable: {uri}", code="PROCESSING_ERROR"
+                            )
+                    result = {
+                        "uri": uri,
+                        "created_abstract": created_abstract,
+                        "indexed_levels": sorted(summaries.keys() & indexed),
+                        "vector_status": "queued" if missing and not wait else "complete",
+                    }
+                    if missing and not wait:
+                        queue_manager = get_queue_manager()
+                        handoff = await guard.to_handoff()
+                        msg = ContentWriteMsg(
+                            task_id=context.task_id,
+                            operation="ensure_directory_index",
+                            resource_id=uri,
+                            result=result,
+                            refresh={
+                                "kind": "none",
+                                "uri": parent_uri,
+                                "indexed_levels": sorted(summaries),
+                            },
+                            account_id=ctx.account_id,
+                            user_id=ctx.user.user_id,
+                            role=str(ctx.role),
+                            group_ids=list(ctx.group_ids),
+                            actor_peer_id=ctx.actor_peer_id,
+                            bypass_acl=ctx.bypass_acl,
+                            lock_handoff=handoff,
+                        )
+                        await guard.handoff_and_dispatch(
+                            handoff,
+                            lambda: queue_manager.enqueue(
+                                queue_manager.CONTENT_WRITE, msg.to_dict()
+                            ),
+                        )
+                    return result
+                finally:
+                    try:
+                        work_ids = get_enqueued_work_ids("Embedding")
+                        if guard.lease is not None and work_ids:
+                            await run_to_completion(
+                                lambda: get_task_tracker().wait_for_work(context.task_id, work_ids)
+                            )
+                    finally:
+                        await guard.close()
+
+        result, _ = await run_tracked_operation(
+            "ensure_directory_index",
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            operation=execute,
+            resource_id=uri,
+            wait=wait,
+        )
+        return result
+
+    async def finalize_compile_directories(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
+        """Index and tag uri's directory tree, preserving summaries and other tags.
+        Return directory_count; denied paths or incomplete writes raise.
+        """
+        viking_fs = self._ensure_initialized()
+        uri = validate_safe_viking_uri_path(uri)
+        entries = await viking_fs.tree(
+            uri,
+            ctx=ctx,
+            output="original",
+            directories_only=True,
+            show_all_hidden=True,
+            node_limit=None,
+            level_limit=None,
+            include_abstract=False,
+        )
+        if any(entry.get("access") == "denied" for entry in entries):
+            raise PermissionDeniedError("Compile directory is not accessible", resource=uri)
+        directories = list(
+            dict.fromkeys(
+                [uri] + [entry["uri"].rstrip("/") for entry in entries if entry.get("isDir")]
+            )
+        )
+        await viking_fs._ensure_access_many(directories, ctx, action=AclAction.WRITE)
+        for directory in directories:
+            ensured = await self.ensure_directory_index(
+                directory,
+                ctx,
+                fallback_abstract="This is the compile generated folder",
+                wait=True,
+            )
+            await self.set_tags(
+                directory, ["compile_target=true"], mode="append", recursive=False, ctx=ctx
+            )
+            records = await self._directory_index_records(directory, ctx)
+            tagged_levels = {
+                record["level"]
+                for record in records
+                if "compile_target=true" in (record.get("search_tags") or [])
+            }
+            expected_levels = set(ensured["indexed_levels"]) | {
+                record["level"] for record in records
+            }
+            if not expected_levels or expected_levels - tagged_levels:
+                raise OpenVikingError(
+                    f"Compile directory tags are incomplete: {directory}", code="PROCESSING_ERROR"
+                )
+        return {"directory_count": len(directories)}
 
     async def get_acl(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
         return await self._ensure_initialized().get_acl(uri, ctx=ctx)

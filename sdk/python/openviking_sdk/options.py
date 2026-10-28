@@ -87,8 +87,6 @@ class AddResourceOptions(_ExtraOptions, total=False):
 class AddSkillOptions(_ExtraOptions, total=False):
     telemetry: Any
     target_uri: str
-    # Reject existing package contents before installing under the package lock.
-    expected_absent: bool
 
 
 class UpdateSkillOptions(AddSkillOptions, total=False):
@@ -98,9 +96,8 @@ class UpdateSkillOptions(AddSkillOptions, total=False):
 
 
 class WriteOptions(_ExtraOptions, total=False):
-    # Compare the raw stored byte revision, or require a missing target, before writing.
+    # Compare the raw stored byte revision before writing.
     expected_sha256: str
-    expected_absent: bool
     edit_source: Literal["manual", "agent", "compile"]
     acl: Dict[str, Any]
     telemetry: Any

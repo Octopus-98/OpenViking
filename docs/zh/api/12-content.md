@@ -548,6 +548,59 @@ Content-Disposition: attachment; filename*=UTF-8''logo.png
 
 ---
 
+### ensure_directory_index()
+
+确保一个既有目录的语义索引就绪，保留已有 L0/L1 内容和标签。仅当 `.abstract.md` 和 `.overview.md` 都不存在时，使用 `fallback_abstract` 创建 L0。已有摘要保持不变，只补缺失索引，不调用 LLM。目标为文件、namespace 不支持语义索引、摘要为空或格式损坏、无权限时返回错误。
+
+**Python SDK**
+
+```python
+result = client.ensure_directory_index(
+    uri="viking://resources/project/",
+    fallback_abstract="This is the compile generated folder",
+    wait=True,
+)
+client.set_tags(
+    uri="viking://resources/project/",
+    tags=["compile_target=true"],
+    mode="append",
+    recursive=False,
+)
+```
+
+TypeScript 对应 `client.ensureDirectoryIndex(uri, fallbackAbstract, { wait: true })`；Go 对应 `client.EnsureDirectoryIndex(ctx, uri, fallbackAbstract, nil)`，默认等待索引就绪。
+
+**HTTP API**
+
+```http
+POST /api/v1/content/ensure_directory_index
+Content-Type: application/json
+
+{
+  "uri": "viking://resources/project/",
+  "fallback_abstract": "This is the compile generated folder",
+  "wait": true
+}
+```
+
+`uri` 和非空的 `fallback_abstract` 必填。`wait` 默认 `true`，返回时确认已有摘要对应的全部索引层可读取。`wait=false` 时缺失索引进入队列，结果包含 `task_id`；`indexed_levels` 只列出响应时已经可读取的层。接口检查目录写权限，不处理子目录。
+
+**响应**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "uri": "viking://resources/project",
+    "created_abstract": true,
+    "indexed_levels": [0],
+    "vector_status": "complete"
+  }
+}
+```
+
+---
+
 ### set_tags()
 
 设置用于检索过滤的显式 `k=v` 标签。`replace` 替换已有标签，`append` 追加标签，`clear` 显式清空已有标签；对目录设置 `recursive=true` 时会更新目录下的文件。省略 `tags` 或传入空数组配合 `replace` 都是 no-op；只有 `clear` 会清空，且会忽略同时传入的标签值。

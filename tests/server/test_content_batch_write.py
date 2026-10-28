@@ -1342,10 +1342,10 @@ async def test_content_write_api_distinguishes_empty_and_missing_files(client, s
     empty_hash = hashlib.sha256(b"").hexdigest()
     for content, condition, status in [
         ("lost", {"expected_sha256": empty_hash}, 409),
-        ("", {"expected_absent": True}, 200),
-        ("lost", {"expected_absent": True}, 409),
+        ("", {}, 200),
         ("updated", {"expected_sha256": empty_hash}, 200),
         ("lost", {"expected_sha256": empty_hash}, 409),
+        ("created", {"mode": "create"}, 200),
     ]:
         response = await client.post(
             "/api/v1/content/write", json={"uri": uri, "content": content, **condition}
@@ -1353,7 +1353,7 @@ async def test_content_write_api_distinguishes_empty_and_missing_files(client, s
         assert response.status_code == status, response.text
 
     ctx = RequestContext(user=service.user, role=Role.ROOT)
-    assert await service.viking_fs.read_file(uri, ctx=ctx) == "updated"
+    assert await service.viking_fs.read_file(uri, ctx=ctx) == "created"
 
 
 @pytest.mark.asyncio

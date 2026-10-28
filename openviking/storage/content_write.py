@@ -317,7 +317,6 @@ class ContentWriteCoordinator:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         task = None
         task_id = None
@@ -349,7 +348,6 @@ class ContentWriteCoordinator:
                 tag_mode=tag_mode,
                 acl=acl,
                 expected_sha256=expected_sha256,
-                expected_absent=expected_absent,
                 root_operation="content_write",
                 root_task_factory=create_root_task,
             )
@@ -509,12 +507,11 @@ class ContentWriteCoordinator:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
     ) -> Dict[str, Any]:
         self._validate_mode(mode)
-        self._validate_write_precondition(expected_sha256, expected_absent)
+        self._validate_write_precondition(expected_sha256)
         processing_mode = normalize_processing_mode(processing_mode)
         normalized_uri = normalize_storage_target_uri(
             self._validate_uri_path(uri, field_name="uri")
@@ -566,7 +563,6 @@ class ContentWriteCoordinator:
                 root_operation=root_operation,
                 root_task_factory=root_task_factory,
                 expected_sha256=expected_sha256,
-                expected_absent=expected_absent,
             )
 
         root_uri = await self._resolve_root_uri(
@@ -591,7 +587,6 @@ class ContentWriteCoordinator:
                 root_operation=root_operation,
                 root_task_factory=root_task_factory,
                 expected_sha256=expected_sha256,
-                expected_absent=expected_absent,
             )
 
         return await self._write_direct_with_refresh(
@@ -609,7 +604,6 @@ class ContentWriteCoordinator:
             root_operation=root_operation,
             root_task_factory=root_task_factory,
             expected_sha256=expected_sha256,
-            expected_absent=expected_absent,
         )
 
     async def batch_write(
@@ -781,7 +775,6 @@ class ContentWriteCoordinator:
                         ctx=ctx,
                         exists=exists,
                         expected_sha256=operation.get("expected_sha256"),
-                        expected_absent=operation.get("expected_absent", False),
                     )
                     if current is not None:
                         desired = operation["content"]
@@ -1110,8 +1103,7 @@ class ContentWriteCoordinator:
 
             mode = raw.get("mode", "replace")
             expected = raw.get("expected_sha256")
-            expected_absent = raw.get("expected_absent", False)
-            self._validate_write_precondition(expected, expected_absent)
+            self._validate_write_precondition(expected)
             self._validate_batch_mode(mode)
             if has_content_base64 and mode == "append":
                 raise InvalidArgumentError(
@@ -1144,7 +1136,6 @@ class ContentWriteCoordinator:
                     "content": content,
                     "mode": mode,
                     "expected_sha256": raw.get("expected_sha256"),
-                    "expected_absent": expected_absent,
                     "ingest_options": ingest_options,
                 }
             )
@@ -1887,7 +1878,6 @@ class ContentWriteCoordinator:
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         # ``.abstract.md`` / ``.overview.md`` are generated sidecars whose body is
         # re-embedded in place (no LLM regeneration and no RNFV plan). Keep that
@@ -1906,7 +1896,6 @@ class ContentWriteCoordinator:
                 root_operation=root_operation,
                 root_task_factory=root_task_factory,
                 expected_sha256=expected_sha256,
-                expected_absent=expected_absent,
             )
 
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
@@ -1923,7 +1912,7 @@ class ContentWriteCoordinator:
         lock_guard = PathLockGuard(self._viking_fs._async_agfs, lease)
         try:
             target_state = await self._classify_locked_write_target(
-                uri, ctx=ctx, expected_sha256=expected_sha256, expected_absent=expected_absent
+                uri, ctx=ctx, expected_sha256=expected_sha256
             )
             target_preexisting = target_state.preexisting
             is_new_file = target_state.is_new_file
@@ -2128,7 +2117,6 @@ class ContentWriteCoordinator:
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         """Re-embed a manually edited L0/L1 sidecar body without LLM regeneration."""
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
@@ -2150,7 +2138,7 @@ class ContentWriteCoordinator:
             # Preserve the public invariant that generated sidecars cannot be
             # materialized, while keeping the state check inside the exact lock.
             target_state = await self._classify_locked_write_target(
-                uri, ctx=ctx, expected_sha256=expected_sha256, expected_absent=expected_absent
+                uri, ctx=ctx, expected_sha256=expected_sha256
             )
             previous_content = target_state.existing_raw
             if previous_content is None:
@@ -2300,7 +2288,6 @@ class ContentWriteCoordinator:
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         lock_guard = PathLockGuard(self._viking_fs._async_agfs)
@@ -2319,7 +2306,7 @@ class ContentWriteCoordinator:
 
         try:
             target_state = await self._classify_locked_write_target(
-                uri, ctx=ctx, expected_sha256=expected_sha256, expected_absent=expected_absent
+                uri, ctx=ctx, expected_sha256=expected_sha256
             )
             final_bytes = await self._write_in_place(
                 uri,
@@ -2391,19 +2378,17 @@ class ContentWriteCoordinator:
         *,
         ctx: RequestContext,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
     ) -> _LockedWriteTarget:
         """Classify a locked target and retain checked content for writes under the same lease."""
         stat = await self._safe_stat(uri, ctx=ctx, allow_not_found=True)
         preexisting = not stat.get("not_found")
         existing_raw = None
-        if not stat.get("isDir") or expected_absent:
+        if not stat.get("isDir"):
             checked = await self._check_write_precondition(
                 uri,
                 ctx=ctx,
                 exists=preexisting,
                 expected_sha256=expected_sha256,
-                expected_absent=expected_absent,
             )
             if checked is not None:
                 existing_raw = self._viking_fs._decode_bytes(checked)
@@ -2419,18 +2404,14 @@ class ContentWriteCoordinator:
         return _LockedWriteTarget(False, ({}, True))
 
     @staticmethod
-    def _validate_write_precondition(expected_sha256: str | None, expected_absent: bool) -> None:
-        """Reject invalid or contradictory byte-revision conditions before acquiring locks."""
-        if not isinstance(expected_absent, bool):
-            raise InvalidArgumentError("expected_absent must be a boolean")
+    def _validate_write_precondition(expected_sha256: str | None) -> None:
+        """Reject invalid byte-revision conditions before acquiring locks."""
         if expected_sha256 is not None and (
             not isinstance(expected_sha256, str)
             or len(expected_sha256) != 64
             or any(c not in "0123456789abcdef" for c in expected_sha256)
         ):
             raise InvalidArgumentError("expected_sha256 must be a lowercase SHA-256 digest")
-        if expected_sha256 is not None and expected_absent:
-            raise InvalidArgumentError("expected_sha256 and expected_absent are mutually exclusive")
 
     async def _check_write_precondition(
         self,
@@ -2439,15 +2420,12 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         exists: bool,
         expected_sha256: str | None,
-        expected_absent: bool,
     ) -> bytes | None:
         """Check the caller's observed state under its write lease and return hashed bytes.
 
         A mismatch raises ConflictError before content changes; omitted conditions
         preserve unconditional writes. The caller holds the lease until writing.
         """
-        if expected_absent and exists:
-            raise ConflictError(f"Target now exists: {uri}. Re-read before writing.")
         if expected_sha256 is None:
             return None
         if not exists:
@@ -2680,7 +2658,6 @@ class ContentWriteCoordinator:
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
         expected_sha256: str | None = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         lock_guard = PathLockGuard(self._viking_fs._async_agfs)
@@ -2699,7 +2676,7 @@ class ContentWriteCoordinator:
 
         try:
             target_state = await self._classify_locked_write_target(
-                uri, ctx=ctx, expected_sha256=expected_sha256, expected_absent=expected_absent
+                uri, ctx=ctx, expected_sha256=expected_sha256
             )
             is_new_file = target_state.is_new_file
             write_kwargs = {

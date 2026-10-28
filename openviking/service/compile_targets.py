@@ -1196,10 +1196,8 @@ class CompileLifecycle:
         }
 
     async def on_finish(self, task: Any, snapshot: ExternalTaskSnapshot) -> ExternalTaskSnapshot:
-        """Commit successful output and accept reindex before completing the run.
-
-        Saved snapshot and reindex identities allow interrupted finalization to
-        resume without publishing a second output version or reindex request.
+        """Commit output, then finish indexing and tags before completing the run.
+        Replay saved snapshot/reindex IDs without publishing duplicate versions.
         """
         meta, request = task.meta["request"].get("compile"), task.meta["request"]
         if meta is None:
@@ -1296,14 +1294,41 @@ class CompileLifecycle:
                         task_id=run_meta["reindex_task_id"],
                     )
                 else:
-                    if run_meta["target_base"]:
+                    # Published output survives indexing or tag finalization failures.
+                    if run_meta["target_base"] and not run_meta.get("snapshot_committed"):
                         await self._rollback(request["to"], run, ctx)
                     run["error"] = snapshot.error_message or snapshot.status
+                if snapshot.status == "completed" and run["started_at"] is not None:
+                    await self._finalize_directories(task, run, ctx)
                 run["status"] = snapshot.status
                 run["finished_at"] = time.time()
                 await self._store.put_operation(account_id, target_to, run)
             await self._release(account_id, target_to, task, run)
             return snapshot
+
+    async def _finalize_directories(
+        self, task: Any, run: Dict[str, Any], ctx: RequestContext
+    ) -> None:
+        """Wait for run's reindex and tag task's target directory tree.
+        Incomplete indexes fail; retries reuse the reindex ID and preserve published output.
+        """
+        from openviking.server.dependencies import get_service
+        from openviking.service.external_task_service import ExternalTaskError
+        from openviking.service.task_tracker import TaskStatus, get_task_tracker
+
+        reindex_id = run["meta"].get("reindex_task_id")
+        if reindex_id:
+            terminal = await get_task_tracker().wait(
+                reindex_id, account_id=task.account_id, user_id=task.user_id
+            )
+            result = terminal.result or {}
+            if terminal.status != TaskStatus.COMPLETED or result.get("failed_records", 0):
+                raise ExternalTaskError(
+                    "COMPILE_INDEX_FAILED",
+                    terminal.error or f"Compile reindex failed: {reindex_id}",
+                    transient=False,
+                )
+        await get_service().fs.finalize_compile_directories(task.meta["request"]["to"], ctx)
 
     async def _release(
         self, account_id: str, target_to: str, task: Any, run: Optional[Dict[str, Any]]

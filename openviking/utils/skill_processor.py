@@ -36,7 +36,7 @@ from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry, register_telemetry
 from openviking.utils.path_safety import safe_join_viking_uri
 from openviking.utils.zip_safe import safe_extract_zip
-from openviking_cli.exceptions import ConflictError, InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -136,7 +136,6 @@ class SkillProcessor:
         owner_lease_ref: Optional[Dict[str, Any]] = None,
         lease_ref: Any = None,
         on_package_written: Optional[Callable[[str, Any], Awaitable[None]]] = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
         """
         Process and store a skill.
@@ -149,7 +148,6 @@ class SkillProcessor:
                 When omitted, defaults to ``{user_root}/skills``.
             on_package_written: Called with the package URI and lease before queue handoff;
                 failures abort processing while the package lease is still held.
-            expected_absent: Reject existing package contents under the write lock.
 
         Returns:
             Processing result with status and metadata
@@ -180,7 +178,6 @@ class SkillProcessor:
             owner_lease_ref=owner_lease_ref,
             lease_ref=lease_ref,
             on_package_written=on_package_written,
-            expected_absent=expected_absent,
         )
 
     async def process_prepared_skill(
@@ -196,9 +193,8 @@ class SkillProcessor:
         owner_lease_ref: Optional[Dict[str, Any]] = None,
         lease_ref: Any = None,
         on_package_written: Optional[Callable[[str, Any], Awaitable[None]]] = None,
-        expected_absent: bool = False,
     ) -> Dict[str, Any]:
-        """Store a package under its lease, checking required absence before privacy or writes."""
+        """Store a prepared package and apply privacy changes under its write lease."""
         cleanup_path = preparation.cleanup_path
         skill_dict = preparation.skill_dict
         auxiliary_files = preparation.auxiliary_files
@@ -221,24 +217,7 @@ class SkillProcessor:
                 )
 
             await run_to_completion(acquire_package_lock)
-            # Package locks do not guarantee a directory exists; missing or empty roots are available.
-            if expected_absent:
-                try:
-                    entries = await viking_fs.ls(
-                        skill_dir_uri,
-                        ctx=ctx,
-                        show_all_hidden=True,
-                        node_limit=1,
-                        include_abstract=False,
-                    )
-                except NotFoundError:
-                    entries = []
-                if entries:
-                    raise ConflictError("Skill package already exists", resource="VERSION_CONFLICT")
-
-            # Preparation above is read-only. A rejected package writer must
-            # not change its privacy config, and cancellation must let an
-            # in-flight config write finish before releasing the package lock.
+            # Privacy changes finish under the package lease even if installation is cancelled.
             if apply_privacy:
                 skill_dict = await run_to_completion(
                     lambda: self.apply_skill_privacy(

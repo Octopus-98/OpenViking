@@ -53,16 +53,8 @@ class WriteContentRequest(BaseModel):
     acl: AclSpec | None = None
     # Who made the edit; versions of Compile outputs record it (console edit = manual).
     edit_source: Literal["manual", "agent", "compile"] = "manual"
-    # Conditions describe raw stored bytes; omission preserves unconditional writes.
+    # The revision describes raw stored bytes; omission preserves unconditional writes.
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
-    expected_absent: bool = False
-
-    @model_validator(mode="after")
-    def validate_precondition(self) -> "WriteContentRequest":
-        """Require one observed target state for a conditional write."""
-        if self.expected_sha256 is not None and self.expected_absent:
-            raise ValueError("expected_sha256 and expected_absent are mutually exclusive")
-        return self
 
 
 class BatchWriteOperation(BaseModel):
@@ -74,7 +66,6 @@ class BatchWriteOperation(BaseModel):
     mode: Literal["replace", "append", "create", "upsert"] = "replace"
     # Optional byte revision, checked under the existing file locks before any writes.
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
-    expected_absent: bool = False
     tags: list[str] | None = None
     tag_mode: Literal["replace", "append", "clear"] = "replace"
     acl: AclSpec | None = None
@@ -83,8 +74,6 @@ class BatchWriteOperation(BaseModel):
     def validate_content_shape(self) -> "BatchWriteOperation":
         if (self.content is None) == (self.content_base64 is None):
             raise ValueError("exactly one of content or content_base64 is required")
-        if self.expected_sha256 is not None and self.expected_absent:
-            raise ValueError("expected_sha256 and expected_absent are mutually exclusive")
         return self
 
 
@@ -112,6 +101,19 @@ class SetTagsRequest(BaseModel):
     tags: list[str] | None = None
     mode: str = "replace"
     recursive: bool = False
+    telemetry: TelemetryRequest = False
+
+
+class EnsureDirectoryIndexRequest(BaseModel):
+    """Ensure one existing directory has semantic indexes, preserving stored summaries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    uri: str = Field(min_length=1, description="URI of an existing directory")
+    fallback_abstract: str = Field(
+        min_length=1, description="L0 body used only when both L0 and L1 are absent"
+    )
+    wait: bool = Field(default=True, description="Wait until semantic indexes are readable")
     telemetry: TelemetryRequest = False
 
 
@@ -286,7 +288,6 @@ async def write(
             acl=request.acl,
             edit_source=request.edit_source,
             expected_sha256=request.expected_sha256,
-            expected_absent=request.expected_absent,
         ),
     )
     return Response(
@@ -347,6 +348,31 @@ async def set_tags(
             tags=tags,
             mode=request.mode,
             recursive=request.recursive,
+            ctx=_ctx,
+        ),
+    )
+    return Response(
+        status="ok",
+        result=execution.result,
+        telemetry=execution.telemetry,
+    ).model_dump(exclude_none=True)
+
+
+@router.post("/ensure_directory_index")
+async def ensure_directory_index(
+    request: EnsureDirectoryIndexRequest = Body(...),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Seed L0 only when both summaries are absent and ensure existing levels are indexed."""
+    service = get_service()
+    uri = validate_request_viking_uri(resolve_path_variables(request.uri), _ctx)
+    execution = await run_operation(
+        operation="content.ensure_directory_index",
+        telemetry=request.telemetry,
+        fn=lambda: service.fs.ensure_directory_index(
+            uri=uri,
+            fallback_abstract=request.fallback_abstract,
+            wait=request.wait,
             ctx=_ctx,
         ),
     )

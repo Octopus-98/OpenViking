@@ -288,6 +288,27 @@ class ContentWriteProcessor(DequeueHandlerBase):
             )
             result = deepcopy(checkpoint_result or msg.result)
             result.update(result_updates)
+            if msg.operation == "ensure_directory_index":
+                from openviking.server.dependencies import get_service
+
+                stat = await self._viking_fs.stat(msg.resource_id, ctx=ctx, skip_count=True)
+                if not stat.get("isDir"):
+                    raise OpenVikingError(
+                        f"Directory index target is not a directory: {msg.resource_id}",
+                        code="FAILED_PRECONDITION",
+                    )
+                expected = set(msg.refresh["indexed_levels"])
+                records = await get_service().fs._directory_index_records(msg.resource_id, ctx)
+                indexed = {record["level"] for record in records}
+                if (queue_status.get("Embedding") or {}).get(
+                    "error_count", 0
+                ) or expected - indexed:
+                    raise OpenVikingError(
+                        f"Directory index is not readable: {msg.resource_id}",
+                        code="PROCESSING_ERROR",
+                    )
+                result["indexed_levels"] = sorted(expected)
+                result["vector_status"] = "complete"
             result["queue_status"] = queue_status
             result.setdefault("task_id", msg.task_id)
             if msg.failure is not None:

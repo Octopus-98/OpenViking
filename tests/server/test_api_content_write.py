@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import filesystem
+from openviking.storage.expr import PathScope
 
 
 async def _first_file_uri(client, root_uri: str) -> str:
@@ -29,6 +31,37 @@ async def test_write_endpoint_registered(client):
 async def test_set_tags_endpoint_registered(client):
     resp = await client.get("/api/v1/fs/attrs/set_tags")
     assert resp.status_code == 405
+
+
+async def test_ensure_directory_index_preserves_content_and_tags(client, service):
+    ctx = RequestContext(user=service.user, role=Role.ROOT)
+    uri = "viking://resources/compile"
+    await service.viking_fs.mkdir(f"{uri}/child", ctx=ctx)
+    response = await client.post(
+        "/api/v1/content/ensure_directory_index",
+        json={"uri": uri, "fallback_abstract": "Compile output"},
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["created_abstract"] is True
+    assert response.json()["result"]["indexed_levels"] == [0]
+    await service.fs.write(f"{uri}/child/note.md", "Content", ctx=ctx, wait=True)
+    await service.resources.wait_processed()
+    original = await service.viking_fs.read_file(f"{uri}/.abstract.md", ctx=ctx)
+    await service.fs.set_tags(uri, ["team=search"], mode="append", recursive=False, ctx=ctx)
+    await service.fs.finalize_compile_directories(uri, ctx)
+    assert await service.viking_fs.read_file(f"{uri}/.abstract.md", ctx=ctx) == original
+    records = await service.vikingdb_manager.filter(
+        filter=PathScope("uri", uri), output_fields=["uri", "level", "search_tags"], ctx=ctx
+    )
+    assert {record["level"] for record in records} == {0, 1, 2}
+    assert {record["uri"] for record in records if record["level"] < 2} == {uri, f"{uri}/child"}
+    assert all(
+        ("compile_target=true" in (record.get("search_tags") or [])) == (record["level"] < 2)
+        for record in records
+    )
+    assert any(
+        record["uri"] == uri and "team=search" in record["search_tags"] for record in records
+    )
 
 
 async def test_fs_attrs_filters_legacy_non_kv_search_tags(monkeypatch):

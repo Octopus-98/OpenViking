@@ -1405,7 +1405,6 @@ async def write(
     wait: bool = False,
     acl: Optional[AclSpec] = None,
     expected_sha256: Optional[str] = None,
-    expected_absent: bool = False,
 ) -> str:
     """Write text to a viking:// file. Use this for files you author yourself (notes, profiles, state), the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite. To store a file, document, URL, or repo the user gives you, use add_resource; for a skill, use add_skill. Do not copy its text into a file here instead.
 
@@ -1418,8 +1417,7 @@ async def write(
       requires manage on the target, or its parent for a new file. Omit to preserve
       existing ACL or inherit on creation.
     - expected_sha256: optional SHA-256 of the raw bytes last read; a changed or missing
-      file is rejected. expected_absent=true requires a missing file. These conditions
-      are mutually exclusive; on conflict, re-read before preparing another write.
+      file is rejected. On conflict, re-read before preparing another write.
 
     Writable scopes: viking://resources/, viking://user/{user_id}/, viking://agent/. The viking://~ home alias expands to the caller's user root. The managed user subtrees skills/, peers/, privacy/ and sessions/ are read-only. Do not write inside a skill package under viking://agent/skills/ either: a plain write skips installation, so the skill's abstract, overview and source metadata go stale. Change a skill with the add_skill tool. After a write, semantic search indexes refresh in the background; pass wait=true to block until search reflects the change."""
     # An explicit ACL uses the kernel's manage check before any content is written.
@@ -1436,7 +1434,6 @@ async def write(
         acl=acl,
         edit_source="agent",
         expected_sha256=expected_sha256,
-        expected_absent=expected_absent,
     )
     written = result.get("written_bytes", 0)
     message = (

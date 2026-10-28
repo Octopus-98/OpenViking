@@ -212,6 +212,8 @@ ov task status cmp_01abc
 
 Terminal task responses also contain the result or error.
 
+OpenViking reports a Compile task as `completed` only after the indexes for `to` and every descendant directory are readable and their directory records carry `compile_target=true`. Directory initialization preserves existing L0/L1 content and appends the tag while retaining other tags; when both summaries are absent, it creates only L0 with `This is the compile generated folder`. Files do not receive this tag. An indexing or tagging failure during finalization fails the task while retaining output that has already been committed.
+
 ### Cancel a task
 
 ```http
@@ -222,7 +224,7 @@ POST /api/v1/tasks/{task_id}/cancel
 ov task cancel cmp_01abc
 ```
 
-A running Compile task first enters `cancelling`, then becomes `cancelled` after the execution backend confirms cancellation and rollback finishes. Rollback restores files in the `to` subtree to the snapshot taken when that Compile run started, including changes made there by other operations and child tasks during the run. Paths outside `to` are not restored. Repeated cancellation of an already `cancelled` task is idempotent.
+A running Compile task first enters `cancelling`, then becomes `cancelled` after the execution backend confirms cancellation and cleanup finishes. Before the output snapshot is committed, cancellation rolls files in the `to` subtree back to the snapshot taken when that Compile run started, including changes made there by other operations and child tasks during the run. Paths outside `to` are not restored. After the output snapshot is committed, failure or cancellation during index and tag finalization preserves the committed output; indexes or tags can remain incomplete. Repeated cancellation of an already `cancelled` task is idempotent.
 
 | Status | Typical stages |
 |--------|----------------|
