@@ -231,6 +231,13 @@ class Tau2BenchEnv:
     def _get_reward(self):
         return self._impl._get_reward()
 
+    def close(self, *, termination_reason: str = "max_steps") -> None:
+        """Finalize the task after the external agent loop has stopped."""
+        if isinstance(self._impl, _GymTau2BenchEnv):
+            self._impl.env.close(termination_reason=termination_reason)
+        self._impl.terminated = True
+        self.terminated = True
+
 
 class _GymTau2BenchEnv:
     def __init__(self, domain: str, task_id: str):
@@ -240,6 +247,7 @@ class _GymTau2BenchEnv:
             domain=domain,
             task_id=task_id,
             user_llm=os.getenv("TAU2_USER_LLM") or DEFAULT_TAU2_USER_LLM,
+            defer_user_stop=True,
         )
         self.terminated = False
 
