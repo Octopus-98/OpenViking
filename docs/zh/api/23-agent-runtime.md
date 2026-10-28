@@ -140,6 +140,8 @@ task, err := client.Compile(
 
 操作列表和产出列表接口均接受可选查询参数 `limit`（1–100，默认 20）和 `cursor`。翻页时原样传入返回的 `next_cursor`，其为 `null` 时表示最后一页。
 
+`operation_id` 包含固定宽度的创建时间前缀和唯一后缀，操作历史按该 ID 倒序分页；游标对应的记录被清理后仍可继续翻页。Compile 操作通过 `meta.task_id` 关联执行任务，`operation_id` 与 `task_id` 不同；任务查询和取消使用 `task_id`，操作详情和产出查询使用操作列表返回的 `operation_id`。
+
 ### 检查 Compile 可用性
 
 ```http

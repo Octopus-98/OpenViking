@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from openviking.server.identity import RequestContext, Role
-from openviking.service.compile_targets import CompileLifecycle, CompileStateStore, new_operation
+from openviking.service.compile_targets import (
+    CompileLifecycle,
+    CompileStateStore,
+    compile_operation_id,
+    make_operation_id,
+    new_operation,
+)
 from openviking.service.external_task_service import ExternalTaskService
 from openviking.service.task_domain import TaskPatch
 from openviking.service.task_pagination import decode_cursor, encode_cursor, page_scope
@@ -62,9 +68,14 @@ async def test_skill_package_records_active_compile_operation(service):
     store = service.compile.lifecycle.store
     target = "viking://agent/skills"
     operation = new_operation("cmp_package", "manual_compile", {}, ctx.user.user_id)
+    operation["operation_id"] = make_operation_id(operation["created_at"], "cmp_package")
     operation["meta"] = {"task_id": "cmp_package"}
     async with store.edit(ctx.account_id, target, create=True) as record:
-        record.update(active_task_id=operation["operation_id"], content_updated_at=1)
+        record.update(
+            active_task_id="cmp_package",
+            active_operation_id=operation["operation_id"],
+            content_updated_at=1,
+        )
     await store.put_operation(ctx.account_id, target, operation)
 
     result = await service.resources.add_skill(
@@ -448,6 +459,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     store = service.compile.lifecycle.store
     initial_state = await store.get_by_to(ctx.account_id, target)
     assert initial_state["auto_update"] is False and initial_state["update_schedule"] is None
+    first_operation_id = initial_state["initial_operation_id"]
     assert "id" not in initial_state
     with monkeypatch.context() as patch:
         summary = (await store.list_summaries(ctx.account_id))[0]
@@ -478,7 +490,8 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
         summaries[:] = [item for item in summaries if item["status"] == "deleted"]
         p = (await client.get("/api/v1/compile/configs?limit=1")).json()["result"]
         assert p == {"targets": [], "next_cursor": None}
-    operation = await store.get_operation(ctx.account_id, target, first)
+    operation = await store.get_operation(ctx.account_id, target, first_operation_id)
+    assert operation["meta"]["task_id"] == first != operation["operation_id"]
     checkpoint = dict(operation["meta"])
     assert checkpoint["snapshot_committed"] and checkpoint["target_head"]
     assert (checkpoint["skill_snapshot"]["snapshot_id"] is None) == builtin_skill
@@ -497,7 +510,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
         await resumed_lifecycle.on_finish(task, resumed)
         resumed_lifecycle._commit.assert_not_awaited()
         resumed_lifecycle.versions.record_compile.assert_not_awaited()
-    operation = await store.get_operation(ctx.account_id, target, first)
+    operation = await store.get_operation(ctx.account_id, target, first_operation_id)
     assert operation["status"] == "completed" and operation["finished_at"] is not None
     assert operation["meta"] == checkpoint
     assert service.reindex.await_count == reindex_requests + 1
@@ -600,7 +613,9 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
         "reindex_task_id",
     }
     assert set(failed_operation["meta"]["changes"]) == {"added", "modified", "deleted"}
-    stored_operation = await store.get_operation(ctx.account_id, target, failed)
+    stored_operation = await store.get_operation(
+        ctx.account_id, target, failed_operation["operation_id"]
+    )
     assert set(stored_operation) == public_fields
     assert set(stored_operation["meta"]) - set(failed_operation["meta"]) == {
         "target_deleted_at",
@@ -630,7 +645,7 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
         await service.viking_fs.show(output["snapshot_id"], path=page, ctx=ctx) == b"ordinary edit"
     )
     cancelled_operation = next(
-        op for op in history["operations"] if op["operation_id"] == cancelled_id
+        op for op in history["operations"] if op["meta"].get("task_id") == cancelled_id
     )
     assert {"execution", "skill_snapshot"}.isdisjoint(cancelled_operation["meta"])
 
@@ -700,11 +715,10 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     runtime_status = "completed"
     assert await scheduler.trigger_if_due(ctx.account_id, target, now) == "submitted"
     operations = await service.compile.list_operations(target, ctx, limit=20, cursor=None)
-    scheduled = next(
-        op["meta"]["task_id"]
-        for op in operations["operations"]
-        if op["meta"].get("trigger") == "scheduled"
+    scheduled_operation = next(
+        op for op in operations["operations"] if op["meta"].get("trigger") == "scheduled"
     )
+    scheduled = scheduled_operation["meta"]["task_id"]
     await service.compile._tasks.execute(scheduled, **owner)
     assert (await tracker.get(scheduled, **owner)).status == "completed"
     assert await scheduler.trigger_if_due(ctx.account_id, target, now) == "not_due"
@@ -756,8 +770,8 @@ async def test_http_contract_preserves_retries_and_compile_target_lifecycle(
     queries = (
         "/api/v1/compile/config",
         "/api/v1/compile/operations",
-        f"/api/v1/compile/operations/{scheduled}",
-        f"/api/v1/compile/operations/{scheduled}/outputs",
+        f"/api/v1/compile/operations/{scheduled_operation['operation_id']}",
+        f"/api/v1/compile/operations/{scheduled_operation['operation_id']}/outputs",
     )
     for path in queries:
         response = await client.get(path, params={"to": target})
@@ -839,7 +853,7 @@ async def test_nested_compile_restores_parent_scope(service, app, monkeypatch, t
     await service.viking_fs.write_file(f"{child}/page.md", "child output", ctx=ctx)
     await service.viking_fs.write_file(f"{child}/new.md", "child new", ctx=ctx)
     await lifecycle.on_finish(tasks[child], ExternalTaskSnapshot(status="completed"))
-    assert (await store.get_operation(ctx.account_id, child, tasks[child].task_id))[
+    assert (await store.get_operation(ctx.account_id, child, compile_operation_id(tasks[child])))[
         "status"
     ] == "completed"
     await service.viking_fs.write_file(f"{child}/page.md", "parent writes child", ctx=ctx)

@@ -140,6 +140,8 @@ Scheduled updates require `compile_api.scheduler_enabled=true` (default `false`)
 
 The history and output list endpoints accept optional query parameters `limit` (1–100, default 20) and `cursor`. Pass the returned `next_cursor` unchanged; `null` marks the last page.
 
+An `operation_id` contains a fixed-width creation timestamp and a unique suffix. History pages follow descending operation ID order, and a cursor remains usable after its record is cleaned up. Compile operations link to execution tasks through `meta.task_id`; `operation_id` differs from `task_id`. Use `task_id` to query or cancel a task and the history item's `operation_id` to read operation details or outputs.
+
 ### Check Compile availability
 
 ```http

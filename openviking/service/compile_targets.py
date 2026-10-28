@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import heapq
 import json
 import math
 import random
@@ -124,8 +123,9 @@ def new_record(to: str) -> Dict[str, Any]:
         # Snapshot the per-file version indexes were last synced to.
         "versions_head": None,
         "active_task_id": None,
+        "active_operation_id": None,  # Set and cleared with active_task_id.
         "last_run": None,
-        "initial_operation_id": None,  # First registered Compile task; missing on legacy targets.
+        "initial_operation_id": None,  # First Compile operation ID.
         "content_updated_at": None,  # Business-file change time in Unix seconds; None when unknown.
         "first_compile_created_at": None,  # First task creation in Unix seconds; None when unknown.
         "execution_context": {"executor": None, "credential": None, "args": {}},
@@ -358,6 +358,7 @@ class CompileStateStore:
                     "schedule_configured",
                     "versions_head",
                     "active_task_id",
+                    "active_operation_id",
                     "last_run",
                     "content_updated_at",
                     "conflicts_num",
@@ -573,36 +574,23 @@ class CompileStateStore:
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Return newest records after cursor; limit bounds memory, not JSON reads."""
+        """Read up to ``limit`` records below ``cursor``, skipping deleted files."""
         if limit is not None and limit <= 0:
             return []
         directory = f"{self._target_dir(account_id, target_to)}/operations"
+        # shortcut: ls lists all names; add range listing if metadata scans dominate.
         names = await self.list_dir(directory)
-        before = None
-        cursor_name = f"{cursor}.json" if cursor else None
-        if cursor_name is not None:
-            if cursor_name not in names:
-                return []
-            operation = await self.read_json(f"{directory}/{cursor_name}")
-            if operation is None:
-                return []
-            before = (operation.get("created_at") or 0, operation["operation_id"])
-        heap: list[tuple[float, str, Dict[str, Any]]] = []
-        for name in names:
-            if name == cursor_name:
+        operations = []
+        for name in sorted(names, reverse=True):
+            if cursor and name[:-5] >= cursor:
                 continue
             operation = await self.read_json(f"{directory}/{name}")
             if operation is None:
                 continue
-            key = (operation.get("created_at") or 0, operation["operation_id"])
-            if before is not None and key >= before:
-                continue
-            candidate = (*key, operation)
-            if limit is None or len(heap) < limit:
-                heapq.heappush(heap, candidate)
-            elif key > heap[0][:2]:
-                heapq.heapreplace(heap, candidate)
-        return [item[2] for item in sorted(heap, reverse=True)]
+            operations.append(operation)
+            if limit is not None and len(operations) >= limit:
+                break
+        return operations
 
     async def list_accounts(self) -> List[str]:
         try:
@@ -741,6 +729,16 @@ def split_control_args(args: Optional[Mapping[str, Any]]) -> tuple[dict, dict]:
     return control, runtime
 
 
+def make_operation_id(created_at: float, suffix: str) -> str:
+    """Return a sortable ID from Unix seconds (9 decimals) and a unique suffix."""
+    return f"{created_at:020.9f}_{suffix}"
+
+
+def compile_operation_id(task: Any) -> str:
+    """Use persisted task time and ID so retries reuse the same operation."""
+    return make_operation_id(task.created_at, task.task_id)
+
+
 def new_operation(
     operation_id: str,
     operation_type: str,
@@ -748,9 +746,10 @@ def new_operation(
     actor: str,
     *,
     status: str = "running",
+    created_at: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Build one directory operation; timestamps use Unix seconds and conflicts default to zero."""
-    now = time.time()
+    """Build an operation; ``created_at`` is Unix seconds, defaulting to the current time."""
+    now = time.time() if created_at is None else created_at
     return {
         "operation_id": operation_id,
         "operation_type": operation_type,
@@ -768,16 +767,21 @@ def new_operation(
 
 
 def new_compile_operation(task: Any, record: Dict[str, Any]) -> Dict[str, Any]:
-    """Build a queued Compile operation linked to its execution task and original trigger."""
+    """Build a queued operation linked to its task and trigger."""
     request = task.meta["request"]
     trigger = request["compile"]["trigger"]
+    operation_id = compile_operation_id(task)
     operation_type = "schedule_compile" if trigger == "scheduled" else "manual_compile"
-    if record.get("initial_operation_id") == task.task_id:
+    if record.get("initial_operation_id") == operation_id:
         operation_type = "initial"
     return new_operation(
-        task.task_id, operation_type, _params(request), task.user_id, status="queued"
+        operation_id,
+        operation_type,
+        _params(request),
+        task.user_id,
+        status="queued",
+        created_at=task.created_at,
     ) | {
-        "created_at": task.created_at,
         "meta": {
             "task_id": task.task_id,
             "target_deleted_at": record["deleted_at"],  # Target lifecycle boundary.
@@ -932,9 +936,9 @@ class CompileLifecycle:
 
     @staticmethod
     def _record_identity(task: Any, record: Dict[str, Any]) -> None:
-        """Retain the target's first task identity and earliest known creation time."""
+        """Keep the first operation ID and earliest task creation time."""
         if "initial_operation_id" in record and record["initial_operation_id"] is None:
-            record["initial_operation_id"] = task.task_id
+            record["initial_operation_id"] = compile_operation_id(task)
         # Missing fields identify legacy targets whose first creation time is unknown.
         if "first_compile_created_at" in record:
             first = record["first_compile_created_at"]
@@ -956,11 +960,12 @@ class CompileLifecycle:
         if not self._task_is_current(locked_record, task):
             return
         target_to = locked_record["to"]
-        async with self._store.lock_operation(task.account_id, target_to, task.task_id, "create"):
-            run = await self._store.get_operation(task.account_id, target_to, task.task_id)
+        operation_id = compile_operation_id(task)
+        async with self._store.lock_operation(task.account_id, target_to, operation_id, "create"):
+            run = await self._store.get_operation(task.account_id, target_to, operation_id)
             self._record_identity(task, locked_record)
             if run is None:
-                await self._store.merge_outputs(task.account_id, target_to, task.task_id, [])
+                await self._store.merge_outputs(task.account_id, target_to, operation_id, [])
                 await self._store.put_operation(
                     task.account_id,
                     target_to,
@@ -999,6 +1004,7 @@ class CompileLifecycle:
         if meta is None:
             return "proceed"
         account_id = task.account_id
+        operation_id = compile_operation_id(task)
         to = task.meta["request"]["to"]
         deadline = time.monotonic() + 30.0
         while await self._store.get(account_id, to) is None:
@@ -1017,7 +1023,7 @@ class CompileLifecycle:
                         status="cancelled", error_message="Compile target was deleted"
                     )
                 target_to = record["to"]
-                run = await self._store.get_operation(account_id, target_to, task.task_id)
+                run = await self._store.get_operation(account_id, target_to, operation_id)
                 if run and run["status"] in TERMINAL and run["finished_at"] is not None:
                     # Replayed completions must not claim the target and restore an older baseline.
                     return ExternalTaskSnapshot(
@@ -1025,16 +1031,19 @@ class CompileLifecycle:
                     )
                 owner = record["active_task_id"]
                 if owner and owner != task.task_id:
-                    other = await self._store.get_operation(account_id, target_to, owner)
+                    other = await self._store.get_operation(
+                        account_id, target_to, record["active_operation_id"]
+                    )
                     if other is not None and other["status"] not in TERMINAL:
                         return "busy"
                 record["active_task_id"] = task.task_id
+                record["active_operation_id"] = operation_id
                 await self.record_queued(task, locked_record=record)
         except LookupError:
             return ExternalTaskSnapshot(
                 status="cancelled", error_message="Compile target was moved or deleted"
             )
-        run = await self._store.get_operation(account_id, target_to, task.task_id)
+        run = await self._store.get_operation(account_id, target_to, operation_id)
         if run is None or run["status"] == "queued":
             try:
                 run = await self._begin_run(task, record, run)
@@ -1169,9 +1178,11 @@ class CompileLifecycle:
         if not meta:
             return None
         record = await self._store.get(account_id, payload["to"])
-        if record is None:
+        if record is None or record["active_task_id"] != task_id:
             return None
-        run = await self._store.get_operation(account_id, record["to"], task_id)
+        run = await self._store.get_operation(
+            account_id, record["to"], record["active_operation_id"]
+        )
         if run is None or run["meta"].get("changes") is None:
             return None
         run_meta = run["meta"]
@@ -1202,8 +1213,9 @@ class CompileLifecycle:
                 status="cancelled", error_message="Compile target was moved or deleted"
             )
         target_to = record["to"]
-        async with self._store.lock_operation(account_id, target_to, task.task_id, "finish"):
-            run = await self._store.get_operation(account_id, target_to, task.task_id)
+        operation_id = compile_operation_id(task)
+        async with self._store.lock_operation(account_id, target_to, operation_id, "finish"):
+            run = await self._store.get_operation(account_id, target_to, operation_id)
             if run is not None and run["finished_at"] is None:
                 run_meta = run["meta"]
                 ctx = task_ctx(task.account_id, task.user_id)
@@ -1310,7 +1322,10 @@ class CompileLifecycle:
                     )
                 ) and run is not None:
                     # Write hooks can publish their marker after final operation state is saved.
-                    run = await self._store.get_operation(account_id, target_to, task_id) or run
+                    run = (
+                        await self._store.get_operation(account_id, target_to, run["operation_id"])
+                        or run
+                    )
                     run_meta = run["meta"]
                     record["last_run"] = {
                         "task_id": task_id,
@@ -1343,6 +1358,7 @@ class CompileLifecycle:
                         record["versions_head"] = synced
                 if record["active_task_id"] == task_id:
                     record["active_task_id"] = None
+                    record["active_operation_id"] = None
         except LookupError:
             return
         if first_success and self.reschedule is not None:
@@ -1638,7 +1654,8 @@ class CompileVersions:
         Exceptions and cancellation retain their original behavior after history is saved.
         """
         entries = []
-        operation_id = f"op_{uuid4().hex}"
+        created_at = time.time()
+        operation_id = make_operation_id(created_at, f"op_{uuid4().hex}")
         if recursive:
             targets = await self._store.list_summaries(ctx.account_id)
         else:
@@ -1673,6 +1690,7 @@ class CompileVersions:
                             operation_type,
                             scoped_params | {"uris": affected},
                             ctx.user.user_id,
+                            created_at=created_at,
                         ),
                     )
                 )
@@ -1828,7 +1846,7 @@ class CompileVersions:
         return record
 
     async def _running(self, account_id: str, record: Dict[str, Any]) -> bool:
-        owner = record["active_task_id"]
+        owner = record["active_operation_id"]
         if not owner:
             return False
         run = await self._store.get_operation(account_id, record["to"], owner)
@@ -2138,9 +2156,9 @@ class CompileVersions:
                 record = await self._store.get(ctx.account_id, records[target_to]["to"])
                 run = (
                     await self._store.get_operation(
-                        ctx.account_id, target_to, record["active_task_id"]
+                        ctx.account_id, target_to, record["active_operation_id"]
                     )
-                    if record["active_task_id"]
+                    if record["active_operation_id"]
                     else None
                 )
                 if run and run["started_at"] is not None and run["finished_at"] is None:
@@ -2215,8 +2233,8 @@ class CompileVersions:
     async def _write_meta(self, account_id: str, record: dict) -> dict:
         """Associate ordinary versions and operations with an unfinished Compile."""
         run = (
-            await self._store.get_operation(account_id, record["to"], record["active_task_id"])
-            if record["active_task_id"]
+            await self._store.get_operation(account_id, record["to"], record["active_operation_id"])
+            if record["active_operation_id"]
             else None
         )
         if (
@@ -2366,6 +2384,7 @@ class CompileVersions:
                 record["deleted_at"] = time.time()
                 record["auto_update"] = False
                 record["active_task_id"] = None
+                record["active_operation_id"] = None
                 record["execution_context"]["credential"] = None
                 await self.drop_all(ctx.account_id, item["to"])
             if self.reschedule is not None:
