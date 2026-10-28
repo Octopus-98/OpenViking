@@ -57,6 +57,7 @@ from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import OPENVIKING_ENABLE_RECORDER_ENV, get_openviking_config
 from openviking_cli.utils.config.agent_evolution_config import AgentEvolutionConfig
+from openviking_cli.utils.config.config_utils import DEFAULT_SERVICE_NAME
 from openviking_cli.utils.config.git_config import GitConfig
 from openviking_cli.utils.config.memory_config import SessionAutoCommitConfig
 from openviking_cli.utils.config.open_viking_config import initialize_openviking_config
@@ -168,6 +169,7 @@ class OpenVikingService:
             max_concurrent_external_task=config.queue_workers.external_task.max_concurrent,
             binding_config=binding_config,
             git_config=config.git,
+            service_name=config.service_name,
         )
 
     def _init_storage(
@@ -183,6 +185,7 @@ class OpenVikingService:
         binding_config: Any = None,
         *,
         git_config: Optional[GitConfig] = None,
+        service_name: str = DEFAULT_SERVICE_NAME,
     ) -> None:
         """Initialize storage resources."""
         from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
@@ -216,7 +219,7 @@ class OpenVikingService:
         self._vikingdb_manager.acl_manager = AclManager(self._vikingdb_manager)
 
         # PathLock has been moved to Rust ragfs; Python-layer LockManager is no longer needed.
-        set_task_tracker(config.build_task_tracker(self._agfs_client))
+        set_task_tracker(config.build_task_tracker(self._agfs_client, service_name=service_name))
 
     def _build_ragfs_binding_config(self) -> Any:
         """Build the single runtime binding config from OpenViking storage + encryption settings."""
@@ -721,7 +724,8 @@ class OpenVikingService:
         if self._queue_manager:
             self._queue_manager.start()
             logger.info("QueueManager workers started")
-        await system_asset_synchronizer.sync(default_ctx)
+        if self._config.reconcile_system_assets_on_startup:
+            await system_asset_synchronizer.sync(default_ctx)
 
         compile_expiry_enabled = self._compile_scheduler is not None
         if session_expiry_enabled or compile_expiry_enabled:
@@ -985,14 +989,15 @@ class OpenVikingService:
     async def reconcile_system_assets(self, account_lister: AccountLister) -> int:
         """Synchronize packaged system assets for every active account."""
         self._ensure_initialized()
-        if not self._system_asset_synchronizer:
+        if not self._system_asset_synchronizer or not self._viking_fs:
             return 0
         return await SystemAssetReconciler(
             self._system_asset_synchronizer,
             account_lister,
+            self._viking_fs._async_agfs,
             user_id=self._config.default_user or self._user.user_id,
             skip_account_ids={self._user.account_id},
-        ).sync_all()
+        ).sync_if_changed()
 
     async def initialize_user_directories(self, ctx: RequestContext) -> int:
         """Initialize current user's directory tree."""
