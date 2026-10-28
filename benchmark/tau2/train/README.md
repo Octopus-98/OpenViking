@@ -10,7 +10,7 @@ health checks, and then launches the batch runner.
 wrapper. Use it when you have already started OpenViking and the Tau2 rollout
 service yourself.
 
-The VikingBot backend requires the pinned Tau fork described in
+The VikingBot backend requires a compatible Tau checkout selected manually as described in
 [`../vikingbot/README.md`](../vikingbot/README.md#install--config). User `STOP` closes
 only customer dialogue; already-authorized business actions can finish before `done`.
 The batch VikingBot agent keeps only `read_file`, `write_file`, `edit_file`, `list_dir`,
