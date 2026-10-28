@@ -802,7 +802,9 @@ _TAU2_USER_TRANSFER_TOKENS = ("###TRANSFER###", "###OUT-OF-SCOPE###")
 
 def _tau2_user_reply_terminates(reply: Any) -> bool:
     text = str(reply or "")
-    return any(tok in text for tok in _TAU2_USER_TRANSFER_TOKENS)
+    return text.strip() == "Task Terminated" or any(
+        tok in text for tok in _TAU2_USER_TRANSFER_TOKENS
+    )
 
 
 def _make_tau2_plain_text_router(*, publish_events: bool, bus: Any, session_key: Any):
@@ -1283,6 +1285,7 @@ async def _run_agent(
         ov_tools_enable=False,
         stop_tool_names=["done"],
         on_plain_text=plain_text_router,
+        inject_write_experience=False,
     )
     if timings is not None:
         timings.record("agent_loop", stage_started_at)

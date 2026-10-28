@@ -860,6 +860,10 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "done_result, terminated",
+    [("", True), ("Done", True), ("", False), ("Error: done failed", True)],
+)
+@pytest.mark.parametrize(
     "user_reply",
     [
         None,
@@ -867,14 +871,18 @@ async def test_tau2_vikingbot_blocking_setup_and_reward_are_offloaded(
         "###TRANSFER###",
         "###OUT-OF-SCOPE###",
         "Error: User dialogue is closed.",
+        "Task Terminated",
+        "  Task Terminated\n",
+        "Task Terminated? Please continue.",
     ],
 )
 async def test_tau2_run_agent_force_loads_experience_loader_skill_before_task_actions(
-    monkeypatch, user_reply
+    monkeypatch, user_reply, done_result, terminated
 ):
     from vikingbot.providers.base import LLMResponse, ToolCallRequest
 
     import benchmark.tau2.train.rollout_executor_vikingbot as module
+    from benchmark.tau2.common.tau2_env.tau2_environment import Tau2BenchEnv
 
     observed = {}
     real_imports = module._vikingbot_imports()
@@ -966,7 +974,10 @@ async def test_tau2_run_agent_force_loads_experience_loader_skill_before_task_ac
             self.model = "fake"
             self.temperature = None
             self.max_iterations = 3
-            self.config = SimpleNamespace(ov_server=SimpleNamespace(exp_write_tools=[]))
+
+        async def _run_agent_loop(self, **kwargs):
+            observed["inject_write_experience"] = kwargs["inject_write_experience"]
+            return await super()._run_agent_loop(**kwargs)
 
     class _DoneTool:
         @property
@@ -995,7 +1006,9 @@ async def test_tau2_run_agent_force_loads_experience_loader_skill_before_task_ac
             return []
 
         async def execute(self, tool_context, **kwargs):
-            return "###STOP###"
+            env = Tau2BenchEnv.__new__(Tau2BenchEnv)
+            env._impl = SimpleNamespace(terminated=terminated, tool_call=lambda *_args: done_result)
+            return env.tool_call(self.name, kwargs)
 
     class _CommunicateTool(_DoneTool):
         @property
@@ -1045,9 +1058,21 @@ async def test_tau2_run_agent_force_loads_experience_loader_skill_before_task_ac
     assert "read_experience" in messages[tool_result_index]["content"]
     assert tools_used[0]["tool_name"] == "read_file"
     assert tools_used[0]["required_skill"] == "experience_loader"
-    hard_stop = user_reply in ("###TRANSFER###", "###OUT-OF-SCOPE###")
-    assert observed["llm_calls"] == (1 if user_reply is None or hard_stop else 2)
+    assert observed["inject_write_experience"] is False
+    hard_stop = user_reply in ("###TRANSFER###", "###OUT-OF-SCOPE###") or (
+        user_reply is not None and user_reply.strip() == "Task Terminated"
+    )
+    expected_done_result = "Task Terminated" if terminated and not done_result else done_result
+    done_success = bool(expected_done_result) and not expected_done_result.startswith("Error:")
+    expected_calls = 1 if user_reply is None or hard_stop else 2
+    if not hard_stop and not done_success:
+        expected_calls = 4  # Three iterations plus the loop's final-summary request.
+    assert observed["llm_calls"] == expected_calls
     assert any(tool["tool_name"] == "done" for tool in tools_used) is not hard_stop
+    for tool in tools_used:
+        if tool["tool_name"] == "done":
+            assert tool["result"] == expected_done_result
+            assert tool["execute_success"] is done_success
     if user_reply is not None:
         assert tools_used[1]["tool_name"] == "communicate_with_user"
         assert tools_used[1]["result"] == user_reply

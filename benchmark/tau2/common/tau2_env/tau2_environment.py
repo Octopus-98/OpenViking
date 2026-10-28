@@ -221,6 +221,9 @@ class Tau2BenchEnv:
     def tool_call(self, tool_name: str, arguments: dict) -> str:
         response = self._impl.tool_call(tool_name, arguments)
         self.terminated = self._impl.terminated
+        # Empty terminal observations must still let the outer loop recognize a successful done.
+        if self.terminated and not response:
+            return "Task Terminated"
         return response
 
     def append_agent_message(self, content: str) -> None:
@@ -247,6 +250,7 @@ class _GymTau2BenchEnv:
             domain=domain,
             task_id=task_id,
             user_llm=os.getenv("TAU2_USER_LLM") or DEFAULT_TAU2_USER_LLM,
+            user_llm_args=json.loads(os.getenv("TAU2_USER_LLM_ARGS") or "{}"),
             defer_user_stop=True,
         )
         self.terminated = False
