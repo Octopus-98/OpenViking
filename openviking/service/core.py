@@ -724,7 +724,8 @@ class OpenVikingService:
         if self._queue_manager:
             self._queue_manager.start()
             logger.info("QueueManager workers started")
-        await system_asset_synchronizer.sync(default_ctx)
+        if self._config.reconcile_system_assets_on_startup:
+            await system_asset_synchronizer.sync(default_ctx)
 
         compile_expiry_enabled = self._compile_scheduler is not None
         if session_expiry_enabled or compile_expiry_enabled:
@@ -988,14 +989,15 @@ class OpenVikingService:
     async def reconcile_system_assets(self, account_lister: AccountLister) -> int:
         """Synchronize packaged system assets for every active account."""
         self._ensure_initialized()
-        if not self._system_asset_synchronizer:
+        if not self._system_asset_synchronizer or not self._viking_fs:
             return 0
         return await SystemAssetReconciler(
             self._system_asset_synchronizer,
             account_lister,
+            self._viking_fs._async_agfs,
             user_id=self._config.default_user or self._user.user_id,
             skip_account_ids={self._user.account_id},
-        ).sync_all()
+        ).sync_if_changed()
 
     async def initialize_user_directories(self, ctx: RequestContext) -> int:
         """Initialize current user's directory tree."""
