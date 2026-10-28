@@ -653,6 +653,48 @@ class TestGitAccessor:
         assert resource.path == extracted
         assert resource.meta["resolved_head_sha"] == probed_sha
 
+    async def test_github_token_is_available_to_initial_head_probe(
+        self,
+        accessor: GitAccessor,
+        tmp_path: Path,
+    ) -> None:
+        source = "https://github.com/org/private.git"
+        extracted = tmp_path / "repo"
+        with (
+            patch(
+                "openviking.parse.accessors.git_accessor.tempfile.mkdtemp",
+                return_value=str(tmp_path),
+            ),
+            patch.object(
+                accessor,
+                "_resolve_tracked_head",
+                new=AsyncMock(return_value=("refs/heads/main", "a" * 40)),
+            ) as resolve_tracked_head,
+            patch.object(
+                accessor,
+                "_github_zip_download",
+                new=AsyncMock(return_value=(extracted, "org/private")),
+            ) as zip_download,
+        ):
+            await accessor.access(
+                source,
+                branch="main",
+                github_token="account-token",
+            )
+
+        probe_env = resolve_tracked_head.await_args.args[2]
+        assert probe_env["GIT_TERMINAL_PROMPT"] == "0"
+        assert any(
+            value.startswith("Authorization: Basic ")
+            for value in _git_config_entries(probe_env).values()
+        )
+        zip_download.assert_awaited_once_with(
+            source,
+            "a" * 40,
+            str(tmp_path),
+            github_token="account-token",
+        )
+
     async def test_commit_pin_records_supplied_commit_without_remote_probe(
         self,
         accessor: GitAccessor,

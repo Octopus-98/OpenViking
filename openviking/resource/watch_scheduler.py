@@ -50,6 +50,7 @@ class WatchScheduler:
 
     DEFAULT_CHECK_INTERVAL = 60.0
     DEFAULT_TASK_TIMEOUT = 3 * 60 * 60
+    DEFAULT_GIT_PROBE_TIMEOUT = 30.0
 
     def __init__(
         self,
@@ -423,6 +424,7 @@ class WatchScheduler:
                     probed_checkpoint = await self._probe_git_checkpoint(
                         task.path,
                         processor_kwargs,
+                        ctx=ctx,
                         instruction=task.instruction,
                     )
                     stored_checkpoint = getattr(task, "source_checkpoint", None) or {}
@@ -632,6 +634,7 @@ class WatchScheduler:
         path: str,
         processor_kwargs: Dict[str, Any],
         *,
+        ctx: RequestContext,
         instruction: str,
     ) -> Optional[Dict[str, Any]]:
         """Return the watched git revision as a source checkpoint.
@@ -645,7 +648,17 @@ class WatchScheduler:
         if not path or not is_git_repo_url(path):
             return None
         try:
-            probed = await GitAccessor().probe_git_remote_head(path, **processor_kwargs)
+            probe_kwargs = dict(processor_kwargs)
+            if probe_kwargs.get("auth_config") is None:
+                resource_processor = getattr(self._resource_service, "_resource_processor", None)
+                if resource_processor is not None:
+                    github_token = await resource_processor.github_token_for(path, ctx)
+                    if github_token:
+                        probe_kwargs["auth_config"] = {"token": github_token}
+            probed = await asyncio.wait_for(
+                GitAccessor().probe_git_remote_head(path, **probe_kwargs),
+                timeout=self.DEFAULT_GIT_PROBE_TIMEOUT,
+            )
         except Exception as e:
             logger.warning(
                 f"[WatchScheduler] git head probe failed for {path}: {e}; "

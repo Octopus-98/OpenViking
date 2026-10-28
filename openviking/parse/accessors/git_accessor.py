@@ -149,8 +149,18 @@ class GitAccessor(DataAccessor):
                 used_git_clone = True
             elif source_str.startswith(("http://", "https://", "git://", "ssh://")):
                 repo_url, branch, commit = self._parse_repo_source(source_str, **kwargs)
+                github_token = None
                 if auth_config is not None:
                     git_env = build_git_http_auth_env(auth_config, repo_url)
+                elif self._is_github_url(repo_url):
+                    github_token = kwargs.get("github_token") or os.environ.get("GITHUB_TOKEN")
+                    if github_token and is_git_https_url(repo_url):
+                        github_auth = parse_git_http_auth_config(
+                            {"token": github_token},
+                            repo_url,
+                        )
+                        assert github_auth is not None
+                        git_env = build_git_http_auth_env(github_auth, repo_url)
                 if commit:
                     resolved_sha = commit
                 else:
@@ -161,14 +171,6 @@ class GitAccessor(DataAccessor):
                 # the moving branch/commit name only when the probe was skipped.
                 download_ref = resolved_sha or commit or branch
                 if self._is_github_url(repo_url) and auth_config is None:
-                    github_token = kwargs.get("github_token") or os.environ.get("GITHUB_TOKEN")
-                    if github_token and is_git_https_url(repo_url):
-                        github_auth = parse_git_http_auth_config(
-                            {"token": github_token},
-                            repo_url,
-                        )
-                        assert github_auth is not None
-                        git_env = build_git_http_auth_env(github_auth, repo_url)
                     # Try GitHub ZIP API first, fall back to git clone
                     try:
                         local_dir, repo_name = await self._github_zip_download(
@@ -585,7 +587,11 @@ class GitAccessor(DataAccessor):
         skip recording an exact-revision checkpoint.
         """
         try:
-            return await self._git_ls_remote_head(url, branch, env)
+            network_env = overlay_parser_subprocess_env(
+                ParserNetworkContext(ParserNetworkOperation.GIT_COMMAND, url),
+                env,
+            )
+            return await self._git_ls_remote_head(url, branch, network_env)
         except Exception as exc:
             logger.warning(
                 f"[GitAccessor] git head probe failed for {url}: {exc}; "

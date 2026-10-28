@@ -2,10 +2,18 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for the lightweight git ls-remote watch probe."""
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from openviking.parse.accessors import git_accessor
 from openviking.parse.accessors.git_accessor import GitAccessor
+from openviking.parse.network import (
+    ParserNetworkOperation,
+    register_parser_network_adapter,
+    reset_parser_network_adapter,
+)
 
 _resolve_probe_target = GitAccessor._resolve_probe_target
 _parse_ls_remote_ref = GitAccessor._parse_ls_remote_ref
@@ -94,6 +102,28 @@ class TestLsRemoteOutputParsers:
 
 
 class TestProbeGitRemoteHead:
+    @pytest.mark.asyncio
+    async def test_initial_tracked_head_uses_parser_network_adapter(self, monkeypatch):
+        accessor = GitAccessor()
+        run_git = AsyncMock(return_value=f"{'a' * 40}\trefs/heads/main\n")
+        monkeypatch.setattr(accessor, "_run_git", run_git)
+        register_parser_network_adapter(
+            SimpleNamespace(
+                supports=lambda context: context.operation is ParserNetworkOperation.GIT_COMMAND,
+                subprocess_env_overlay=lambda _context: {"OV_GIT_ROUTE": "adapter"},
+            )
+        )
+        try:
+            result = await accessor._resolve_tracked_head(
+                "https://github.com/volcengine/OpenViking.git",
+                "main",
+            )
+        finally:
+            reset_parser_network_adapter()
+
+        assert result == ("refs/heads/main", "a" * 40)
+        assert run_git.await_args.kwargs["env"]["OV_GIT_ROUTE"] == "adapter"
+
     @pytest.mark.asyncio
     async def test_known_branch_uses_heads_refspec(self, monkeypatch):
         captured = {}

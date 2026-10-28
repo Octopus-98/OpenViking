@@ -1,6 +1,7 @@
 import asyncio
 import threading
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -473,6 +474,29 @@ class TestWatchSchedulerGitShaGate:
         }
 
     @pytest.mark.asyncio
+    async def test_account_github_token_is_used_for_probe_without_persisting(self, monkeypatch):
+        state = {"kind": "git", "head_sha": "a" * 40, "instruction": ""}
+        probe = AsyncMock(return_value=("refs/heads/main", "a" * 40))
+        scheduler, resource_service = self._build_scheduler(monkeypatch, probe)
+        token_resolver = AsyncMock(return_value="account-token")
+        resource_service._resource_processor = SimpleNamespace(
+            github_token_for=token_resolver,
+        )
+        manager, task = await self._setup_task(scheduler, source_checkpoint=state)
+
+        await scheduler._execute_task(task)
+
+        token_resolver.assert_awaited_once()
+        probe.assert_awaited_once_with(
+            self.REPO,
+            auth_config={"token": "account-token"},
+        )
+        assert resource_service.calls == []
+        updated = await manager.get_task(task.task_id)
+        assert updated.source_checkpoint == state
+        assert "auth_config" not in updated.processor_kwargs
+
+    @pytest.mark.asyncio
     async def test_changed_instruction_triggers_refresh(self, monkeypatch):
         sha = "a" * 40
         probe = AsyncMock(return_value=("refs/heads/main", sha))
@@ -491,6 +515,21 @@ class TestWatchSchedulerGitShaGate:
 
         assert len(resource_service.calls) == 1
         assert resource_service.calls[0]["instruction"] == "new instruction"
+        updated = await manager.get_task(task.task_id)
+        assert updated.last_status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_probe_timeout_fails_open_to_refresh(self, monkeypatch):
+        async def blocked_probe(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        scheduler, resource_service = self._build_scheduler(monkeypatch, blocked_probe)
+        monkeypatch.setattr(scheduler, "DEFAULT_GIT_PROBE_TIMEOUT", 0.01)
+        manager, task = await self._setup_task(scheduler)
+
+        await asyncio.wait_for(scheduler._execute_task(task), timeout=1.0)
+
+        assert len(resource_service.calls) == 1
         updated = await manager.get_task(task.task_id)
         assert updated.last_status == "completed"
 
