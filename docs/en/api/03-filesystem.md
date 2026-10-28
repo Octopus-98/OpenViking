@@ -469,7 +469,7 @@ curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -d '{"uri":"viking://resources/docs","tags":["team=search"],"mode":"append","recursive":true}'
 ```
 
-With `include_acl=true`, a caller with `manage` permission on a shared resource under `viking://resources/...` also receives `result.attrs.acl`. Its value is the same report returned in `result` by [GET /api/v1/acl](12-acl.md): `uri`, `acl_mode`, `direct_entries`, `inherited_entries`, and `effective_entries`.
+With `include_acl=true`, a caller with `manage` permission on a shared resource under `viking://resources/...` also receives `result.attrs.acl`. Its value is the same report returned in `result` by [GET /api/v1/acl?uri={uri}](12-acl.md): `uri`, `acl_mode`, `direct_entries`, `inherited_entries`, and `effective_entries`.
 
 The permission check matches the dedicated ACL endpoint: account `ADMIN` has implicit `manage`; other roles, including `ROOT`, need effective `manage` from direct or inherited user, group, or `user:*` grants. When account ACL is disabled, those grants do not authorize ACL queries; account `ADMIN` can still query them.
 

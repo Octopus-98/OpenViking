@@ -507,7 +507,7 @@ curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
   -d '{"uri":"viking://resources/docs","tags":["team=search"],"mode":"append","recursive":true}'
 ```
 
-传入 `include_acl=true` 时，拥有目标节点 `manage` 权限的调用者查询 `viking://resources/...` 下的共享资源会额外获得 `result.attrs.acl`。其内容与 [GET /api/v1/acl](12-acl.md) 的 `result` 相同，包含 `uri`、`acl_mode`、`direct_entries`（直接授权）、`inherited_entries`（继承授权）和 `effective_entries`（有效授权）。
+传入 `include_acl=true` 时，拥有目标节点 `manage` 权限的调用者查询 `viking://resources/...` 下的共享资源会额外获得 `result.attrs.acl`。其内容与 [GET /api/v1/acl?uri={uri}](12-acl.md) 的 `result` 相同，包含 `uri`、`acl_mode`、`direct_entries`（直接授权）、`inherited_entries`（继承授权）和 `effective_entries`（有效授权）。
 
 权限检查与独立 ACL 接口一致：账号 `ADMIN` 隐式拥有 `manage`；其他角色（包括 `ROOT`）需要通过直接或继承的用户、用户组、`user:*` 授权获得有效 `manage`。账号 ACL 关闭时，这些授权不参与 ACL 查询鉴权，账号 `ADMIN` 仍可查询。
 
